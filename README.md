@@ -19,6 +19,7 @@ flowchart TD
     Gateway --> Memory["SQLite and HNSW memory"]
     Gateway --> Tools["Tool loop"]
     Tools --> Sandbox["Isolated sandbox service"]
+```
 
 The current lab implementation uses OpenWebUI, FastAPI, llama.cpp-compatible backends, SQLite, HNSW, and SentenceTransformers.
 
