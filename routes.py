@@ -40,7 +40,7 @@ from tool_loop import (
 logger = logging.getLogger(__name__)
 router = APIRouter()
 BASE_BACKEND = settings.LLM_BACKEND_URL
-ROUTES_TOOLS_PROBE_VERSION = "owui-native-tools-final-answer-loop-guard-2026-07-17-v11"
+ROUTES_TOOLS_PROBE_VERSION = "owui-native-tools-nonstream-json-2026-07-20-v11a"
 
 
 # -----------------------------------------------------------------------------
@@ -2484,7 +2484,23 @@ async def handle_chat(request: Request):
                 "Skipping [WRITE_PATH] to prevent garbage accumulation."
             )
 
-        return StreamingResponse(generate(), media_type="text/event-stream")
+        stream_requested = bool(payload.get("stream", False))
+
+        if stream_requested:
+            return StreamingResponse(generate(), media_type="text/event-stream")
+
+        completion = _completion_with_direct_answer(
+            {"model": payload.get("model") or settings.MAIN_MODEL},
+            assistant_reply,
+            "stop",
+        )
+        logger.info(
+            "[ROUTE] Returning OpenAI JSON response "
+            "stream_requested=False content_len=%s",
+            len(assistant_reply),
+        )
+        return JSONResponse(content=completion)
+
     except Exception as e:
         logger.error(f"[ROUTE] Gateway Error: {e}", exc_info=True)
         return JSONResponse(status_code=500, content={"error": str(e)})
