@@ -40,7 +40,7 @@ from tool_loop import (
 logger = logging.getLogger(__name__)
 router = APIRouter()
 BASE_BACKEND = settings.LLM_BACKEND_URL
-ROUTES_TOOLS_PROBE_VERSION = "owui-main-chat-thinking-2026-07-20-v11e"
+ROUTES_TOOLS_PROBE_VERSION = "owui-live-reasoning-and-content-2026-07-20-v11i"
 
 
 # -----------------------------------------------------------------------------
@@ -817,8 +817,8 @@ NATIVE TOOL DECISION POLICY:
 - This is one bounded tool-decision pass. Do not narrate your plan.
 - If a listed tool is necessary, emit a native OpenAI tool call immediately.
 - Never print XML-like <tool_call>, <function>, or <parameter> tags.
-- Never say that you will call a tool later. Either call it now or answer directly.
-- If no tool is necessary, answer the user directly and concisely.
+- Never say that you will call a tool later. Either call it now or output exactly KVEN_NO_TOOL.
+- If no tool is necessary, output exactly KVEN_NO_TOOL and nothing else.
 - Never discuss which tools are or are not available.
 - At most one mutating tool call is allowed in one user turn.
 - A request to remember a user-supplied fact does not need an OWUI tool: Kven II persists it automatically after the answer.
@@ -827,7 +827,7 @@ NATIVE TOOL DECISION POLICY:
 NATIVE_TOOL_CORRECTION_POLICY = """
 CORRECTION: Your previous attempt did not produce a valid native tool call.
 Do not explain, plan, or emit XML. If a tool is needed, emit the native OpenAI tool call now.
-Otherwise answer the user directly.
+Otherwise output exactly KVEN_NO_TOOL and nothing else.
 """.strip()
 
 
@@ -1498,12 +1498,27 @@ async def _post_native_decision_json(
     decision_payload["temperature"] = 0.0
     decision_payload["max_tokens"] = max_tokens
     decision_payload.pop("max_completion_tokens", None)
+
+    # Tool selection must be a short classification pass. Thinking would spend
+    # the entire bounded budget before Qwen emits either tool_calls or NO_TOOL.
+    chat_template_kwargs = decision_payload.get("chat_template_kwargs")
+    if not isinstance(chat_template_kwargs, dict):
+        chat_template_kwargs = {}
+    else:
+        chat_template_kwargs = dict(chat_template_kwargs)
+
+    chat_template_kwargs["enable_thinking"] = False
+    decision_payload["chat_template_kwargs"] = chat_template_kwargs
+    decision_payload["reasoning_format"] = "none"
+    decision_payload.pop("reasoning_effort", None)
+
     decision_payload["messages"] = _with_native_decision_policy(
         payload.get("messages", []), correction=correction
     )
 
     logger.info(
-        "[OWUI_NATIVE_GUARD] decision_start correction=%s max_tokens=%s timeout=%s",
+        "[OWUI_NATIVE_GUARD] decision_start correction=%s max_tokens=%s "
+        "timeout=%s thinking=False reasoning_format=none",
         correction,
         max_tokens,
         timeout_seconds,
@@ -1922,6 +1937,71 @@ async def _proxy_hybrid_continuation_final_response(
     )
 
 
+
+async def _proxy_hybrid_no_tool_final_response(
+    payload: dict,
+    chat_url: str,
+    *,
+    write_path_messages: list,
+    active_state: dict,
+    owui_rag_meta: dict,
+    skip_write_path: bool,
+    timeout_seconds: float = 1200.0,
+) -> Response:
+    """Produce the real answer after the bounded decision says no tool is needed."""
+    final_payload = dict(payload)
+    final_payload.pop("tools", None)
+    final_payload.pop("tool_choice", None)
+    final_payload.pop("parallel_tool_calls", None)
+
+    stream_requested = bool(final_payload.get("stream", False))
+    rag_detected = bool(owui_rag_meta.get("detected"))
+
+    if stream_requested and not rag_detected:
+        thinking_enabled = _env_bool(
+            "KVEN2_MAIN_ENABLE_THINKING",
+            True,
+        )
+
+        final_payload = _apply_final_answer_safeguards(
+            final_payload,
+            route_label="hybrid_no_tool_live",
+            enable_thinking=thinking_enabled,
+        )
+
+        logger.info(
+            "[OWUI_NATIVE_GUARD] no_tool_final "
+            "live_stream=True thinking=%s tools_removed=True",
+            thinking_enabled,
+        )
+
+        return _stream_main_chat_response(
+            final_payload,
+            chat_url,
+            write_path_messages=write_path_messages,
+            active_state=active_state,
+            skip_write_path=skip_write_path,
+            timeout_seconds=timeout_seconds,
+        )
+
+    logger.info(
+        "[OWUI_NATIVE_GUARD] no_tool_final "
+        "live_stream=False rag=%s stream_requested=%s tools_removed=True",
+        rag_detected,
+        stream_requested,
+    )
+
+    return await _proxy_hybrid_final_response(
+        final_payload,
+        chat_url,
+        write_path_messages=write_path_messages,
+        active_state=active_state,
+        owui_rag_meta=owui_rag_meta,
+        skip_write_path=skip_write_path,
+        timeout_seconds=timeout_seconds,
+    )
+
+
 async def _proxy_hybrid_native_openai_tool_protocol(
     payload: dict,
     chat_url: str,
@@ -1970,12 +2050,12 @@ async def _proxy_hybrid_native_openai_tool_protocol(
 
     allowed_names = _allowed_native_tool_names(payload)
     if not allowed_names:
-        final_payload = dict(payload)
-        final_payload.pop("tools", None)
-        final_payload.pop("tool_choice", None)
-        logger.info("[OWUI_NATIVE_GUARD] no_tools_after_policy final_answer_direct=True")
-        return await _proxy_hybrid_final_response(
-            final_payload,
+        logger.info(
+            "[OWUI_NATIVE_GUARD] no_tools_after_policy "
+            "route_to_final_answer=True"
+        )
+        return await _proxy_hybrid_no_tool_final_response(
+            payload,
             chat_url,
             write_path_messages=write_path_messages,
             active_state=active_state,
@@ -1984,13 +2064,25 @@ async def _proxy_hybrid_native_openai_tool_protocol(
             timeout_seconds=timeout_seconds,
         )
 
-    decision_timeout = float(_env_int("KVEN2_NATIVE_TOOL_DECISION_TIMEOUT", 120, 30, 300))
-    decision_tokens_default = 1024 if owui_rag_meta.get("detected") else 768
+    decision_timeout = float(
+        _env_int(
+            "KVEN2_NATIVE_TOOL_DECISION_TIMEOUT",
+            120,
+            30,
+            300,
+        )
+    )
+
+    # This pass only classifies TOOL_CALL versus NO_TOOL. A large budget lets
+    # the model answer the whole question before the real streamed generation.
+    decision_tokens_default = (
+        192 if owui_rag_meta.get("detected") else 128
+    )
     decision_tokens = _env_int(
         "KVEN2_NATIVE_TOOL_DECISION_MAX_TOKENS",
         decision_tokens_default,
-        256,
-        2048,
+        64,
+        512,
     )
 
     last_base = {}
@@ -2001,7 +2093,7 @@ async def _proxy_hybrid_native_openai_tool_protocol(
             chat_url,
             correction=correction,
             timeout_seconds=decision_timeout,
-            max_tokens=512 if correction else decision_tokens,
+            max_tokens=decision_tokens,
         )
         if response_json is None:
             logger.info(
@@ -2059,20 +2151,23 @@ async def _proxy_hybrid_native_openai_tool_protocol(
         failed_attempt = _looks_like_failed_native_tool_attempt(content, reasoning)
 
         if clean_answer and not failed_attempt and finish_reason != "length":
-            completion = _completion_with_direct_answer(response_json, clean_answer, finish_reason or "stop")
+            no_tool_marker = clean_answer.strip() == "KVEN_NO_TOOL"
             logger.info(
-                "[OWUI_NATIVE_GUARD] direct_answer_from_decision content_len=%s",
+                "[OWUI_NATIVE_GUARD] no_tool_decision "
+                "marker=%s decision_content_len=%s "
+                "route_to_full_final_answer=True",
+                no_tool_marker,
                 len(clean_answer),
             )
-            _schedule_hybrid_write_path(
-                assistant_reply=clean_answer,
+            return await _proxy_hybrid_no_tool_final_response(
+                payload,
+                chat_url,
                 write_path_messages=write_path_messages,
                 active_state=active_state,
                 owui_rag_meta=owui_rag_meta,
                 skip_write_path=skip_write_path,
-                generation_guard_meta=decision_guard_meta,
+                timeout_seconds=timeout_seconds,
             )
-            return _completion_response_for_client(completion, stream_requested)
 
         if attempt == 0 and (failed_attempt or (not clean_answer and reasoning)):
             logger.warning(
@@ -2083,20 +2178,14 @@ async def _proxy_hybrid_native_openai_tool_protocol(
 
         break
 
-    # Safe fallback: remove tools and let the model produce a normal final answer
-    # with the user's original generation budget. This avoids blank responses and
-    # prevents another tool/planning loop.
-    final_payload = dict(payload)
-    final_payload.pop("tools", None)
-    final_payload.pop("tool_choice", None)
-    final_payload["messages"] = _with_native_decision_policy(
-        payload.get("messages", []), correction=False
-    )
+    # Decision failure must never expose a blank response. Remove tools and run
+    # the normal full-budget final-answer path without decision-control prompts.
     logger.warning(
-        "[OWUI_NATIVE_GUARD] fallback_no_tool_answer reason=decision_exhausted"
+        "[OWUI_NATIVE_GUARD] fallback_no_tool_answer "
+        "reason=decision_exhausted route_to_full_final_answer=True"
     )
-    return await _proxy_hybrid_final_response(
-        final_payload,
+    return await _proxy_hybrid_no_tool_final_response(
+        payload,
         chat_url,
         write_path_messages=write_path_messages,
         active_state=active_state,
@@ -2248,6 +2337,532 @@ def detect_internal_owui_request(messages) -> tuple[bool, str]:
         return True, "metadata_marker"
 
     return False, "no_internal_signature"
+
+
+
+def _stream_main_chat_response(
+    payload: dict,
+    chat_url: str,
+    *,
+    write_path_messages: list,
+    active_state: dict,
+    skip_write_path: bool,
+    timeout_seconds: float = 1200.0,
+) -> StreamingResponse:
+    """Stream reasoning and content live; retain final content for memory."""
+
+    async def generate():
+        assistant_reply = ""
+        reasoning_text = ""
+        content_streamed = False
+        finish_reason = "stop"
+        completion_base = {
+            "model": payload.get("model") or settings.MAIN_MODEL,
+        }
+        guard_meta = {"detected": False}
+        last_reasoning_check = 0
+        last_content_check = 0
+        check_interval = _env_int(
+            "KVEN2_REPETITION_CHECK_INTERVAL",
+            200,
+            50,
+            2000,
+        )
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=timeout_seconds
+            ) as client:
+                async with client.stream(
+                    "POST",
+                    chat_url,
+                    json=payload,
+                ) as response:
+                    content_type = response.headers.get(
+                        "content-type",
+                        "",
+                    )
+                    logger.info(
+                        "[LIVE_STREAM] backend_status=%s "
+                        "content_type=%s",
+                        response.status_code,
+                        content_type,
+                    )
+                    response.raise_for_status()
+
+                    if content_type.startswith(
+                        "text/event-stream"
+                    ):
+                        async for line in response.aiter_lines():
+                            if not line.startswith("data: "):
+                                continue
+
+                            raw = line[6:].strip()
+                            if not raw:
+                                continue
+                            if raw == "[DONE]":
+                                break
+
+                            try:
+                                obj = json.loads(raw)
+                            except Exception:
+                                logger.debug(
+                                    "[LIVE_STREAM] "
+                                    "ignored_non_json_data "
+                                    "preview=%s",
+                                    raw[:200],
+                                )
+                                continue
+
+                            completion_base = obj
+                            choice0 = (
+                                obj.get("choices") or [{}]
+                            )[0]
+                            delta = choice0.get("delta") or {}
+
+                            reasoning_piece = delta.get(
+                                "reasoning_content"
+                            )
+                            content_piece = delta.get("content")
+
+                            if (
+                                isinstance(reasoning_piece, str)
+                                and reasoning_piece
+                            ):
+                                reasoning_text += reasoning_piece
+
+                                if (
+                                    len(reasoning_text)
+                                    - last_reasoning_check
+                                    >= check_interval
+                                ):
+                                    last_reasoning_check = len(
+                                        reasoning_text
+                                    )
+                                    _, reasoning_guard = (
+                                        _sanitize_repetitive_text(
+                                            reasoning_text
+                                        )
+                                    )
+                                    if reasoning_guard.get(
+                                        "detected"
+                                    ):
+                                        guard_meta = dict(
+                                            reasoning_guard
+                                        )
+                                        guard_meta["reason"] = (
+                                            "reasoning_"
+                                            + str(
+                                                reasoning_guard.get(
+                                                    "reason"
+                                                )
+                                                or "loop"
+                                            )
+                                        )
+                                        logger.warning(
+                                            "[LIVE_STREAM] "
+                                            "reasoning_aborted "
+                                            "meta=%s",
+                                            _json_preview(
+                                                guard_meta,
+                                                limit=1000,
+                                            ),
+                                        )
+                                        break
+
+                                safe_obj = dict(obj)
+                                safe_choice = dict(choice0)
+                                safe_delta = dict(delta)
+                                safe_delta.pop("content", None)
+                                safe_delta[
+                                    "reasoning_content"
+                                ] = reasoning_piece
+                                safe_choice["delta"] = safe_delta
+                                safe_choice[
+                                    "finish_reason"
+                                ] = None
+                                safe_obj["choices"] = [
+                                    safe_choice
+                                ]
+
+                                yield (
+                                    "data: "
+                                    + json.dumps(
+                                        safe_obj,
+                                        ensure_ascii=False,
+                                    )
+                                    + "\n\n"
+                                )
+
+                            elif delta.get("role"):
+                                safe_obj = dict(obj)
+                                safe_choice = dict(choice0)
+                                safe_delta = dict(delta)
+                                safe_delta.pop("content", None)
+                                safe_choice["delta"] = safe_delta
+                                safe_obj["choices"] = [
+                                    safe_choice
+                                ]
+
+                                yield (
+                                    "data: "
+                                    + json.dumps(
+                                        safe_obj,
+                                        ensure_ascii=False,
+                                    )
+                                    + "\n\n"
+                                )
+
+                            if (
+                                isinstance(content_piece, str)
+                                and content_piece
+                            ):
+                                candidate_reply = (
+                                    assistant_reply
+                                    + content_piece
+                                )
+
+                                if (
+                                    len(candidate_reply)
+                                    - last_content_check
+                                    >= check_interval
+                                ):
+                                    last_content_check = len(
+                                        candidate_reply
+                                    )
+                                    (
+                                        cleaned_candidate,
+                                        live_content_guard,
+                                    ) = _sanitize_repetitive_text(
+                                        candidate_reply
+                                    )
+
+                                    if live_content_guard.get(
+                                        "detected"
+                                    ):
+                                        assistant_reply = (
+                                            cleaned_candidate
+                                        )
+                                        guard_meta = dict(
+                                            live_content_guard
+                                        )
+                                        guard_meta["reason"] = (
+                                            "content_"
+                                            + str(
+                                                live_content_guard.get(
+                                                    "reason"
+                                                )
+                                                or "loop"
+                                            )
+                                        )
+                                        logger.warning(
+                                            "[LIVE_STREAM] "
+                                            "content_aborted "
+                                            "meta=%s",
+                                            _json_preview(
+                                                guard_meta,
+                                                limit=1000,
+                                            ),
+                                        )
+                                        break
+
+                                assistant_reply = candidate_reply
+                                content_streamed = True
+
+                                safe_obj = dict(obj)
+                                safe_choice = dict(choice0)
+                                safe_delta = dict(delta)
+                                safe_delta.pop(
+                                    "reasoning_content",
+                                    None,
+                                )
+                                safe_delta["content"] = (
+                                    content_piece
+                                )
+                                safe_choice["delta"] = safe_delta
+                                safe_choice[
+                                    "finish_reason"
+                                ] = None
+                                safe_obj["choices"] = [
+                                    safe_choice
+                                ]
+
+                                yield (
+                                    "data: "
+                                    + json.dumps(
+                                        safe_obj,
+                                        ensure_ascii=False,
+                                    )
+                                    + "\n\n"
+                                )
+
+                            if choice0.get("finish_reason"):
+                                finish_reason = str(
+                                    choice0.get(
+                                        "finish_reason"
+                                    )
+                                )
+
+                    else:
+                        response_json = json.loads(
+                            await response.aread()
+                        )
+                        completion_base = response_json
+
+                        choice0 = (
+                            response_json.get("choices")
+                            or [{}]
+                        )[0]
+                        message = (
+                            choice0.get("message") or {}
+                        )
+
+                        reasoning = str(
+                            message.get(
+                                "reasoning_content"
+                            )
+                            or ""
+                        )
+
+                        if reasoning:
+                            reasoning_event = {
+                                "id": (
+                                    response_json.get("id")
+                                    or "chatcmpl-kven-live"
+                                ),
+                                "object": (
+                                    "chat.completion.chunk"
+                                ),
+                                "created": (
+                                    response_json.get(
+                                        "created"
+                                    )
+                                    or 0
+                                ),
+                                "model": (
+                                    response_json.get(
+                                        "model"
+                                    )
+                                    or payload.get("model")
+                                    or settings.MAIN_MODEL
+                                ),
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {
+                                            "role": "assistant",
+                                            "reasoning_content": (
+                                                reasoning
+                                            ),
+                                        },
+                                        "finish_reason": None,
+                                    }
+                                ],
+                            }
+
+                            yield (
+                                "data: "
+                                + json.dumps(
+                                    reasoning_event,
+                                    ensure_ascii=False,
+                                )
+                                + "\n\n"
+                            )
+
+                        assistant_reply = str(
+                            message.get("content") or ""
+                        )
+                        finish_reason = str(
+                            choice0.get("finish_reason")
+                            or "stop"
+                        )
+
+        except asyncio.CancelledError:
+            logger.info(
+                "[LIVE_STREAM] client_disconnected "
+                "backend_stream_cancelled=True"
+            )
+            raise
+
+        except Exception as exc:
+            logger.error(
+                "[LIVE_STREAM] stream_failed error=%s",
+                exc,
+                exc_info=True,
+            )
+            assistant_reply = (
+                "Ошибка при потоковой генерации. "
+                "Повторите запрос."
+            )
+            guard_meta = {
+                "detected": True,
+                "reason": "stream_exception",
+            }
+
+        assistant_reply = _clean_direct_native_answer(
+            assistant_reply
+        )
+        assistant_reply, content_guard = (
+            _sanitize_repetitive_text(
+                assistant_reply
+            )
+        )
+
+        if content_guard.get("detected"):
+            guard_meta = content_guard
+
+        if (
+            guard_meta.get("detected")
+            and not assistant_reply
+        ):
+            assistant_reply = (
+                "Генерация остановлена из-за "
+                "повторяющегося цикла. "
+                "Повторите запрос."
+            )
+        elif not assistant_reply:
+            assistant_reply = (
+                "Backend завершил поток без "
+                "итогового ответа."
+            )
+            guard_meta = {
+                "detected": True,
+                "reason": "empty_final_content",
+            }
+
+        logger.info(
+            "[LIVE_STREAM] completed "
+            "reasoning_chars=%s content_chars=%s "
+            "finish_reason=%s guard_detected=%s "
+            "content_streamed_live=%s",
+            len(reasoning_text),
+            len(assistant_reply),
+            finish_reason,
+            bool(guard_meta.get("detected")),
+            content_streamed,
+        )
+
+        if guard_meta.get("detected"):
+            logger.warning(
+                "[ROUTE] Skipping [WRITE_PATH] "
+                "reason=live_stream_guard meta=%s",
+                _json_preview(
+                    guard_meta,
+                    limit=1000,
+                ),
+            )
+        elif (
+            not skip_write_path
+            and len(assistant_reply.strip()) > 10
+        ):
+            logger.info(
+                "[ROUTE] ✅ Triggering background "
+                "task [WRITE_PATH]"
+            )
+            asyncio.create_task(
+                process_episodic(
+                    write_path_messages,
+                    assistant_reply,
+                    active_state,
+                )
+            )
+
+        final_finish_reason = (
+            "stop"
+            if guard_meta.get("detected")
+            else (finish_reason or "stop")
+        )
+
+        event_id = (
+            completion_base.get("id")
+            or "chatcmpl-kven-live"
+        )
+        event_created = (
+            completion_base.get("created")
+            or 0
+        )
+        event_model = (
+            completion_base.get("model")
+            or payload.get("model")
+            or settings.MAIN_MODEL
+        )
+
+        # A non-SSE backend has not emitted content yet. Convert its complete
+        # answer into one normal content delta before the terminal event.
+        if not content_streamed:
+            content_event = {
+                "id": event_id,
+                "object": "chat.completion.chunk",
+                "created": event_created,
+                "model": event_model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "role": "assistant",
+                            "content": assistant_reply,
+                        },
+                        "finish_reason": None,
+                    }
+                ],
+            }
+
+            yield (
+                "data: "
+                + json.dumps(
+                    content_event,
+                    ensure_ascii=False,
+                )
+                + "\n\n"
+            )
+
+        terminal_event = {
+            "id": event_id,
+            "object": "chat.completion.chunk",
+            "created": event_created,
+            "model": event_model,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": final_finish_reason,
+                }
+            ],
+        }
+
+        if completion_base.get("usage") is not None:
+            terminal_event["usage"] = (
+                completion_base.get("usage")
+            )
+
+        if (
+            completion_base.get("system_fingerprint")
+            is not None
+        ):
+            terminal_event["system_fingerprint"] = (
+                completion_base.get(
+                    "system_fingerprint"
+                )
+            )
+
+        yield (
+            "data: "
+            + json.dumps(
+                terminal_event,
+                ensure_ascii=False,
+            )
+            + "\n\n"
+        )
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 async def _forward_to_backend_and_collect(
@@ -2658,10 +3273,37 @@ async def handle_chat(request: Request):
         # OWUI wrapper and produce an invalid llama.cpp payload. Native/default
         # RAG tool calls are handled by the hybrid branch above.
         rag_blocks_gateway_tool_loop = bool(owui_rag_meta.get("detected"))
-        if rag_blocks_gateway_tool_loop and tool_loop_enabled_for_registered_tools(body):
+        gateway_tool_loop_enabled = tool_loop_enabled_for_registered_tools(body)
+
+        if rag_blocks_gateway_tool_loop and gateway_tool_loop_enabled:
             logger.info(
                 "[OWUI_RAG_CONTEXT] skipping_gateway_tool_loop "
                 "reason=owui_rag_context_managed_by_owui_or_hybrid"
+            )
+
+        live_main_stream = (
+            bool(payload.get("stream", False))
+            and not internal_request
+            and not rag_blocks_gateway_tool_loop
+            and not gateway_tool_loop_enabled
+        )
+
+        if live_main_stream:
+            logger.info(
+                "[LIVE_STREAM] selected route_label=main_final "
+                "thinking=%s",
+                bool(
+                    (payload.get("chat_template_kwargs") or {}).get(
+                        "enable_thinking"
+                    )
+                ),
+            )
+            return _stream_main_chat_response(
+                payload,
+                chat_url,
+                write_path_messages=write_path_messages,
+                active_state=active_state,
+                skip_write_path=skip_write_path,
             )
 
         # Bounded gateway-owned model-driven loop: allow exactly one registry tool
@@ -2671,7 +3313,7 @@ async def handle_chat(request: Request):
         if (
             not internal_request
             and not rag_blocks_gateway_tool_loop
-            and tool_loop_enabled_for_registered_tools(body)
+            and gateway_tool_loop_enabled
         ):
             try:
                 explicit_name = tool_loop_explicit_tool_choice_name(body)
