@@ -40,7 +40,7 @@ from tool_loop import (
 logger = logging.getLogger(__name__)
 router = APIRouter()
 BASE_BACKEND = settings.LLM_BACKEND_URL
-ROUTES_TOOLS_PROBE_VERSION = "owui-live-reasoning-and-content-2026-07-20-v11i"
+ROUTES_TOOLS_PROBE_VERSION = "owui-active-tool-continuation-2026-07-20-v11j"
 
 
 # -----------------------------------------------------------------------------
@@ -1002,22 +1002,61 @@ def _summarize_native_tools(body: dict, messages: list) -> dict:
     }
 
 
-def _messages_include_tool_result(messages: list) -> bool:
-    """True when the request is the second OpenAI tool-calling phase."""
-    if not isinstance(messages, list):
-        return False
-    return any(isinstance(m, dict) and m.get("role") == "tool" for m in messages)
-
-
 def _messages_include_native_tool_continuation(messages: list) -> bool:
-    """True when assistant.tool_calls / role=tool already exist in history."""
-    if not isinstance(messages, list):
+    """
+    True only for an active OpenAI tool continuation at the message tail.
+
+    Historical tool calls from completed turns must not force later user
+    messages into continuation mode. An active continuation has this shape:
+
+        assistant(tool_calls) -> tool [-> tool ...] -> end of messages
+    """
+    if not isinstance(messages, list) or not messages:
         return False
-    return any(
-        _message_has_native_tool_protocol_fields(m)
-        for m in messages
-        if isinstance(m, dict)
+
+    index = len(messages) - 1
+
+    # Ignore malformed/non-dict tail entries without treating old history as
+    # an active continuation.
+    while index >= 0 and not isinstance(messages[index], dict):
+        index -= 1
+
+    saw_tool_result = False
+
+    # One assistant tool call may produce several contiguous tool results.
+    while index >= 0:
+        message = messages[index]
+
+        if not isinstance(message, dict):
+            index -= 1
+            continue
+
+        if message.get("role") != "tool":
+            break
+
+        saw_tool_result = True
+        index -= 1
+
+    if not saw_tool_result:
+        return False
+
+    while index >= 0 and not isinstance(messages[index], dict):
+        index -= 1
+
+    if index < 0:
+        return False
+
+    assistant_message = messages[index]
+    return (
+        assistant_message.get("role") == "assistant"
+        and isinstance(assistant_message.get("tool_calls"), list)
+        and bool(assistant_message.get("tool_calls"))
     )
+
+
+def _messages_include_tool_result(messages: list) -> bool:
+    """True only when tool results belong to the active message-tail phase."""
+    return _messages_include_native_tool_continuation(messages)
 
 
 def _prepare_native_tool_payload(
