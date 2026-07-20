@@ -40,7 +40,7 @@ from tool_loop import (
 logger = logging.getLogger(__name__)
 router = APIRouter()
 BASE_BACKEND = settings.LLM_BACKEND_URL
-ROUTES_TOOLS_PROBE_VERSION = "owui-native-tools-clean-continuation-2026-07-20-v11c"
+ROUTES_TOOLS_PROBE_VERSION = "owui-chat-generation-min-tokens-2026-07-20-v11d"
 
 
 # -----------------------------------------------------------------------------
@@ -100,20 +100,31 @@ def _inject_final_answer_control(messages: list) -> list:
 
 
 def _apply_final_answer_safeguards(payload: dict, *, route_label: str) -> dict:
-    """Return a final-answer payload with bounded non-thinking generation settings."""
+    """Return a final-answer payload with a minimum generation budget."""
     safe = dict(payload or {})
 
-    max_tokens_cap = _env_int("KVEN2_FINAL_MAX_TOKENS", 2048, 256, 8192)
+    min_tokens = _env_int(
+        "KVEN2_FINAL_MIN_TOKENS",
+        4096,
+        256,
+        131072,
+    )
+
+    requested_value = safe.get("max_tokens")
+    if requested_value is None:
+        requested_value = safe.get("max_completion_tokens")
+
     try:
-        requested_max_tokens = int(
-            safe.get("max_tokens")
-            or safe.get("max_completion_tokens")
-            or max_tokens_cap
+        requested_max_tokens = (
+            int(requested_value)
+            if requested_value is not None
+            else min_tokens
         )
     except Exception:
-        requested_max_tokens = max_tokens_cap
+        requested_max_tokens = min_tokens
 
-    safe["max_tokens"] = min(max(1, requested_max_tokens), max_tokens_cap)
+    # Enforce only a lower bound. Larger client-supplied budgets are preserved.
+    safe["max_tokens"] = max(min_tokens, requested_max_tokens)
     safe.pop("max_completion_tokens", None)
 
     # Qwen thinking/greedy generation is the main source of the observed
@@ -139,10 +150,12 @@ def _apply_final_answer_safeguards(payload: dict, *, route_label: str) -> dict:
     safe["messages"] = _inject_final_answer_control(safe.get("messages", []))
 
     logger.info(
-        "[FINAL_GUARD] payload_applied route_label=%s max_tokens=%s temperature=%s "
-        "top_p=%s top_k=%s repeat_penalty=%s repeat_last_n=%s thinking=%s",
+        "[FINAL_GUARD] payload_applied route_label=%s max_tokens=%s min_tokens=%s "
+        "temperature=%s top_p=%s top_k=%s repeat_penalty=%s "
+        "repeat_last_n=%s thinking=%s",
         route_label,
         safe.get("max_tokens"),
+        min_tokens,
         safe.get("temperature"),
         safe.get("top_p"),
         safe.get("top_k"),
