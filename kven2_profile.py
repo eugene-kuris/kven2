@@ -21,5 +21,5 @@ def load_agent_profile() -> dict:
         logger.warning(f"[PROFILE] Invalid JSON in {PROFILE_PATH}: {e}")
     except Exception as e:
         logger.error(f"[PROFILE] Failed to load profile: {e}")
-    
+
     return {}

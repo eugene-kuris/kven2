@@ -41,7 +41,7 @@ async def call_small_model(prompt: str, grammar: str = None, max_tokens: int = 5
         "max_tokens": max_tokens,
         "stream": False,
     }
-    
+
     if grammar:
         payload["grammar"] = grammar
     else:

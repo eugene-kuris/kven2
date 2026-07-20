@@ -1,83 +1,82 @@
-import logging
 import sys
-import httpx
-import atexit
-from contextlib import asynccontextmanager
+import os
+import logging
+import asyncio
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
+from config import settings
 
-# Настройка логирования
+# --- НАСТРОЙКА ЛОГИРОВАНИЯ (Этап A: Instrumentation) ---
+# Создаем директорию для логов, если её нет
+LOG_DIR = "/agent/data/kven2"
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOG_DIR, "kven2.log")
+
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)]
+    format='%(asctime)s | %(name)s | %(levelname)s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[
+        logging.StreamHandler(sys.stdout),  # Вывод в консоль
+        logging.FileHandler(LOG_FILE, encoding='utf-8')  # Запись в файл
+    ]
 )
 logger = logging.getLogger(__name__)
 
-# Импорт модулей проекта
+# Инициализация компонентов
 import sqlite
-import decay
-import routes
-from config import settings
 import embedder
 import hnsw
+import decay
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info("🚀 Initializing Kven2 Gateway...")
+app = FastAPI(title="Kven II Proxy")
+
+# Добавляем CORS для удобства отладки
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.on_event("startup")
+async def startup_event():
+    logger.info("🚀 Kven II Starting up...")
     
-    # Инициализация БД
+    # 1. Инициализация БД
     await sqlite.init_db()
-    
-    # Инициализация Embedder и HNSW
+    logger.info("[MAIN] Database initialized.")
+
+    # 2. Инициализация Embedder и HNSW
     try:
         embedder.init_embedder()
-        logger.info("[EMBEDDER] Embedder initialized.")
+        logger.info("[MAIN] Embedder initialized.")
         hnsw.init_hnsw()
-        logger.info("[HNSW] HNSW index initialized.")
+        logger.info("[MAIN] HNSW index initialized.")
     except Exception as e:
-        logger.error(f"Failed to initialize RAG components: {e}")
+        logger.error(f"[MAIN] Failed to initialize RAG components: {e}")
+        sys.exit(1)
 
-    logger.info("🧹 Running initial memory hygiene check...")
+    # 3. Первичная гигиена памяти
+    logger.info("[MAIN] Running initial memory hygiene check...")
     await decay.run_decay()
-    
-    # Регистрируем сохранение HNSW на случайной остановке
-    def save_hnsw_on_exit():
-        hnsw.save_hnsw()
-    atexit.register(save_hnsw_on_exit)
-    
-    models_to_check = [
-        ("Small Model (30B)", settings.SMALL_MODEL_URL),
-        ("Large Model (35B)", settings.LLM_BACKEND_URL)
-    ]
-    
-    for name, url in models_to_check:
-        base_url = url.rstrip('/')
-        try:
-            logger.info(f"🔍 Checking {name} at {base_url}/models ...")
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                await client.get(f"{base_url}/models", timeout=5.0)
-                logger.info(f"✅ {name} is online and healthy.")
-        except Exception as e:
-            logger.critical(f"❌ {name} FAILED connection check! Shutting down.")
-            logger.critical(f"Error details: {e}")
-            raise RuntimeError(f"Critical Backend Failure: {name} unreachable. Aborting startup.") from e
-    
-    yield
-    # При graceful shutdown save_hnsw_on_exit вызовется через atexit
-
-app = FastAPI(lifespan=lifespan)
-
-# Включаем роутер напрямую
-app.include_router(routes.router, prefix="/v1") 
+    logger.info("[MAIN] Startup complete.")
 
 @app.get("/models")
-async def root_models():
-    return await routes.router.routes[0].endpoint()
+async def models():
+    # Заглушка для совместимости
+    return {"data": [{"id": settings.MAIN_MODEL}]}
 
 @app.get("/slots")
-async def root_slots():
-    return [{"id": "default", "name": "Kven Gateway", "object": "slot"}]
+async def slots():
+    return []
+
+# Подключение роутеров
+from routes import router
+app.include_router(router, prefix="/v1")
 
 if __name__ == "__main__":
-    import uvicorn
+    logger.info(f"Starting server on port {settings.PROXY_PORT}...")
     uvicorn.run(app, host="0.0.0.0", port=settings.PROXY_PORT)

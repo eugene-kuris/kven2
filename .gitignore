@@ -1,3 +1,47 @@
+# Python environments and caches
 venv/
+.venv/
 __pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Runtime data and databases
+data/
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Vector indexes and model files
+hnsw_index.bin*
+*.gguf
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+*.orig
+
+# Local code snapshots
+checkpoints/
+_archive_code_snapshots_*/
+
+# Packaging and coverage
+build/
+dist/
+*.egg-info/
+.coverage
+htmlcov/
+
+# Editor metadata
+.idea/
+.vscode/
