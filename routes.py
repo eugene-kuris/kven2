@@ -40,7 +40,7 @@ from tool_loop import (
 logger = logging.getLogger(__name__)
 router = APIRouter()
 BASE_BACKEND = settings.LLM_BACKEND_URL
-ROUTES_TOOLS_PROBE_VERSION = "owui-chat-generation-min-tokens-2026-07-20-v11d"
+ROUTES_TOOLS_PROBE_VERSION = "owui-main-chat-thinking-2026-07-20-v11e"
 
 
 # -----------------------------------------------------------------------------
@@ -85,6 +85,20 @@ def _env_float(name: str, default: float, min_value: float, max_value: float) ->
     return max(min_value, min(value, max_value))
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    """Read a boolean environment value with an explicit default."""
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default)
+
+    normalized = str(raw).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return bool(default)
+
+
 def _inject_final_answer_control(messages: list) -> list:
     """Append one compact anti-reasoning policy to the leading system message."""
     copied = [dict(m) if isinstance(m, dict) else m for m in (messages or [])]
@@ -99,8 +113,13 @@ def _inject_final_answer_control(messages: list) -> list:
     return copied
 
 
-def _apply_final_answer_safeguards(payload: dict, *, route_label: str) -> dict:
-    """Return a final-answer payload with a minimum generation budget."""
+def _apply_final_answer_safeguards(
+    payload: dict,
+    *,
+    route_label: str,
+    enable_thinking: bool = False,
+) -> dict:
+    """Apply the final-answer budget, sampling, and explicit thinking policy."""
     safe = dict(payload or {})
 
     min_tokens = _env_int(
@@ -138,21 +157,28 @@ def _apply_final_answer_safeguards(payload: dict, *, route_label: str) -> dict:
     safe["repeat_penalty"] = _env_float("KVEN2_FINAL_REPEAT_PENALTY", 1.08, 0.8, 2.0)
     safe["repeat_last_n"] = _env_int("KVEN2_FINAL_REPEAT_LAST_N", 512, 64, 4096)
 
+    thinking_enabled = bool(enable_thinking)
+
     chat_template_kwargs = safe.get("chat_template_kwargs")
     if not isinstance(chat_template_kwargs, dict):
         chat_template_kwargs = {}
     else:
         chat_template_kwargs = dict(chat_template_kwargs)
-    chat_template_kwargs["enable_thinking"] = False
+
+    chat_template_kwargs["enable_thinking"] = thinking_enabled
     safe["chat_template_kwargs"] = chat_template_kwargs
-    safe["reasoning_format"] = "none"
+    safe["reasoning_format"] = (
+        "deepseek"
+        if thinking_enabled
+        else "none"
+    )
 
     safe["messages"] = _inject_final_answer_control(safe.get("messages", []))
 
     logger.info(
         "[FINAL_GUARD] payload_applied route_label=%s max_tokens=%s min_tokens=%s "
         "temperature=%s top_p=%s top_k=%s repeat_penalty=%s "
-        "repeat_last_n=%s thinking=%s",
+        "repeat_last_n=%s thinking=%s reasoning_format=%s",
         route_label,
         safe.get("max_tokens"),
         min_tokens,
@@ -162,6 +188,7 @@ def _apply_final_answer_safeguards(payload: dict, *, route_label: str) -> dict:
         safe.get("repeat_penalty"),
         safe.get("repeat_last_n"),
         chat_template_kwargs.get("enable_thinking"),
+        safe.get("reasoning_format"),
     )
     return safe
 
@@ -2600,7 +2627,26 @@ async def handle_chat(request: Request):
             )
 
         if not internal_request:
-            payload = _apply_final_answer_safeguards(payload, route_label="main_final")
+            main_chat_thinking = (
+                _env_bool("KVEN2_MAIN_ENABLE_THINKING", True)
+                and not bool(owui_rag_meta.get("detected"))
+                and not tool_loop_enabled_for_registered_tools(body)
+            )
+
+            payload = _apply_final_answer_safeguards(
+                payload,
+                route_label="main_final",
+                enable_thinking=main_chat_thinking,
+            )
+
+            logger.info(
+                "[CHAT_POLICY] main_chat_thinking=%s rag=%s "
+                "gateway_tool_loop=%s stream=%s",
+                main_chat_thinking,
+                bool(owui_rag_meta.get("detected")),
+                tool_loop_enabled_for_registered_tools(body),
+                bool(payload.get("stream", False)),
+            )
 
         backend_chunks = []
         assistant_reply = ""
