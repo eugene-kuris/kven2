@@ -40,7 +40,7 @@ from tool_loop import (
 logger = logging.getLogger(__name__)
 router = APIRouter()
 BASE_BACKEND = settings.LLM_BACKEND_URL
-ROUTES_TOOLS_PROBE_VERSION = "owui-native-tools-nonstream-json-2026-07-20-v11a"
+ROUTES_TOOLS_PROBE_VERSION = "owui-native-tools-clean-continuation-2026-07-20-v11c"
 
 
 # -----------------------------------------------------------------------------
@@ -1288,6 +1288,81 @@ def _clean_direct_native_answer(content: str) -> str:
     return cleaned.strip()
 
 
+def _build_clean_tool_continuation_messages(messages: list) -> list:
+    """Flatten native tool protocol history into ordinary final-answer context."""
+    sanitized, _ = _sanitize_owui_rag_messages_for_write_path(messages)
+    clean_messages = []
+    tool_results = []
+
+    for idx, message in enumerate(sanitized or []):
+        if not isinstance(message, dict):
+            continue
+
+        role = message.get("role")
+        content = _content_to_text(message.get("content")).strip()
+
+        if role == "tool":
+            if content:
+                label = (
+                    message.get("name")
+                    or message.get("tool_call_id")
+                    or f"tool_result_{idx + 1}"
+                )
+                tool_results.append(f"[{label}]\n{content}")
+            continue
+
+        if role == "assistant" and message.get("tool_calls"):
+            continue
+
+        if (
+            role == "assistant"
+            and _looks_like_failed_native_tool_attempt(content, "")
+        ):
+            continue
+
+        clean_message = dict(message)
+        clean_message.pop("tool_calls", None)
+        clean_message.pop("tool_call_id", None)
+        clean_messages.append(clean_message)
+
+    results_text = "\n\n".join(tool_results).strip()
+    if not results_text:
+        results_text = "[No readable tool results were returned.]"
+
+    continuation_policy = f"""
+KVEN TOOL CONTINUATION FINAL CONTROL:
+Tool results are already available below.
+Use them only when relevant to the user's latest request.
+Do not call, request, describe, or simulate any tool.
+Never output <tool_call>, <function>, or <parameter> tags.
+Return only the completed user-facing answer.
+
+TOOL RESULTS:
+{results_text}
+""".strip()
+
+    if (
+        clean_messages
+        and isinstance(clean_messages[0], dict)
+        and clean_messages[0].get("role") == "system"
+    ):
+        existing = _content_to_text(
+            clean_messages[0].get("content")
+        ).strip()
+        clean_messages[0]["content"] = (
+            existing
+            + "\n\n--- TOOL CONTINUATION FINAL CONTROL ---\n\n"
+            + continuation_policy
+        ).strip()
+    else:
+        clean_messages.insert(
+            0,
+            {"role": "system", "content": continuation_policy},
+        )
+
+    return clean_messages
+
+
 def _completion_with_tool_calls(base: dict, tool_calls: list) -> dict:
     """Build a normalized OpenAI completion containing only native tool calls."""
     result = {
@@ -1627,6 +1702,186 @@ async def _proxy_hybrid_final_response(
         )
 
 
+async def _proxy_hybrid_continuation_final_response(
+    payload: dict,
+    chat_url: str,
+    *,
+    write_path_messages: list,
+    active_state: dict,
+    owui_rag_meta: dict,
+    skip_write_path: bool,
+    timeout_seconds: float = 1200.0,
+) -> Response:
+    """Validate a tool continuation answer before exposing it or writing memory."""
+    client_stream_requested = bool(payload.get("stream", False))
+
+    base_payload = _apply_final_answer_safeguards(
+        payload,
+        route_label="hybrid_continuation_final",
+    )
+    base_payload["stream"] = False
+
+    last_base = {
+        "model": payload.get("model") or settings.MAIN_MODEL,
+    }
+
+    for attempt in range(2):
+        attempt_payload = dict(base_payload)
+        attempt_messages = [
+            dict(message) if isinstance(message, dict) else message
+            for message in base_payload.get("messages", [])
+        ]
+
+        if attempt == 1:
+            attempt_messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "CORRECTION: The previous draft contained a tool call "
+                        "or service markup and was rejected. Do not use tools "
+                        "and do not mention this correction. Return only the "
+                        "final answer based on the supplied tool results."
+                    ),
+                }
+            )
+
+        attempt_payload["messages"] = attempt_messages
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=timeout_seconds
+            ) as client:
+                response = await client.post(
+                    chat_url,
+                    json=attempt_payload,
+                )
+
+            if response.status_code >= 400:
+                logger.warning(
+                    "[OWUI_NATIVE_GUARD] continuation_http_error "
+                    "attempt=%s status=%s preview=%s",
+                    attempt + 1,
+                    response.status_code,
+                    response.text[:1000],
+                )
+                continue
+
+            response_json = response.json()
+
+            raw_choice = (
+                response_json.get("choices") or [{}]
+            )[0]
+            raw_message = raw_choice.get("message") or {}
+
+            raw_content = str(
+                raw_message.get("content") or ""
+            )
+            reasoning = str(
+                raw_message.get("reasoning_content") or ""
+            )
+            has_tool_calls = bool(
+                raw_message.get("tool_calls")
+            )
+
+            normalized_json = (
+                _normalize_native_tool_response_for_owui(
+                    response_json
+                )
+            )
+            last_base = normalized_json
+
+            choice0 = (
+                normalized_json.get("choices") or [{}]
+            )[0]
+
+            clean_answer = _clean_direct_native_answer(
+                raw_content
+            )
+            clean_answer, guard_meta = (
+                _sanitize_repetitive_text(clean_answer)
+            )
+
+            failed_attempt = (
+                has_tool_calls
+                or _looks_like_failed_native_tool_attempt(
+                    raw_content,
+                    reasoning,
+                )
+            )
+
+            logger.info(
+                "[OWUI_NATIVE_GUARD] continuation_attempt=%s "
+                "status=%s raw_len=%s clean_len=%s "
+                "has_tool_calls=%s failed_attempt=%s",
+                attempt + 1,
+                response.status_code,
+                len(raw_content),
+                len(clean_answer),
+                has_tool_calls,
+                failed_attempt,
+            )
+
+            if clean_answer and not failed_attempt:
+                completion = _completion_with_direct_answer(
+                    normalized_json,
+                    clean_answer,
+                    choice0.get("finish_reason") or "stop",
+                )
+
+                _schedule_hybrid_write_path(
+                    assistant_reply=clean_answer,
+                    write_path_messages=write_path_messages,
+                    active_state=active_state,
+                    owui_rag_meta=owui_rag_meta,
+                    skip_write_path=skip_write_path,
+                    generation_guard_meta=guard_meta,
+                )
+
+                return _completion_response_for_client(
+                    completion,
+                    client_stream_requested,
+                )
+
+            logger.warning(
+                "[OWUI_NATIVE_GUARD] "
+                "continuation_output_rejected "
+                "attempt=%s preview=%s",
+                attempt + 1,
+                raw_content[:500],
+            )
+
+        except Exception as exc:
+            logger.error(
+                "[OWUI_NATIVE_GUARD] "
+                "continuation_attempt_failed "
+                "attempt=%s error=%s",
+                attempt + 1,
+                exc,
+                exc_info=True,
+            )
+
+    fallback = (
+        "Не удалось сформировать итоговый ответ по результатам "
+        "инструмента без служебной разметки. Повторите запрос."
+    )
+
+    logger.error(
+        "[OWUI_NATIVE_GUARD] continuation_safe_fallback "
+        "tool_markup_not_exposed=True"
+    )
+
+    completion = _completion_with_direct_answer(
+        last_base,
+        fallback,
+        "stop",
+    )
+
+    return _completion_response_for_client(
+        completion,
+        client_stream_requested,
+    )
+
+
 async def _proxy_hybrid_native_openai_tool_protocol(
     payload: dict,
     chat_url: str,
@@ -1648,12 +1903,22 @@ async def _proxy_hybrid_native_openai_tool_protocol(
     messages = payload.get("messages", [])
     stream_requested = bool(payload.get("stream", False))
 
-    # Tool result already exists: never run another decision pass or repeat a tool.
+    # Tool results already exist: remove the tool catalogue and native protocol
+    # history, then validate the final answer before exposing it to the client.
     if _messages_include_native_tool_continuation(messages):
         final_payload = dict(payload)
-        final_payload["tool_choice"] = "none"
-        logger.info("[OWUI_NATIVE_GUARD] continuation_final_answer tool_choice=none")
-        return await _proxy_hybrid_final_response(
+        final_payload.pop("tools", None)
+        final_payload.pop("tool_choice", None)
+        final_payload["messages"] = _build_clean_tool_continuation_messages(
+            messages
+        )
+
+        logger.info(
+            "[OWUI_NATIVE_GUARD] continuation_final_answer "
+            "tools_removed=True protocol_history_flattened=True"
+        )
+
+        return await _proxy_hybrid_continuation_final_response(
             final_payload,
             chat_url,
             write_path_messages=write_path_messages,
