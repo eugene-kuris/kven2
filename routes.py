@@ -1887,6 +1887,7 @@ async def _proxy_hybrid_continuation_final_response(
     payload: dict,
     chat_url: str,
     *,
+    model_adapter,
     write_path_messages: list,
     active_state: dict,
     owui_rag_meta: dict,
@@ -1926,6 +1927,7 @@ async def _proxy_hybrid_continuation_final_response(
         return _stream_main_chat_response(
             base_payload,
             chat_url,
+            model_adapter=model_adapter,
             write_path_messages=write_path_messages,
             active_state=active_state,
             skip_write_path=skip_write_path,
@@ -2166,6 +2168,7 @@ async def _proxy_hybrid_native_openai_tool_protocol(
     payload: dict,
     chat_url: str,
     *,
+    model_adapter,
     write_path_messages: list,
     active_state: dict,
     owui_rag_meta: dict,
@@ -2201,6 +2204,7 @@ async def _proxy_hybrid_native_openai_tool_protocol(
         return await _proxy_hybrid_continuation_final_response(
             final_payload,
             chat_url,
+            model_adapter=model_adapter,
             write_path_messages=write_path_messages,
             active_state=active_state,
             owui_rag_meta=owui_rag_meta,
@@ -2504,6 +2508,7 @@ def _stream_main_chat_response(
     payload: dict,
     chat_url: str,
     *,
+    model_adapter=None,
     write_path_messages: list,
     active_state: dict,
     skip_write_path: bool,
@@ -2519,6 +2524,41 @@ def _stream_main_chat_response(
     """
 
     async def generate():
+        effective_model_adapter = (
+            model_adapter
+            or resolve_model_adapter(
+                backend_model=settings.MAIN_MODEL,
+                backend_url=BASE_BACKEND,
+            )
+        )
+        stream_phase = (
+            "continuation"
+            if continuation_mode
+            else "main"
+        )
+        thinking_enabled = bool(
+            (
+                payload.get("chat_template_kwargs")
+                or {}
+            ).get("enable_thinking")
+        )
+        content_normalizer = (
+            effective_model_adapter
+            .create_stream_content_normalizer(
+                phase=stream_phase,
+                thinking_enabled=thinking_enabled,
+            )
+        )
+        content_normalizer_finished = False
+
+        logger.info(
+            "[MODEL_ADAPTER] stream_normalizer "
+            "adapter=%s phase=%s thinking=%s",
+            effective_model_adapter.adapter_id,
+            stream_phase,
+            thinking_enabled,
+        )
+
         assistant_reply = ""
         reasoning_text = ""
         content_streamed = False
@@ -2717,6 +2757,16 @@ def _stream_main_chat_response(
                                         ensure_ascii=False,
                                     )
                                     + "\n\n"
+                                )
+
+                            if (
+                                isinstance(content_piece, str)
+                                and content_piece
+                            ):
+                                content_piece = (
+                                    content_normalizer.feed(
+                                        content_piece
+                                    )
                                 )
 
                             if (
@@ -2938,9 +2988,17 @@ def _stream_main_chat_response(
                                 + "\n\n"
                             )
 
-                        assistant_reply = str(
-                            message.get("content") or ""
+                        assistant_reply = (
+                            content_normalizer.feed(
+                                str(
+                                    message.get("content")
+                                    or ""
+                                )
+                            )
+                            + content_normalizer.finish()
                         )
+                        content_normalizer_finished = True
+
                         finish_reason = str(
                             choice0.get("finish_reason")
                             or "stop"
@@ -2988,6 +3046,16 @@ def _stream_main_chat_response(
                 "detected": True,
                 "reason": "stream_exception",
             }
+
+        if (
+            not content_normalizer_finished
+            and not guard_meta.get("detected")
+        ):
+            normalized_tail = content_normalizer.finish()
+            content_normalizer_finished = True
+
+            if normalized_tail:
+                assistant_reply += normalized_tail
 
         client_reply = assistant_reply
 
@@ -3478,7 +3546,7 @@ async def handle_chat(request: Request):
         logger.info(f"[ROUTE] Model: {model_name}, Messages count: {msg_count}")
         logger.info(
             "[MODEL_ADAPTER] selected adapter=%s requested_model=%s "
-            "backend_model=%s backend_url=%s passive=True",
+            "backend_model=%s backend_url=%s adapter_enabled=True",
             model_adapter.adapter_id,
             model_name,
             backend_model_name,
@@ -3691,6 +3759,7 @@ async def handle_chat(request: Request):
             return await _proxy_hybrid_native_openai_tool_protocol(
                 native_payload,
                 chat_url,
+                model_adapter=model_adapter,
                 write_path_messages=write_path_messages,
                 active_state=active_state,
                 owui_rag_meta=owui_rag_meta,
@@ -3757,6 +3826,7 @@ async def handle_chat(request: Request):
             return _stream_main_chat_response(
                 payload,
                 chat_url,
+                model_adapter=model_adapter,
                 write_path_messages=write_path_messages,
                 active_state=active_state,
                 skip_write_path=skip_write_path,
