@@ -1368,22 +1368,82 @@ def _extract_pseudo_native_tool_calls(text: str, allowed_names: set[str]) -> lis
     return recovered
 
 
-def _looks_like_failed_native_tool_attempt(content: str, reasoning: str) -> bool:
+_NATIVE_TOOL_FAILURE_MARKERS = (
+    "<tool_call",
+    "<function=",
+    "i will use the tool",
+    "i will call the tool",
+    "i should use the tool",
+    "let me use the tool",
+    "i will execute the tool call",
+    "tool call first",
+    "вызову инструмент",
+    "использую инструмент",
+    "нужно вызвать инструмент",
+)
+
+_CONTINUATION_CONTENT_BLOCK_MARKERS = (
+    *_NATIVE_TOOL_FAILURE_MARKERS,
+    "<parameter=",
+    "<think>",
+    "<|think_start|>",
+)
+
+
+def _looks_like_failed_native_tool_attempt(
+    content: str,
+    reasoning: str,
+) -> bool:
     combined = f"{reasoning}\n{content}".lower()
-    markers = (
-        "<tool_call",
-        "<function=",
-        "i will use the tool",
-        "i will call the tool",
-        "i should use the tool",
-        "let me use the tool",
-        "i will execute the tool call",
-        "tool call first",
-        "вызову инструмент",
-        "использую инструмент",
-        "нужно вызвать инструмент",
+    return any(
+        marker in combined
+        for marker in _NATIVE_TOOL_FAILURE_MARKERS
     )
-    return any(marker in combined for marker in markers)
+
+
+def _find_continuation_content_marker(
+    text: str,
+) -> tuple[int | None, str]:
+    """Return the earliest forbidden marker in continuation content."""
+    lowered = (text or "").lower()
+    earliest = None
+    matched = ""
+
+    for marker in _CONTINUATION_CONTENT_BLOCK_MARKERS:
+        position = lowered.find(marker)
+
+        if position < 0:
+            continue
+
+        if earliest is None or position < earliest:
+            earliest = position
+            matched = marker
+
+    return earliest, matched
+
+
+def _continuation_safe_emit_end(text: str) -> int:
+    """
+    Hold only a suffix that may be the beginning of a forbidden marker.
+
+    Normal text is released immediately. For example, a trailing "<to" is
+    retained until it either becomes "<tool_call" or stops matching it.
+    """
+    lowered = (text or "").lower()
+    holdback = 0
+
+    for marker in _CONTINUATION_CONTENT_BLOCK_MARKERS:
+        maximum = min(
+            len(lowered),
+            len(marker) - 1,
+        )
+
+        for size in range(maximum, 0, -1):
+            if lowered.endswith(marker[:size]):
+                holdback = max(holdback, size)
+                break
+
+    return len(text or "") - holdback
 
 
 def _clean_direct_native_answer(content: str) -> str:
@@ -1834,11 +1894,45 @@ async def _proxy_hybrid_continuation_final_response(
 ) -> Response:
     """Validate a tool continuation answer before exposing it or writing memory."""
     client_stream_requested = bool(payload.get("stream", False))
+    continuation_thinking = _env_bool(
+        "KVEN2_TOOL_CONTINUATION_ENABLE_THINKING",
+        True,
+    )
 
     base_payload = _apply_final_answer_safeguards(
         payload,
-        route_label="hybrid_continuation_final",
+        route_label=(
+            "hybrid_continuation_live"
+            if client_stream_requested
+            else "hybrid_continuation_final"
+        ),
+        enable_thinking=(
+            continuation_thinking
+            if client_stream_requested
+            else False
+        ),
     )
+
+    if client_stream_requested:
+        base_payload["stream"] = True
+
+        logger.info(
+            "[OWUI_NATIVE_GUARD] continuation_live_stream=True "
+            "thinking=%s tools_removed=True",
+            continuation_thinking,
+        )
+
+        return _stream_main_chat_response(
+            base_payload,
+            chat_url,
+            write_path_messages=write_path_messages,
+            active_state=active_state,
+            skip_write_path=skip_write_path,
+            timeout_seconds=timeout_seconds,
+            continuation_mode=True,
+            owui_rag_meta=owui_rag_meta,
+        )
+
     base_payload["stream"] = False
 
     last_base = {
@@ -2413,13 +2507,22 @@ def _stream_main_chat_response(
     active_state: dict,
     skip_write_path: bool,
     timeout_seconds: float = 1200.0,
+    continuation_mode: bool = False,
+    owui_rag_meta: dict | None = None,
 ) -> StreamingResponse:
-    """Stream reasoning and content live; retain final content for memory."""
+    """
+    Stream reasoning and content live; retain final content for memory.
+
+    In continuation mode, renewed tool calls and tool markup are blocked
+    before they can reach the client.
+    """
 
     async def generate():
         assistant_reply = ""
         reasoning_text = ""
         content_streamed = False
+        continuation_emitted_chars = 0
+        continuation_reasoning_marker_logged = False
         finish_reason = "stop"
         completion_base = {
             "model": payload.get("model") or settings.MAIN_MODEL,
@@ -2491,10 +2594,47 @@ def _stream_main_chat_response(
                             content_piece = delta.get("content")
 
                             if (
+                                continuation_mode
+                                and (
+                                    delta.get("tool_calls")
+                                    or delta.get("function_call")
+                                    or choice0.get("finish_reason")
+                                    == "tool_calls"
+                                )
+                            ):
+                                guard_meta = {
+                                    "detected": True,
+                                    "reason": (
+                                        "structured_tool_call"
+                                    ),
+                                }
+                                logger.warning(
+                                    "[LIVE_STREAM] "
+                                    "continuation_structured_tool_call_"
+                                    "blocked=True"
+                                )
+                                break
+
+                            if (
                                 isinstance(reasoning_piece, str)
                                 and reasoning_piece
                             ):
                                 reasoning_text += reasoning_piece
+
+                                if (
+                                    continuation_mode
+                                    and not continuation_reasoning_marker_logged
+                                    and _looks_like_failed_native_tool_attempt(
+                                        "",
+                                        reasoning_text,
+                                    )
+                                ):
+                                    continuation_reasoning_marker_logged = True
+                                    logger.warning(
+                                        "[LIVE_STREAM] "
+                                        "continuation_reasoning_mentions_"
+                                        "tool=True content_not_blocked=True"
+                                    )
 
                                 if (
                                     len(reasoning_text)
@@ -2587,6 +2727,35 @@ def _stream_main_chat_response(
                                     + content_piece
                                 )
 
+                                if continuation_mode:
+                                    (
+                                        marker_position,
+                                        marker,
+                                    ) = _find_continuation_content_marker(
+                                        candidate_reply
+                                    )
+
+                                    if marker_position is not None:
+                                        assistant_reply = (
+                                            candidate_reply[
+                                                :marker_position
+                                            ].rstrip()
+                                        )
+                                        guard_meta = {
+                                            "detected": True,
+                                            "reason": (
+                                                "content_tool_markup"
+                                            ),
+                                            "marker": marker,
+                                        }
+                                        logger.warning(
+                                            "[LIVE_STREAM] "
+                                            "continuation_content_marker_"
+                                            "blocked marker=%s",
+                                            marker,
+                                        )
+                                        break
+
                                 if (
                                     len(candidate_reply)
                                     - last_content_check
@@ -2632,34 +2801,68 @@ def _stream_main_chat_response(
                                         break
 
                                 assistant_reply = candidate_reply
-                                content_streamed = True
+                                emit_piece = content_piece
 
-                                safe_obj = dict(obj)
-                                safe_choice = dict(choice0)
-                                safe_delta = dict(delta)
-                                safe_delta.pop(
-                                    "reasoning_content",
-                                    None,
-                                )
-                                safe_delta["content"] = (
-                                    content_piece
-                                )
-                                safe_choice["delta"] = safe_delta
-                                safe_choice[
-                                    "finish_reason"
-                                ] = None
-                                safe_obj["choices"] = [
-                                    safe_choice
-                                ]
-
-                                yield (
-                                    "data: "
-                                    + json.dumps(
-                                        safe_obj,
-                                        ensure_ascii=False,
+                                if continuation_mode:
+                                    safe_emit_end = (
+                                        _continuation_safe_emit_end(
+                                            assistant_reply
+                                        )
                                     )
-                                    + "\n\n"
-                                )
+
+                                    if (
+                                        safe_emit_end
+                                        > continuation_emitted_chars
+                                    ):
+                                        emit_piece = assistant_reply[
+                                            continuation_emitted_chars:
+                                            safe_emit_end
+                                        ]
+                                        continuation_emitted_chars = (
+                                            safe_emit_end
+                                        )
+                                    else:
+                                        emit_piece = ""
+
+                                if emit_piece:
+                                    content_streamed = True
+
+                                    safe_obj = dict(obj)
+                                    safe_choice = dict(choice0)
+                                    safe_delta = dict(delta)
+                                    safe_delta.pop(
+                                        "reasoning_content",
+                                        None,
+                                    )
+                                    safe_delta.pop(
+                                        "tool_calls",
+                                        None,
+                                    )
+                                    safe_delta.pop(
+                                        "function_call",
+                                        None,
+                                    )
+                                    safe_delta["content"] = (
+                                        emit_piece
+                                    )
+                                    safe_choice["delta"] = (
+                                        safe_delta
+                                    )
+                                    safe_choice[
+                                        "finish_reason"
+                                    ] = None
+                                    safe_obj["choices"] = [
+                                        safe_choice
+                                    ]
+
+                                    yield (
+                                        "data: "
+                                        + json.dumps(
+                                            safe_obj,
+                                            ensure_ascii=False,
+                                        )
+                                        + "\n\n"
+                                    )
 
                             if choice0.get("finish_reason"):
                                 finish_reason = str(
@@ -2742,6 +2945,27 @@ def _stream_main_chat_response(
                             or "stop"
                         )
 
+                        if (
+                            continuation_mode
+                            and (
+                                message.get("tool_calls")
+                                or message.get("function_call")
+                                or finish_reason == "tool_calls"
+                            )
+                        ):
+                            assistant_reply = ""
+                            guard_meta = {
+                                "detected": True,
+                                "reason": (
+                                    "structured_tool_call"
+                                ),
+                            }
+                            logger.warning(
+                                "[LIVE_STREAM] "
+                                "continuation_json_tool_call_"
+                                "blocked=True"
+                            )
+
         except asyncio.CancelledError:
             logger.info(
                 "[LIVE_STREAM] client_disconnected "
@@ -2764,8 +2988,31 @@ def _stream_main_chat_response(
                 "reason": "stream_exception",
             }
 
+        client_reply = assistant_reply
+
+        if (
+            continuation_mode
+            and not guard_meta.get("detected")
+        ):
+            (
+                marker_position,
+                marker,
+            ) = _find_continuation_content_marker(
+                client_reply
+            )
+
+            if marker_position is not None:
+                client_reply = client_reply[
+                    :marker_position
+                ].rstrip()
+                guard_meta = {
+                    "detected": True,
+                    "reason": "content_tool_markup",
+                    "marker": marker,
+                }
+
         assistant_reply = _clean_direct_native_answer(
-            assistant_reply
+            client_reply
         )
         assistant_reply, content_guard = (
             _sanitize_repetitive_text(
@@ -2775,8 +3022,126 @@ def _stream_main_chat_response(
 
         if content_guard.get("detected"):
             guard_meta = content_guard
+            client_reply = assistant_reply
 
-        if (
+        guard_reason = str(
+            guard_meta.get("reason") or ""
+        )
+        continuation_repetition_guard = (
+            "repeated_" in guard_reason
+        )
+        continuation_failure_sent = False
+
+        if continuation_mode:
+            if (
+                guard_meta.get("detected")
+                and not continuation_repetition_guard
+            ):
+                fallback = (
+                    "Не удалось безопасно завершить ответ "
+                    "по результатам инструмента. "
+                    "Повторите запрос."
+                )
+
+                if content_streamed:
+                    fallback = "\n\n" + fallback
+
+                fallback_event = {
+                    "id": (
+                        completion_base.get("id")
+                        or "chatcmpl-kven-live"
+                    ),
+                    "object": "chat.completion.chunk",
+                    "created": (
+                        completion_base.get("created")
+                        or 0
+                    ),
+                    "model": (
+                        completion_base.get("model")
+                        or payload.get("model")
+                        or settings.MAIN_MODEL
+                    ),
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "role": "assistant",
+                                "content": fallback,
+                            },
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+
+                yield (
+                    "data: "
+                    + json.dumps(
+                        fallback_event,
+                        ensure_ascii=False,
+                    )
+                    + "\n\n"
+                )
+
+                content_streamed = True
+                continuation_failure_sent = True
+                assistant_reply = ""
+
+            elif (
+                not guard_meta.get("detected")
+                and continuation_emitted_chars
+                < len(client_reply)
+            ):
+                remaining = client_reply[
+                    continuation_emitted_chars:
+                ]
+
+                if remaining:
+                    remaining_event = {
+                        "id": (
+                            completion_base.get("id")
+                            or "chatcmpl-kven-live"
+                        ),
+                        "object": (
+                            "chat.completion.chunk"
+                        ),
+                        "created": (
+                            completion_base.get("created")
+                            or 0
+                        ),
+                        "model": (
+                            completion_base.get("model")
+                            or payload.get("model")
+                            or settings.MAIN_MODEL
+                        ),
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
+                                    "role": "assistant",
+                                    "content": remaining,
+                                },
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+
+                    yield (
+                        "data: "
+                        + json.dumps(
+                            remaining_event,
+                            ensure_ascii=False,
+                        )
+                        + "\n\n"
+                    )
+
+                    content_streamed = True
+                    continuation_emitted_chars = len(
+                        client_reply
+                    )
+
+        if continuation_failure_sent:
+            pass
+        elif (
             guard_meta.get("detected")
             and not assistant_reply
         ):
@@ -2807,7 +3172,16 @@ def _stream_main_chat_response(
             content_streamed,
         )
 
-        if guard_meta.get("detected"):
+        if continuation_mode:
+            _schedule_hybrid_write_path(
+                assistant_reply=assistant_reply,
+                write_path_messages=write_path_messages,
+                active_state=active_state,
+                owui_rag_meta=owui_rag_meta or {},
+                skip_write_path=skip_write_path,
+                generation_guard_meta=guard_meta,
+            )
+        elif guard_meta.get("detected"):
             logger.warning(
                 "[ROUTE] Skipping [WRITE_PATH] "
                 "reason=live_stream_guard meta=%s",
