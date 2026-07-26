@@ -6,7 +6,7 @@ import os
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-TIME_SOURCE = "http://192.168.143.192:8954/time"
+TIME_SOURCE = "http://127.0.0.1:8954/time"
 
 async def get_external_time() -> str:
     """

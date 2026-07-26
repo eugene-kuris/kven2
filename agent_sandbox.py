@@ -471,4 +471,4 @@ if __name__ == "__main__":
     import uvicorn
 
     print(f"Starting Kven II Agent Sandbox on port 8954 ({SANDBOX_VERSION})...")
-    uvicorn.run(app, host="0.0.0.0", port=8954)
+    uvicorn.run(app, host="127.0.0.1", port=8954)
