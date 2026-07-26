@@ -24,6 +24,7 @@ from kven2_profile import load_agent_profile
 import kven2_time as sys_time
 from write_path import process_episodic, strip_reasoning
 from config import settings
+from model_adapters import resolve_model_adapter
 from sandbox_client import execute_gateway_tool as sandbox_execute_gateway_tool
 from tool_loop import (
     extract_gateway_tool_call as tool_loop_extract_gateway_tool_call,
@@ -3468,8 +3469,21 @@ async def handle_chat(request: Request):
         _disable_tools_for_pure_kven_memory_write(body, messages)
 
         model_name = body.get("model") or settings.MAIN_MODEL
+        backend_model_name = settings.MAIN_MODEL
+        model_adapter = resolve_model_adapter(
+            backend_model=backend_model_name,
+            backend_url=BASE_BACKEND,
+        )
         msg_count = len(messages)
         logger.info(f"[ROUTE] Model: {model_name}, Messages count: {msg_count}")
+        logger.info(
+            "[MODEL_ADAPTER] selected adapter=%s requested_model=%s "
+            "backend_model=%s backend_url=%s passive=True",
+            model_adapter.adapter_id,
+            model_name,
+            backend_model_name,
+            BASE_BACKEND,
+        )
         tool_loop_log_incoming_tool_request(body)
 
         # Detect and sanitize OWUI RAG before native tool routing. OWUI 0.10.2
