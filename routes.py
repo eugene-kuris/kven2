@@ -5,6 +5,8 @@ import re
 import httpx
 import logging
 import asyncio
+import uuid
+from contextvars import ContextVar
 from fastapi import Request, APIRouter
 from fastapi.responses import StreamingResponse, JSONResponse, Response
 
@@ -38,6 +40,30 @@ from tool_loop import (
     _format_hidden_tool_decision_prompt as tool_loop_format_hidden_tool_decision_prompt,
 )
 logger = logging.getLogger(__name__)
+
+_REQUEST_ID: ContextVar[str] = ContextVar(
+    "kven2_request_id",
+    default="",
+)
+
+
+class _RequestIdLogFilter(logging.Filter):
+    """Prefix routes.py logs with the current ASGI request id."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        request_id = _REQUEST_ID.get()
+
+        if request_id:
+            message = str(record.msg)
+
+            if not message.startswith("[rid="):
+                record.msg = f"[rid={request_id}] {message}"
+
+        return True
+
+
+logger.addFilter(_RequestIdLogFilter())
+
 router = APIRouter()
 BASE_BACKEND = settings.LLM_BACKEND_URL
 ROUTES_TOOLS_PROBE_VERSION = "owui-active-tool-continuation-2026-07-20-v11j"
@@ -3045,6 +3071,9 @@ async def list_slots():
 
 @router.post("/chat/completions")
 async def handle_chat(request: Request):
+    request_id = uuid.uuid4().hex[:12]
+    _REQUEST_ID.set(request_id)
+
     try:
         logger.info("[ROUTE] >>> Incoming request to /chat/completions")
         logger.info(f"[ROUTE_VERSION] {ROUTES_TOOLS_PROBE_VERSION}")
