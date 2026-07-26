@@ -1,4 +1,7 @@
-from .base import ModelBackendAdapter
+from .base import (
+    ModelBackendAdapter,
+    StreamContentNormalizer,
+)
 from .registry import (
     available_adapter_ids,
     resolve_model_adapter,
@@ -6,6 +9,7 @@ from .registry import (
 
 __all__ = (
     "ModelBackendAdapter",
+    "StreamContentNormalizer",
     "available_adapter_ids",
     "resolve_model_adapter",
 )
