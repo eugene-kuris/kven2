@@ -24,7 +24,10 @@ from kven2_profile import load_agent_profile
 from write_path import process_episodic, strip_reasoning
 from config import settings
 from model_adapters import resolve_model_adapter
-from planner_router import route_tool_request as planner_route_tool_request
+from planner_router import (
+    classify_main_thinking as planner_classify_main_thinking,
+    route_tool_request as planner_route_tool_request,
+)
 from speculative_stream import SpeculativeStream
 from sandbox_client import execute_gateway_tool as sandbox_execute_gateway_tool
 from tool_loop import (
@@ -125,6 +128,97 @@ def _env_bool(name: str, default: bool) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     return bool(default)
+
+
+async def _resolve_main_chat_thinking(
+    messages: list[dict],
+    *,
+    rag_detected: bool,
+    gateway_tool_loop_enabled: bool,
+) -> bool:
+    """Resolve whether the ordinary main-model answer should use thinking."""
+
+    base_enabled = (
+        _env_bool("KVEN2_MAIN_ENABLE_THINKING", True)
+        and not bool(rag_detected)
+        and not bool(gateway_tool_loop_enabled)
+    )
+
+    if not base_enabled:
+        logger.info(
+            "[PLANNER_THINKING] bypassed "
+            "reason=base_policy_disabled selected=FAST "
+            "rag=%s gateway_tool_loop=%s",
+            bool(rag_detected),
+            bool(gateway_tool_loop_enabled),
+        )
+        return False
+
+    conditional_enabled = _env_bool(
+        "KVEN2_CONDITIONAL_MAIN_THINKING_ENABLED",
+        False,
+    )
+
+    if not conditional_enabled:
+        logger.info(
+            "[PLANNER_THINKING] conditional_disabled "
+            "selected=THINK"
+        )
+        return True
+
+    timeout_seconds = _env_float(
+        "KVEN2_CONDITIONAL_MAIN_THINKING_TIMEOUT",
+        8.0,
+        0.5,
+        60.0,
+    )
+
+    try:
+        result = await asyncio.wait_for(
+            planner_classify_main_thinking(
+                messages,
+                timeout_seconds=timeout_seconds,
+            ),
+            timeout=timeout_seconds,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "[PLANNER_THINKING] resolver_failed "
+            "fallback=THINK error_type=%s error=%s",
+            type(exc).__name__,
+            str(exc)[:500],
+            exc_info=True,
+        )
+        return True
+
+    mode = str(result.get("mode") or "").strip().upper()
+    meta = result.get("meta") or {}
+    error = str(result.get("error") or "")[:500]
+
+    if mode == "FAST":
+        selected = False
+        reason = "planner_fast"
+    elif mode == "THINK":
+        selected = True
+        reason = "planner_think"
+    else:
+        selected = True
+        reason = "planner_safe_fallback"
+
+    logger.info(
+        "[PLANNER_THINKING] resolved mode=%s selected=%s "
+        "reason=%s timeout=%s meta=%s error=%s",
+        mode or "EMPTY",
+        selected,
+        reason,
+        timeout_seconds,
+        _json_preview(meta, limit=1200),
+        error,
+    )
+
+    return selected
 
 
 def _inject_final_answer_control(messages: list) -> list:
@@ -4084,11 +4178,15 @@ async def handle_chat(request: Request):
                 skip_write_path=skip_write_path,
             )
 
+        gateway_tool_loop_enabled = (
+            tool_loop_enabled_for_registered_tools(body)
+        )
+
         if not internal_request:
-            main_chat_thinking = (
-                _env_bool("KVEN2_MAIN_ENABLE_THINKING", True)
-                and not bool(owui_rag_meta.get("detected"))
-                and not tool_loop_enabled_for_registered_tools(body)
+            main_chat_thinking = await _resolve_main_chat_thinking(
+                write_path_messages,
+                rag_detected=bool(owui_rag_meta.get("detected")),
+                gateway_tool_loop_enabled=gateway_tool_loop_enabled,
             )
 
             payload = _apply_final_answer_safeguards(
@@ -4102,7 +4200,7 @@ async def handle_chat(request: Request):
                 "gateway_tool_loop=%s stream=%s",
                 main_chat_thinking,
                 bool(owui_rag_meta.get("detected")),
-                tool_loop_enabled_for_registered_tools(body),
+                gateway_tool_loop_enabled,
                 bool(payload.get("stream", False)),
             )
 
@@ -4116,7 +4214,6 @@ async def handle_chat(request: Request):
         # OWUI wrapper and produce an invalid llama.cpp payload. Native/default
         # RAG tool calls are handled by the hybrid branch above.
         rag_blocks_gateway_tool_loop = bool(owui_rag_meta.get("detected"))
-        gateway_tool_loop_enabled = tool_loop_enabled_for_registered_tools(body)
 
         if rag_blocks_gateway_tool_loop and gateway_tool_loop_enabled:
             logger.info(
