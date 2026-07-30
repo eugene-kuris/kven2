@@ -159,7 +159,10 @@ class Qwen36LlamaCppAdapter(ModelBackendAdapter):
         phase: str,
         thinking_enabled: bool,
     ) -> StreamContentNormalizer:
-        if phase == "continuation" and not thinking_enabled:
+        if (
+            phase in {"main", "continuation"}
+            and not thinking_enabled
+        ):
             return _EmptyLeadingThinkWrapperNormalizer()
 
         return super().create_stream_content_normalizer(
