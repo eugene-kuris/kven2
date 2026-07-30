@@ -26,6 +26,7 @@ from write_path import process_episodic, strip_reasoning
 from config import settings
 from model_adapters import resolve_model_adapter
 from planner_router import route_tool_request as planner_route_tool_request
+from speculative_stream import SpeculativeStream
 from sandbox_client import execute_gateway_tool as sandbox_execute_gateway_tool
 from tool_loop import (
     extract_gateway_tool_call as tool_loop_extract_gateway_tool_call,
@@ -2165,6 +2166,69 @@ async def _proxy_hybrid_no_tool_final_response(
     )
 
 
+def _start_speculative_no_tool_stream(
+    payload: dict,
+    chat_url: str,
+    *,
+    write_path_messages: list,
+    active_state: dict,
+    owui_rag_meta: dict,
+    skip_write_path: bool,
+    timeout_seconds: float,
+    max_chunks: int,
+) -> SpeculativeStream:
+    """
+    Start the final main-model stream before the planner has completed.
+
+    Output remains buffered, and completion side effects remain blocked,
+    until the planner releases the completion gate after NO_TOOL.
+    """
+    final_payload = dict(payload)
+    final_payload.pop("tools", None)
+    final_payload.pop("tool_choice", None)
+    final_payload.pop("parallel_tool_calls", None)
+
+    thinking_enabled = _env_bool(
+        "KVEN2_MAIN_ENABLE_THINKING",
+        True,
+    )
+
+    final_payload = _apply_final_answer_safeguards(
+        final_payload,
+        route_label="hybrid_no_tool_speculative",
+        enable_thinking=thinking_enabled,
+    )
+    final_payload["stream"] = True
+
+    release_gate = asyncio.Event()
+
+    source_response = _stream_main_chat_response(
+        final_payload,
+        chat_url,
+        write_path_messages=write_path_messages,
+        active_state=active_state,
+        skip_write_path=skip_write_path,
+        timeout_seconds=timeout_seconds,
+        owui_rag_meta=owui_rag_meta,
+        completion_gate=release_gate,
+    )
+
+    speculative = SpeculativeStream(
+        source_response,
+        release_gate=release_gate,
+        max_chunks=max_chunks,
+    )
+
+    logger.info(
+        "[SPECULATIVE_PLANNER] main_stream_started=True "
+        "queue_max_chunks=%s thinking=%s",
+        max_chunks,
+        thinking_enabled,
+    )
+
+    return speculative
+
+
 async def _proxy_hybrid_native_openai_tool_protocol(
     payload: dict,
     chat_url: str,
@@ -2255,6 +2319,8 @@ async def _proxy_hybrid_native_openai_tool_protocol(
             timeout_seconds=timeout_seconds,
         )
 
+    speculative_stream = None
+
     if planner_enabled:
         planner_timeout = _env_float(
             "KVEN2_PLANNER_TOOL_ROUTING_TIMEOUT",
@@ -2266,24 +2332,90 @@ async def _proxy_hybrid_native_openai_tool_protocol(
             tool_choice
         )
 
+        speculative_enabled = _env_bool(
+            "KVEN2_SPECULATIVE_PLANNER_ENABLED",
+            False,
+        )
+        speculative_eligible = (
+            speculative_enabled
+            and stream_requested
+            and not bool(owui_rag_meta.get("detected"))
+            and not explicit_tool_name
+            and tool_choice_mode in ("", "auto")
+        )
+
+        if speculative_enabled and not speculative_eligible:
+            if not stream_requested:
+                bypass_reason = "non_stream_request"
+            elif owui_rag_meta.get("detected"):
+                bypass_reason = "rag_detected"
+            elif explicit_tool_name:
+                bypass_reason = "explicit_tool_choice"
+            else:
+                bypass_reason = (
+                    f"tool_choice_{tool_choice_mode or 'unknown'}"
+                )
+
+            logger.info(
+                "[SPECULATIVE_PLANNER] bypass=True reason=%s",
+                bypass_reason,
+            )
+
+        if speculative_eligible:
+            queue_max_chunks = _env_int(
+                "KVEN2_SPECULATIVE_QUEUE_MAX_CHUNKS",
+                32,
+                1,
+                512,
+            )
+
+            speculative_stream = (
+                _start_speculative_no_tool_stream(
+                    payload,
+                    chat_url,
+                    write_path_messages=write_path_messages,
+                    active_state=active_state,
+                    owui_rag_meta=owui_rag_meta,
+                    skip_write_path=skip_write_path,
+                    timeout_seconds=timeout_seconds,
+                    max_chunks=queue_max_chunks,
+                )
+            )
+            await speculative_stream.wait_started()
+
         logger.info(
             "[PLANNER_ROUTER] routing_start tools_count=%s "
-            "explicit_tool=%s required=%s timeout=%s",
+            "explicit_tool=%s required=%s timeout=%s "
+            "speculative=%s",
             len(payload.get("tools", []))
             if isinstance(payload.get("tools"), list)
             else 0,
             explicit_tool_name or "",
             tool_choice_mode == "required",
             planner_timeout,
+            speculative_stream is not None,
         )
 
-        planner_result = await planner_route_tool_request(
-            messages,
-            payload.get("tools", []),
-            allowed_names=allowed_names,
-            explicit_tool_name=explicit_tool_name or None,
-            timeout_seconds=planner_timeout,
-        )
+        try:
+            planner_result = await planner_route_tool_request(
+                messages,
+                payload.get("tools", []),
+                allowed_names=allowed_names,
+                explicit_tool_name=explicit_tool_name or None,
+                timeout_seconds=planner_timeout,
+            )
+        except asyncio.CancelledError:
+            if speculative_stream is not None:
+                await speculative_stream.cancel(
+                    reason="request_cancelled"
+                )
+            raise
+        except Exception:
+            if speculative_stream is not None:
+                await speculative_stream.cancel(
+                    reason="planner_exception"
+                )
+            raise
         planner_decision = str(
             planner_result.get("decision") or ""
         ).strip().upper()
@@ -2307,6 +2439,12 @@ async def _proxy_hybrid_native_openai_tool_protocol(
             )
 
             if calls:
+                if speculative_stream is not None:
+                    await speculative_stream.cancel(
+                        reason="tool_selected"
+                    )
+                    speculative_stream = None
+
                 logger.info(
                     "[PLANNER_ROUTER] native_tool_call_ready "
                     "name=%s validation=%s",
@@ -2339,8 +2477,17 @@ async def _proxy_hybrid_native_openai_tool_protocol(
         ):
             logger.info(
                 "[PLANNER_ROUTER] no_tool "
-                "route_to_final_answer=True"
+                "route_to_final_answer=True speculative=%s",
+                speculative_stream is not None,
             )
+
+            if speculative_stream is not None:
+                logger.info(
+                    "[SPECULATIVE_PLANNER] "
+                    "no_tool_release=True"
+                )
+                return speculative_stream.release_response()
+
             return await _proxy_hybrid_no_tool_final_response(
                 payload,
                 chat_url,
@@ -2366,6 +2513,12 @@ async def _proxy_hybrid_native_openai_tool_protocol(
                 "fallback=legacy_main decision=%s",
                 planner_decision,
             )
+
+    if speculative_stream is not None:
+        await speculative_stream.cancel(
+            reason="planner_fallback"
+        )
+        speculative_stream = None
 
     decision_timeout = float(
         _env_int(
@@ -2654,6 +2807,7 @@ def _stream_main_chat_response(
     timeout_seconds: float = 1200.0,
     continuation_mode: bool = False,
     owui_rag_meta: dict | None = None,
+    completion_gate: asyncio.Event | None = None,
 ) -> StreamingResponse:
     """
     Stream reasoning and content live; retain final content for memory.
@@ -3346,6 +3500,26 @@ def _stream_main_chat_response(
                     continuation_emitted_chars = len(
                         client_reply
                     )
+
+        if (
+            completion_gate is not None
+            and not completion_gate.is_set()
+        ):
+            logger.info(
+                "[LIVE_STREAM] completion_gate_waiting=True"
+            )
+
+            try:
+                await completion_gate.wait()
+            except asyncio.CancelledError:
+                logger.info(
+                    "[LIVE_STREAM] completion_gate_cancelled=True"
+                )
+                raise
+
+            logger.info(
+                "[LIVE_STREAM] completion_gate_released=True"
+            )
 
         if continuation_failure_sent:
             pass
