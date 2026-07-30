@@ -235,6 +235,58 @@ def _inject_final_answer_control(messages: list) -> list:
     return copied
 
 
+def _resolve_hybrid_no_tool_thinking(
+    *,
+    answer_mode: str | None,
+    rag_detected: bool,
+) -> bool:
+    """
+    Resolve thinking for a hybrid NO_TOOL final answer.
+
+    An explicit FAST or THINK mode comes from the combined planner pass.
+    Missing or invalid modes use the safe THINK fallback when conditional
+    thinking is active. RAG and the global base policy can still force FAST.
+    """
+    normalized_mode = str(
+        answer_mode or ""
+    ).strip().upper()
+
+    base_enabled = (
+        _env_bool("KVEN2_MAIN_ENABLE_THINKING", True)
+        and not bool(rag_detected)
+    )
+
+    if not base_enabled:
+        selected = False
+        reason = "base_policy_disabled"
+    elif not _env_bool(
+        "KVEN2_CONDITIONAL_MAIN_THINKING_ENABLED",
+        False,
+    ):
+        selected = True
+        reason = "conditional_disabled"
+    elif normalized_mode == "FAST":
+        selected = False
+        reason = "planner_fast"
+    elif normalized_mode == "THINK":
+        selected = True
+        reason = "planner_think"
+    else:
+        selected = True
+        reason = "safe_fallback"
+
+    logger.info(
+        "[PLANNER_THINKING] hybrid_resolved "
+        "mode=%s selected=%s reason=%s rag=%s",
+        normalized_mode or "MISSING",
+        selected,
+        reason,
+        bool(rag_detected),
+    )
+
+    return selected
+
+
 def _apply_final_answer_safeguards(
     payload: dict,
     *,
@@ -1898,10 +1950,15 @@ async def _proxy_hybrid_final_response(
     active_state: dict,
     owui_rag_meta: dict,
     skip_write_path: bool,
+    enable_thinking: bool = False,
     timeout_seconds: float = 1200.0,
 ) -> Response:
-    """Proxy a bounded non-thinking final answer and safely schedule write_path."""
-    final_payload = _apply_final_answer_safeguards(payload, route_label="hybrid_final")
+    """Proxy a bounded hybrid final answer and safely schedule write_path."""
+    final_payload = _apply_final_answer_safeguards(
+        payload,
+        route_label="hybrid_final",
+        enable_thinking=enable_thinking,
+    )
     stream_requested = bool(final_payload.get("stream", False))
 
     if stream_requested:
@@ -2204,6 +2261,7 @@ async def _proxy_hybrid_no_tool_final_response(
     active_state: dict,
     owui_rag_meta: dict,
     skip_write_path: bool,
+    answer_mode: str | None = None,
     timeout_seconds: float = 1200.0,
 ) -> Response:
     """Produce the real answer after the bounded decision says no tool is needed."""
@@ -2214,13 +2272,12 @@ async def _proxy_hybrid_no_tool_final_response(
 
     stream_requested = bool(final_payload.get("stream", False))
     rag_detected = bool(owui_rag_meta.get("detected"))
+    thinking_enabled = _resolve_hybrid_no_tool_thinking(
+        answer_mode=answer_mode,
+        rag_detected=rag_detected,
+    )
 
     if stream_requested and not rag_detected:
-        thinking_enabled = _env_bool(
-            "KVEN2_MAIN_ENABLE_THINKING",
-            True,
-        )
-
         final_payload = _apply_final_answer_safeguards(
             final_payload,
             route_label="hybrid_no_tool_live",
@@ -2229,7 +2286,9 @@ async def _proxy_hybrid_no_tool_final_response(
 
         logger.info(
             "[OWUI_NATIVE_GUARD] no_tool_final "
-            "live_stream=True thinking=%s tools_removed=True",
+            "live_stream=True mode=%s thinking=%s "
+            "tools_removed=True",
+            str(answer_mode or "").strip().upper() or "MISSING",
             thinking_enabled,
         )
 
@@ -2256,6 +2315,7 @@ async def _proxy_hybrid_no_tool_final_response(
         active_state=active_state,
         owui_rag_meta=owui_rag_meta,
         skip_write_path=skip_write_path,
+        enable_thinking=thinking_enabled,
         timeout_seconds=timeout_seconds,
     )
 
@@ -2268,6 +2328,7 @@ def _start_speculative_no_tool_stream(
     active_state: dict,
     owui_rag_meta: dict,
     skip_write_path: bool,
+    enable_thinking: bool,
     timeout_seconds: float,
     max_chunks: int,
 ) -> SpeculativeStream:
@@ -2282,10 +2343,7 @@ def _start_speculative_no_tool_stream(
     final_payload.pop("tool_choice", None)
     final_payload.pop("parallel_tool_calls", None)
 
-    thinking_enabled = _env_bool(
-        "KVEN2_MAIN_ENABLE_THINKING",
-        True,
-    )
+    thinking_enabled = bool(enable_thinking)
 
     final_payload = _apply_final_answer_safeguards(
         final_payload,
@@ -2414,6 +2472,7 @@ async def _proxy_hybrid_native_openai_tool_protocol(
         )
 
     speculative_stream = None
+    speculative_thinking: bool | None = None
 
     if planner_enabled:
         planner_timeout = _env_float(
@@ -2463,6 +2522,13 @@ async def _proxy_hybrid_native_openai_tool_protocol(
                 512,
             )
 
+            speculative_thinking = (
+                _resolve_hybrid_no_tool_thinking(
+                    answer_mode="FAST",
+                    rag_detected=False,
+                )
+            )
+
             speculative_stream = (
                 _start_speculative_no_tool_stream(
                     payload,
@@ -2471,6 +2537,7 @@ async def _proxy_hybrid_native_openai_tool_protocol(
                     active_state=active_state,
                     owui_rag_meta=owui_rag_meta,
                     skip_write_path=skip_write_path,
+                    enable_thinking=speculative_thinking,
                     timeout_seconds=timeout_seconds,
                     max_chunks=queue_max_chunks,
                 )
@@ -2569,18 +2636,58 @@ async def _proxy_hybrid_native_openai_tool_protocol(
             planner_decision == "NO_TOOL"
             and tool_choice_mode != "required"
         ):
+            planner_answer_mode = str(
+                planner_result.get("mode") or ""
+            ).strip().upper()
+
+            selected_thinking = (
+                _resolve_hybrid_no_tool_thinking(
+                    answer_mode=planner_answer_mode or None,
+                    rag_detected=bool(
+                        owui_rag_meta.get("detected")
+                    ),
+                )
+            )
+
             logger.info(
-                "[PLANNER_ROUTER] no_tool "
-                "route_to_final_answer=True speculative=%s",
+                "[PLANNER_ROUTER] no_tool mode=%s "
+                "thinking=%s route_to_final_answer=True "
+                "speculative=%s",
+                planner_answer_mode or "MISSING",
+                selected_thinking,
                 speculative_stream is not None,
             )
 
             if speculative_stream is not None:
+                if (
+                    speculative_thinking is not None
+                    and speculative_thinking
+                    == selected_thinking
+                ):
+                    logger.info(
+                        "[SPECULATIVE_PLANNER] "
+                        "no_tool_release=True mode=%s "
+                        "thinking=%s",
+                        planner_answer_mode or "MISSING",
+                        selected_thinking,
+                    )
+                    return (
+                        speculative_stream.release_response()
+                    )
+
+                await speculative_stream.cancel(
+                    reason="answer_mode_changed"
+                )
+                speculative_stream = None
+
                 logger.info(
                     "[SPECULATIVE_PLANNER] "
-                    "no_tool_release=True"
+                    "no_tool_restart=True mode=%s "
+                    "from_thinking=%s to_thinking=%s",
+                    planner_answer_mode or "MISSING",
+                    speculative_thinking,
+                    selected_thinking,
                 )
-                return speculative_stream.release_response()
 
             return await _proxy_hybrid_no_tool_final_response(
                 payload,
@@ -2589,6 +2696,7 @@ async def _proxy_hybrid_native_openai_tool_protocol(
                 active_state=active_state,
                 owui_rag_meta=owui_rag_meta,
                 skip_write_path=skip_write_path,
+                answer_mode=planner_answer_mode or None,
                 timeout_seconds=timeout_seconds,
             )
 
