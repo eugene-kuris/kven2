@@ -21,7 +21,6 @@ from sqlite import (
 from retrieval import retrieve_context  # <-- ФАЗА 4: Векторный ретрив
 # ИСПРАВЛЕНО: Импорт обновлен на новое имя файла kven2_profile
 from kven2_profile import load_agent_profile
-import kven2_time as sys_time
 from write_path import process_episodic, strip_reasoning
 from config import settings
 from model_adapters import resolve_model_adapter
@@ -1099,6 +1098,7 @@ def _prepare_native_tool_payload(
     native_payload = dict(body)
     native_payload["model"] = model_name
     native_payload["messages"] = messages
+    native_payload["cache_prompt"] = True
 
     # First pass: make tool selection deterministic and give Qwen enough budget
     # to emit tool_calls instead of spending the whole response in reasoning.
@@ -3944,8 +3944,9 @@ async def handle_chat(request: Request):
 
             # 2. Сборка промпта
             profile = load_agent_profile()
-            current_time = await sys_time.get_external_time()
-            logger.info(f"[ROUTE] Profile loaded. Time fetched: {current_time}")
+            logger.info(
+                "[ROUTE] Profile loaded. Current time is resolved by tool only when needed."
+            )
 
             sys_block = ""
             if profile:
@@ -3957,10 +3958,13 @@ async def handle_chat(request: Request):
                 sys_block += f"Owner: {profile.get('owner', '')}\n"
                 sys_block += f"Mission: {profile.get('mission', '')}\n\n"
 
-            sys_block += f"Current server datetime: {current_time}\n"
-            sys_block += "You have access to the current server time above.\n"
-            sys_block += "Use it when answering questions about date or time.\n"
-            sys_block += "Do not say that you lack realtime access.\n\n"
+            sys_block += (
+                "CURRENT DATE AND TIME POLICY:\n"
+                "- Current server time is not injected into every prompt.\n"
+                "- When the current date or time matters, use the get_time tool if available.\n"
+                "- Do not guess the current date or time.\n"
+                "- Do not claim that realtime access is unavailable when get_time is available.\n\n"
+            )
             sys_block += (
                 "MEMORY OWNERSHIP POLICY:\n"
                 "- OWUI Knowledge/Collections and OWUI Memory are read-only reference sources.\n"
@@ -4037,7 +4041,8 @@ async def handle_chat(request: Request):
             "model": model_name,
             "messages": enriched_messages,
             "stream": body.get("stream", False),
-            "temperature": body.get("temperature", 0.7)
+            "temperature": body.get("temperature", 0.7),
+            "cache_prompt": True,
         }
 
         forwarded_params = _apply_generation_passthrough(body, payload)
