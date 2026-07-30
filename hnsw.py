@@ -263,15 +263,22 @@ def save_hnsw():
 
     with hnsw_lock:
         try:
-            if hnsw_index is not None:
-                os.makedirs(os.path.dirname(index_path) or ".", exist_ok=True)
-                hnsw_index.save_index(index_path)
-                _SAVE_COUNTER = 0
-                logger.info("[HNSW] Index saved to disk.")
-            else:
-                logger.warning("[HNSW] save_hnsw called while index is None; only ID map will be saved.")
+            if hnsw_index is None:
+                logger.warning(
+                    "[HNSW] save_hnsw skipped: index is None; "
+                    "refusing to write an ID map without its index."
+                )
+                return False
 
-            _save_id_map()
+            os.makedirs(os.path.dirname(index_path) or ".", exist_ok=True)
+            hnsw_index.save_index(index_path)
+            _SAVE_COUNTER = 0
+            logger.info("[HNSW] Index saved to disk.")
+
+            if not _save_id_map():
+                logger.error("[HNSW] ID map save failed.")
+                return False
+
             logger.info("[HNSW] Index and ID map saved to disk.")
             return True
 

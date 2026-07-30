@@ -1,3 +1,4 @@
+import atexit
 import json
 import os
 import unittest
@@ -6,6 +7,11 @@ from unittest.mock import AsyncMock, patch
 from fastapi.responses import Response
 
 import routes
+import hnsw
+
+# Importing routes imports hnsw, which registers a production persistence
+# handler. Unit tests must never persist process-local HNSW state on exit.
+atexit.unregister(hnsw.save_hnsw)
 
 
 TOOLS = [
