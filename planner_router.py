@@ -28,6 +28,7 @@ PLANNER_CHAT_URL = (
 DEFAULT_TIMEOUT_SECONDS = 20.0
 SELECTION_MAX_TOKENS = 96
 ARGUMENTS_MAX_TOKENS = 192
+THINKING_MAX_TOKENS = 64
 MAX_CONTEXT_CHARS = 6000
 MAX_DESCRIPTION_CHARS = 240
 
@@ -333,6 +334,101 @@ async def _post_planner_json(
     }
 
     return parsed, meta
+
+
+def _thinking_prompt(context: str) -> str:
+    return (
+        "You are the Kven II answer-mode classifier.\n"
+        "Decide whether the main model needs extended internal reasoning "
+        "for the user's latest request.\n\n"
+        "Rules:\n"
+        "- Do not solve the user's task.\n"
+        "- Select FAST only when the answer is explicitly present in the "
+        "request or the task is a purely linguistic transformation with "
+        "no inference.\n"
+        "- FAST is suitable for greetings, acknowledgements, translation, "
+        "simple paraphrasing, and extracting an explicitly stated value.\n"
+        "- Applying any rule, even a single short or obvious rule, always "
+        "requires THINK.\n"
+        "- Questions asking what is allowed, what will happen, which route "
+        "applies, or what capacity results from a technical state require "
+        "THINK.\n"
+        "- Select THINK for calculations, diagnosis, routing, permissions, "
+        "configuration, code, storage, security, option comparison, and "
+        "causal analysis.\n"
+        "- THINK examples: applying UNIX rwx permissions and group "
+        "membership; determining git merge --ff-only behavior; "
+        "longest-prefix routing; RAID calculation; systemd dependency "
+        "behavior.\n"
+        "- When uncertain, select THINK.\n\n"
+        "Return exactly one JSON object:\n"
+        '{"mode":"FAST"}\n'
+        "or\n"
+        '{"mode":"THINK"}\n\n'
+        f"Conversation context:\n{context}"
+    )
+
+
+async def classify_main_thinking(
+    messages: list[dict],
+    *,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+) -> dict:
+    """
+    Classify the main-model answer as FAST or THINK.
+
+    Result forms:
+      {"mode": "FAST", "meta": {...}}
+      {"mode": "THINK", "meta": {...}}
+      {"mode": "ERROR", "error": "...", "meta": {...}}
+    """
+
+    context = _compact_conversation_context(messages)
+    selection_meta: dict = {}
+
+    try:
+        selection, selection_meta = await _post_planner_json(
+            _thinking_prompt(context),
+            max_tokens=THINKING_MAX_TOKENS,
+            timeout_seconds=timeout_seconds,
+        )
+
+        mode = str(selection.get("mode") or "").strip().upper()
+        if mode not in {"FAST", "THINK"}:
+            raise PlannerRouterError(
+                f"unknown thinking mode: {mode!r}"
+            )
+
+        logger.info(
+            "[PLANNER_THINKING] mode=%s elapsed=%s "
+            "prompt_tokens=%s cached_tokens=%s",
+            mode,
+            selection_meta.get("elapsed_seconds"),
+            selection_meta.get("prompt_tokens"),
+            selection_meta.get("cached_tokens"),
+        )
+
+        return {
+            "mode": mode,
+            "meta": {
+                "selection": selection_meta,
+            },
+        }
+
+    except Exception as exc:
+        logger.warning(
+            "[PLANNER_THINKING] classification_failed error=%s",
+            exc,
+            exc_info=True,
+        )
+
+        return {
+            "mode": "ERROR",
+            "error": str(exc),
+            "meta": {
+                "selection": selection_meta,
+            },
+        }
 
 
 def _selection_prompt(
