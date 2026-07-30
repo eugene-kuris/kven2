@@ -25,6 +25,7 @@ import kven2_time as sys_time
 from write_path import process_episodic, strip_reasoning
 from config import settings
 from model_adapters import resolve_model_adapter
+from planner_router import route_tool_request as planner_route_tool_request
 from sandbox_client import execute_gateway_tool as sandbox_execute_gateway_tool
 from tool_loop import (
     extract_gateway_tool_call as tool_loop_extract_gateway_tool_call,
@@ -67,7 +68,7 @@ logger.addFilter(_RequestIdLogFilter())
 
 router = APIRouter()
 BASE_BACKEND = settings.LLM_BACKEND_URL
-ROUTES_TOOLS_PROBE_VERSION = "owui-active-tool-continuation-2026-07-20-v11j"
+ROUTES_TOOLS_PROBE_VERSION = "planner-tool-routing-2026-07-30-v12"
 
 
 # -----------------------------------------------------------------------------
@@ -2227,6 +2228,144 @@ async def _proxy_hybrid_native_openai_tool_protocol(
             skip_write_path=skip_write_path,
             timeout_seconds=timeout_seconds,
         )
+
+    planner_enabled = _env_bool(
+        "KVEN2_PLANNER_TOOL_ROUTING_ENABLED",
+        False,
+    )
+    tool_choice = payload.get("tool_choice")
+    tool_choice_mode = (
+        str(tool_choice).strip().lower()
+        if isinstance(tool_choice, str)
+        else ""
+    )
+
+    if planner_enabled and tool_choice_mode == "none":
+        logger.info(
+            "[PLANNER_ROUTER] bypass reason=tool_choice_none "
+            "route_to_final_answer=True"
+        )
+        return await _proxy_hybrid_no_tool_final_response(
+            payload,
+            chat_url,
+            write_path_messages=write_path_messages,
+            active_state=active_state,
+            owui_rag_meta=owui_rag_meta,
+            skip_write_path=skip_write_path,
+            timeout_seconds=timeout_seconds,
+        )
+
+    if planner_enabled:
+        planner_timeout = _env_float(
+            "KVEN2_PLANNER_TOOL_ROUTING_TIMEOUT",
+            20.0,
+            3.0,
+            60.0,
+        )
+        explicit_tool_name = _explicit_native_tool_choice_name(
+            tool_choice
+        )
+
+        logger.info(
+            "[PLANNER_ROUTER] routing_start tools_count=%s "
+            "explicit_tool=%s required=%s timeout=%s",
+            len(payload.get("tools", []))
+            if isinstance(payload.get("tools"), list)
+            else 0,
+            explicit_tool_name or "",
+            tool_choice_mode == "required",
+            planner_timeout,
+        )
+
+        planner_result = await planner_route_tool_request(
+            messages,
+            payload.get("tools", []),
+            allowed_names=allowed_names,
+            explicit_tool_name=explicit_tool_name or None,
+            timeout_seconds=planner_timeout,
+        )
+        planner_decision = str(
+            planner_result.get("decision") or ""
+        ).strip().upper()
+
+        logger.info(
+            "[PLANNER_ROUTER] routing_result decision=%s meta=%s "
+            "error=%s",
+            planner_decision,
+            _json_preview(
+                planner_result.get("meta") or {},
+                limit=1600,
+            ),
+            str(planner_result.get("error") or "")[:500],
+        )
+
+        if planner_decision == "TOOL":
+            planned_call = planner_result.get("tool_call")
+            calls, call_meta = _validate_and_limit_native_tool_calls(
+                [planned_call] if planned_call else [],
+                allowed_names,
+            )
+
+            if calls:
+                logger.info(
+                    "[PLANNER_ROUTER] native_tool_call_ready "
+                    "name=%s validation=%s",
+                    calls[0]["function"]["name"],
+                    _json_preview(call_meta, limit=1000),
+                )
+                completion = _completion_with_tool_calls(
+                    {
+                        "model": (
+                            payload.get("model")
+                            or settings.MAIN_MODEL
+                        )
+                    },
+                    calls,
+                )
+                return _completion_response_for_client(
+                    completion,
+                    stream_requested,
+                )
+
+            logger.warning(
+                "[PLANNER_ROUTER] invalid_tool_call "
+                "fallback=legacy_main validation=%s",
+                _json_preview(call_meta, limit=1000),
+            )
+
+        elif (
+            planner_decision == "NO_TOOL"
+            and tool_choice_mode != "required"
+        ):
+            logger.info(
+                "[PLANNER_ROUTER] no_tool "
+                "route_to_final_answer=True"
+            )
+            return await _proxy_hybrid_no_tool_final_response(
+                payload,
+                chat_url,
+                write_path_messages=write_path_messages,
+                active_state=active_state,
+                owui_rag_meta=owui_rag_meta,
+                skip_write_path=skip_write_path,
+                timeout_seconds=timeout_seconds,
+            )
+
+        elif (
+            planner_decision == "NO_TOOL"
+            and tool_choice_mode == "required"
+        ):
+            logger.warning(
+                "[PLANNER_ROUTER] no_tool_rejected "
+                "reason=tool_choice_required fallback=legacy_main"
+            )
+
+        else:
+            logger.warning(
+                "[PLANNER_ROUTER] unavailable "
+                "fallback=legacy_main decision=%s",
+                planner_decision,
+            )
 
     decision_timeout = float(
         _env_int(
