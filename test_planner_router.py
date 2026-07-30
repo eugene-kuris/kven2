@@ -162,6 +162,38 @@ class PlannerRouterTests(unittest.IsolatedAsyncioTestCase):
             result["error"],
         )
 
+    def test_selection_prompt_keeps_dynamic_context_last(self):
+        prompt = planner_router._selection_prompt(
+            "DYNAMIC-CONTEXT",
+            [{"name": "stable_tool"}],
+        )
+
+        self.assertLess(
+            prompt.index("Доступные инструменты:"),
+            prompt.index("Контекст беседы:"),
+        )
+        self.assertTrue(prompt.endswith("DYNAMIC-CONTEXT"))
+
+    def test_arguments_prompt_keeps_dynamic_context_last(self):
+        prompt = planner_router._arguments_prompt(
+            "DYNAMIC-CONTEXT",
+            {
+                "name": "stable_tool",
+                "description": "Stable description",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                },
+            },
+        )
+
+        self.assertLess(
+            prompt.index("Выбранный инструмент:"),
+            prompt.index("Контекст беседы:"),
+        )
+        self.assertTrue(prompt.endswith("DYNAMIC-CONTEXT"))
+
+
     async def test_explicit_tool_skips_selection(self):
         mocked = AsyncMock(
             return_value=(

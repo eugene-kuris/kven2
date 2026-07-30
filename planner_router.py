@@ -355,9 +355,9 @@ def _selection_prompt(
         '{"decision":"NO_TOOL"}\n'
         "или\n"
         '{"decision":"TOOL","name":"tool_name"}\n\n'
-        f"Контекст беседы:\n{context}\n\n"
         "Доступные инструменты:\n"
         f"{json.dumps(catalog, ensure_ascii=False, separators=(',', ':'))}"
+        f"\n\nКонтекст беседы:\n{context}"
     )
 
 
@@ -374,9 +374,9 @@ def _arguments_prompt(
         "которых нет в запросе или контексте.\n\n"
         "Ответ строго одним JSON-объектом:\n"
         '{"name":"tool_name","arguments":{}}\n\n'
-        f"Контекст беседы:\n{context}\n\n"
         "Выбранный инструмент:\n"
         f"{json.dumps(tool, ensure_ascii=False, separators=(',', ':'))}"
+        f"\n\nКонтекст беседы:\n{context}"
     )
 
 
