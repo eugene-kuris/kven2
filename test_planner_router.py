@@ -45,7 +45,7 @@ class PlannerRouterTests(unittest.IsolatedAsyncioTestCase):
     async def test_no_tool(self):
         mocked = AsyncMock(
             return_value=(
-                {"decision": "NO_TOOL"},
+                {"decision": "NO_TOOL", "mode": "THINK"},
                 {"elapsed_seconds": 0.5},
             )
         )
@@ -59,14 +59,49 @@ class PlannerRouterTests(unittest.IsolatedAsyncioTestCase):
                 [
                     {
                         "role": "user",
-                        "content": "Объясни принцип работы TCP.",
+                        "content": "Explain how TCP works.",
                     }
                 ],
                 TOOLS,
             )
 
         self.assertEqual(result["decision"], "NO_TOOL")
+        self.assertEqual(result["mode"], "THINK")
         self.assertEqual(mocked.await_count, 1)
+
+    async def test_no_tool_requires_valid_answer_mode(self):
+        mocked = AsyncMock(
+            return_value=(
+                {
+                    "decision": "NO_TOOL",
+                    "mode": "MAYBE",
+                },
+                {
+                    "elapsed_seconds": 0.2,
+                },
+            )
+        )
+
+        with patch.object(
+            planner_router,
+            "_post_planner_json",
+            mocked,
+        ):
+            result = await planner_router.route_tool_request(
+                [
+                    {
+                        "role": "user",
+                        "content": "Explain how TCP works.",
+                    }
+                ],
+                TOOLS,
+            )
+
+        self.assertEqual(result["decision"], "ERROR")
+        self.assertIn(
+            "unknown NO_TOOL answer mode",
+            result["error"],
+        )
 
     async def test_tool_selection_and_arguments(self):
         mocked = AsyncMock(
@@ -84,7 +119,7 @@ class PlannerRouterTests(unittest.IsolatedAsyncioTestCase):
                     {
                         "name": "search_web",
                         "arguments": {
-                            "query": "текущий курс доллара",
+                            "query": "current USD exchange rate",
                         },
                     },
                     {
@@ -103,7 +138,7 @@ class PlannerRouterTests(unittest.IsolatedAsyncioTestCase):
                 [
                     {
                         "role": "user",
-                        "content": "Найди текущий курс доллара.",
+                        "content": "Find the current USD exchange rate.",
                     }
                 ],
                 TOOLS,
@@ -117,7 +152,7 @@ class PlannerRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             json.loads(function["arguments"]),
             {
-                "query": "текущий курс доллара",
+                "query": "current USD exchange rate",
             },
         )
 
@@ -150,7 +185,7 @@ class PlannerRouterTests(unittest.IsolatedAsyncioTestCase):
                 [
                     {
                         "role": "user",
-                        "content": "Найди актуальные сведения.",
+                        "content": "Find current information.",
                     }
                 ],
                 TOOLS,
@@ -169,10 +204,18 @@ class PlannerRouterTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertLess(
-            prompt.index("Доступные инструменты:"),
-            prompt.index("Контекст беседы:"),
+            prompt.index("Available tools:"),
+            prompt.index("Conversation context:"),
         )
         self.assertTrue(prompt.endswith("DYNAMIC-CONTEXT"))
+        self.assertIn(
+            '{"decision":"NO_TOOL","mode":"FAST"}',
+            prompt,
+        )
+        self.assertIn(
+            '{"decision":"NO_TOOL","mode":"THINK"}',
+            prompt,
+        )
 
     def test_arguments_prompt_keeps_dynamic_context_last(self):
         prompt = planner_router._arguments_prompt(
@@ -188,8 +231,8 @@ class PlannerRouterTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertLess(
-            prompt.index("Выбранный инструмент:"),
-            prompt.index("Контекст беседы:"),
+            prompt.index("Selected tool:"),
+            prompt.index("Conversation context:"),
         )
         self.assertTrue(prompt.endswith("DYNAMIC-CONTEXT"))
 
@@ -218,7 +261,7 @@ class PlannerRouterTests(unittest.IsolatedAsyncioTestCase):
                 [
                     {
                         "role": "user",
-                        "content": "Открой https://example.com",
+                        "content": "Open https://example.com",
                     }
                 ],
                 TOOLS,

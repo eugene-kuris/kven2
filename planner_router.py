@@ -436,24 +436,42 @@ def _selection_prompt(
     catalog: list[dict],
 ) -> str:
     return (
-        "Ты маршрутизатор инструментов Kven II.\n"
-        "Определи, требуется ли один из доступных инструментов для "
-        "последнего запроса пользователя.\n\n"
-        "Правила:\n"
-        "- Не решай сам пользовательскую задачу.\n"
-        "- Выбирай NO_TOOL, если можно надёжно ответить рассуждением "
-        "и уже имеющимся контекстом.\n"
-        "- Выбирай TOOL для актуальных внешних данных, содержимого URL "
-        "или файлов, поиска в частных данных и явных действий.\n"
-        "- Не выдумывай имя инструмента.\n"
-        "- Выбирай не более одного инструмента.\n\n"
-        "Ответ строго одним JSON-объектом:\n"
-        '{"decision":"NO_TOOL"}\n'
-        "или\n"
+        "You are the Kven II tool and answer-mode router.\n"
+        "Decide whether the user's latest request requires one of the "
+        "available tools. If no tool is required, also decide whether "
+        "the main model needs extended internal reasoning.\n\n"
+        "Tool-routing rules:\n"
+        "- Do not solve the user's task.\n"
+        "- Select NO_TOOL when the request can be answered reliably from "
+        "the existing conversation context and model knowledge.\n"
+        "- Select TOOL for current external data, URL or file content, "
+        "private-data search, or an explicit external action.\n"
+        "- Never invent a tool name.\n"
+        "- Select at most one tool.\n\n"
+        "Answer-mode rules for NO_TOOL:\n"
+        "- Select FAST only when the answer is explicitly present in the "
+        "request or the task is a purely linguistic transformation with "
+        "no inference.\n"
+        "- FAST is suitable for greetings, acknowledgements, translation, "
+        "simple paraphrasing, and extracting an explicitly stated value.\n"
+        "- Applying any rule, even a single short or obvious rule, always "
+        "requires THINK.\n"
+        "- Questions asking what is allowed, what will happen, which route "
+        "applies, or what capacity results from a technical state require "
+        "THINK.\n"
+        "- Select THINK for calculations, diagnosis, routing, permissions, "
+        "configuration, code, storage, security, option comparison, and "
+        "causal analysis.\n"
+        "- When uncertain, select THINK.\n\n"
+        "Return exactly one JSON object:\n"
+        '{"decision":"NO_TOOL","mode":"FAST"}\n'
+        "or\n"
+        '{"decision":"NO_TOOL","mode":"THINK"}\n'
+        "or\n"
         '{"decision":"TOOL","name":"tool_name"}\n\n'
-        "Доступные инструменты:\n"
+        "Available tools:\n"
         f"{json.dumps(catalog, ensure_ascii=False, separators=(',', ':'))}"
-        f"\n\nКонтекст беседы:\n{context}"
+        f"\n\nConversation context:\n{context}"
     )
 
 
@@ -462,17 +480,16 @@ def _arguments_prompt(
     tool: dict,
 ) -> str:
     return (
-        "Ты формируешь аргументы для уже выбранного инструмента "
-        "Kven II.\n"
-        "Не вызывай другой инструмент и не отвечай на пользовательскую "
-        "задачу.\n"
-        "Заполни аргументы по JSON Schema. Не выдумывай сведения, "
-        "которых нет в запросе или контексте.\n\n"
-        "Ответ строго одним JSON-объектом:\n"
+        "You generate arguments for an already selected Kven II tool.\n"
+        "Do not select another tool and do not answer the user's task.\n"
+        "Fill the arguments according to the JSON Schema. Do not invent "
+        "information that is absent from the request or conversation "
+        "context.\n\n"
+        "Return exactly one JSON object:\n"
         '{"name":"tool_name","arguments":{}}\n\n'
-        "Выбранный инструмент:\n"
+        "Selected tool:\n"
         f"{json.dumps(tool, ensure_ascii=False, separators=(',', ':'))}"
-        f"\n\nКонтекст беседы:\n{context}"
+        f"\n\nConversation context:\n{context}"
     )
 
 
@@ -488,7 +505,7 @@ async def route_tool_request(
     Return a compact planner decision.
 
     Result forms:
-      {"decision": "NO_TOOL", "meta": {...}}
+      {"decision": "NO_TOOL", "mode": "FAST|THINK", "meta": {...}}
       {"decision": "TOOL", "tool_call": {...}, "meta": {...}}
       {"decision": "ERROR", "error": "...", "meta": {...}}
     """
@@ -499,6 +516,7 @@ async def route_tool_request(
     if not tools_by_name:
         return {
             "decision": "NO_TOOL",
+            "mode": "THINK",
             "meta": {
                 "reason": "no_allowed_tools",
             },
@@ -537,15 +555,26 @@ async def route_tool_request(
             ).strip().upper()
 
             if decision == "NO_TOOL":
+                mode = str(
+                    selection.get("mode") or ""
+                ).strip().upper()
+
+                if mode not in {"FAST", "THINK"}:
+                    raise PlannerRouterError(
+                        f"unknown NO_TOOL answer mode: {mode!r}"
+                    )
+
                 logger.info(
-                    "[PLANNER_ROUTER] no_tool elapsed=%s "
+                    "[PLANNER_ROUTER] no_tool mode=%s elapsed=%s "
                     "prompt_tokens=%s cached_tokens=%s",
+                    mode,
                     selection_meta.get("elapsed_seconds"),
                     selection_meta.get("prompt_tokens"),
                     selection_meta.get("cached_tokens"),
                 )
                 return {
                     "decision": "NO_TOOL",
+                    "mode": mode,
                     "meta": {
                         "selection": selection_meta,
                     },
