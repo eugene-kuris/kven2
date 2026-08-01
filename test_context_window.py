@@ -285,6 +285,139 @@ class ContextWindowReportTests(unittest.TestCase):
             0,
         )
 
+    def test_media_compaction_preview_removes_only_older_media(self):
+        old_data_uri = (
+            "data:image/png;base64,"
+            + ("A" * 100)
+        )
+        recent_data_uri = (
+            "data:image/png;base64,"
+            + ("B" * 80)
+        )
+        messages = [
+            {
+                "role": "system",
+                "content": "stable system",
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "older image question",
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": old_data_uri,
+                        },
+                    },
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": "older answer",
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "latest image question",
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": recent_data_uri,
+                        },
+                    },
+                ],
+            },
+        ]
+        original = copy.deepcopy(messages)
+
+        compacted, meta = (
+            context_window.build_historical_media_compaction_preview(
+                messages,
+                tail_messages=2,
+            )
+        )
+
+        self.assertEqual(messages, original)
+        self.assertEqual(compacted[0], original[0])
+        self.assertEqual(compacted[2:], original[2:])
+        self.assertEqual(
+            compacted[1]["content"][0],
+            original[1]["content"][0],
+        )
+        self.assertNotIn(
+            old_data_uri,
+            json.dumps(compacted, ensure_ascii=False),
+        )
+        self.assertIn(
+            recent_data_uri,
+            json.dumps(compacted, ensure_ascii=False),
+        )
+        self.assertEqual(meta["candidate_indices"], [1])
+        self.assertEqual(meta["compacted_indices"], [1])
+        self.assertEqual(meta["removed_media_parts"], 1)
+        self.assertGreater(meta["saved_json_chars"], 0)
+
+    def test_media_compaction_preview_preserves_active_tool_tail(self):
+        data_uri = (
+            "data:image/png;base64,"
+            + ("A" * 100)
+        )
+        messages = [
+            {
+                "role": "system",
+                "content": "system",
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": data_uri,
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "search_web",
+                            "arguments": "{}",
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "current result",
+            },
+        ]
+        original = copy.deepcopy(messages)
+
+        compacted, meta = (
+            context_window.build_historical_media_compaction_preview(
+                messages,
+                tail_messages=1,
+            )
+        )
+
+        self.assertEqual(compacted[2:], original[2:])
+        self.assertEqual(meta["verbatim_tail_start"], 2)
+        self.assertTrue(meta["active_tool_continuation"])
+        self.assertEqual(meta["compacted_indices"], [1])
+
     def test_report_does_not_mutate_or_expose_content(self):
         messages = [
             {

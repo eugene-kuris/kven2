@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 from collections import Counter
 from typing import Any
@@ -223,6 +224,146 @@ def _completed_tool_protocol_groups(
         index += 1
 
     return groups
+
+
+_HISTORICAL_MEDIA_PLACEHOLDER = (
+    "[Historical media omitted from active context after its turn was completed.]"
+)
+
+
+def _replace_media_content_with_placeholder(
+    content: Any,
+    *,
+    placeholder: str,
+) -> tuple[Any, int]:
+    """Return copied content with media parts replaced by one text marker."""
+
+    if isinstance(content, list):
+        copied_parts = []
+        removed_parts = 0
+
+        for part in content:
+            if isinstance(part, dict):
+                part_type = str(
+                    part.get("type") or ""
+                ).strip().lower()
+                if part_type in _MEDIA_PART_TYPES:
+                    removed_parts += 1
+                    continue
+
+            copied_parts.append(copy.deepcopy(part))
+
+        if removed_parts:
+            copied_parts.append(
+                {
+                    "type": "text",
+                    "text": placeholder,
+                }
+            )
+
+        return copied_parts, removed_parts
+
+    if isinstance(content, dict):
+        part_type = str(
+            content.get("type") or ""
+        ).strip().lower()
+        if part_type in _MEDIA_PART_TYPES:
+            return (
+                {
+                    "type": "text",
+                    "text": placeholder,
+                },
+                1,
+            )
+
+    return copy.deepcopy(content), 0
+
+
+def build_historical_media_compaction_preview(
+    messages: list,
+    *,
+    tail_messages: int = 12,
+    placeholder: str = _HISTORICAL_MEDIA_PLACEHOLDER,
+) -> tuple[list, dict]:
+    """Build a non-runtime preview that removes only older media payloads.
+
+    Leading system messages and the protected verbatim tail are copied without
+    changes. Historical text remains in place. Each older message that contains
+    one or more media parts receives one deterministic text placeholder.
+    """
+
+    source_messages = messages if isinstance(messages, list) else []
+    compacted_messages = copy.deepcopy(source_messages)
+    before_report = build_context_window_report(
+        source_messages,
+        tail_messages=tail_messages,
+    )
+    candidate_indices = list(
+        before_report.get(
+            "older_media_candidate_indices",
+            [],
+        )
+    )
+
+    compacted_indices = []
+    removed_media_parts = 0
+
+    for index in candidate_indices:
+        if not (
+            0 <= index < len(compacted_messages)
+            and isinstance(compacted_messages[index], dict)
+        ):
+            continue
+
+        message = compacted_messages[index]
+        compacted_content, removed = (
+            _replace_media_content_with_placeholder(
+                message.get("content"),
+                placeholder=str(placeholder),
+            )
+        )
+        if not removed:
+            continue
+
+        message["content"] = compacted_content
+        compacted_indices.append(index)
+        removed_media_parts += removed
+
+    before_json_chars = _json_char_count(source_messages)
+    after_json_chars = _json_char_count(compacted_messages)
+    after_report = build_context_window_report(
+        compacted_messages,
+        tail_messages=tail_messages,
+    )
+
+    return compacted_messages, {
+        "candidate_indices": candidate_indices,
+        "compacted_indices": compacted_indices,
+        "compacted_messages": len(compacted_indices),
+        "removed_media_parts": removed_media_parts,
+        "before_json_chars": before_json_chars,
+        "after_json_chars": after_json_chars,
+        "saved_json_chars": max(
+            0,
+            before_json_chars - after_json_chars,
+        ),
+        "before_media_payload_chars": before_report.get(
+            "media_payload_chars_total",
+            0,
+        ),
+        "after_media_payload_chars": after_report.get(
+            "media_payload_chars_total",
+            0,
+        ),
+        "verbatim_tail_start": before_report.get(
+            "verbatim_tail_start",
+            0,
+        ),
+        "active_tool_continuation": before_report.get(
+            "active_tool_continuation",
+            False,
+        ),
+    }
 
 
 def _active_tool_continuation_start(
