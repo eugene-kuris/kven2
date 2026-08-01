@@ -115,6 +115,78 @@ class ContextWindowReportTests(unittest.TestCase):
             ["assistant", "tool", "tool"],
         )
 
+    def test_report_splits_text_and_media_payloads(self):
+        data_uri = (
+            "data:image/png;base64,"
+            + ("A" * 100)
+        )
+        remote_url = "https://example.test/image.png"
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "hello",
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": data_uri,
+                        },
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": remote_url,
+                        },
+                    },
+                ],
+            }
+        ]
+
+        report = context_window.build_context_window_report(
+            messages,
+            tail_messages=12,
+        )
+
+        self.assertEqual(
+            report["text_chars_total"],
+            len("hello"),
+        )
+        self.assertEqual(
+            report["media_data_uri_chars_total"],
+            len(data_uri),
+        )
+        self.assertEqual(
+            report["media_reference_chars_total"],
+            len(remote_url),
+        )
+        self.assertEqual(
+            report["media_data_uri_count"],
+            1,
+        )
+        self.assertEqual(
+            report["media_reference_count"],
+            1,
+        )
+
+        manifest = report["message_manifest"][0]
+
+        self.assertEqual(manifest["index"], 0)
+        self.assertEqual(manifest["role"], "user")
+        self.assertEqual(
+            manifest["part_type_counts"],
+            {
+                "image_url": 2,
+                "text": 1,
+            },
+        )
+        self.assertEqual(
+            manifest["media_payload_chars"],
+            len(data_uri) + len(remote_url),
+        )
+
     def test_report_does_not_mutate_or_expose_content(self):
         messages = [
             {

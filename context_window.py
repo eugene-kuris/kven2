@@ -33,6 +33,123 @@ def _content_char_count(content: Any) -> int:
     return _json_char_count(content)
 
 
+_MEDIA_PART_TYPES = {
+    "image",
+    "image_url",
+    "input_image",
+    "audio",
+    "input_audio",
+    "video",
+    "file",
+    "input_file",
+}
+
+
+def _media_string_values(value: Any):
+    """Yield media payload strings without exposing them."""
+
+    if isinstance(value, str):
+        yield value
+        return
+
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            if str(key).lower() == "type":
+                continue
+            yield from _media_string_values(nested)
+        return
+
+    if isinstance(value, (list, tuple)):
+        for nested in value:
+            yield from _media_string_values(nested)
+
+
+def _content_manifest(content: Any) -> dict:
+    """Describe text and media sizes without retaining content."""
+
+    content_json_chars = _json_char_count(content)
+    text_chars = 0
+    media_payload_chars = 0
+    media_data_uri_chars = 0
+    media_reference_chars = 0
+    media_data_uri_count = 0
+    media_reference_count = 0
+    part_types: Counter = Counter()
+
+    if content is None:
+        content_kind = "none"
+        parts = []
+    elif isinstance(content, str):
+        content_kind = "text"
+        parts = [content]
+    elif isinstance(content, list):
+        content_kind = "list"
+        parts = content
+    elif isinstance(content, dict):
+        content_kind = "dict"
+        parts = [content]
+    else:
+        content_kind = type(content).__name__
+        parts = [content]
+
+    for part in parts:
+        if isinstance(part, str):
+            part_types["text"] += 1
+            text_chars += len(part)
+            continue
+
+        if not isinstance(part, dict):
+            part_types[type(part).__name__] += 1
+            continue
+
+        part_type = str(
+            part.get("type") or "unknown"
+        ).strip().lower()
+        part_types[part_type] += 1
+
+        if part_type == "text":
+            text = part.get("text")
+            if isinstance(text, str):
+                text_chars += len(text)
+            elif text is not None:
+                text_chars += _json_char_count(text)
+            continue
+
+        if part_type not in _MEDIA_PART_TYPES:
+            continue
+
+        for value in _media_string_values(part):
+            value_chars = len(value)
+            media_payload_chars += value_chars
+
+            if value.lstrip().lower().startswith("data:"):
+                media_data_uri_chars += value_chars
+                media_data_uri_count += 1
+            else:
+                media_reference_chars += value_chars
+                media_reference_count += 1
+
+    return {
+        "content_kind": content_kind,
+        "content_json_chars": content_json_chars,
+        "text_chars": text_chars,
+        "media_payload_chars": media_payload_chars,
+        "media_data_uri_chars": media_data_uri_chars,
+        "media_reference_chars": media_reference_chars,
+        "media_data_uri_count": media_data_uri_count,
+        "media_reference_count": media_reference_count,
+        "other_or_structure_chars": max(
+            0,
+            content_json_chars
+            - text_chars
+            - media_payload_chars,
+        ),
+        "part_type_counts": dict(
+            sorted(part_types.items())
+        ),
+    }
+
+
 def _message_role(message: Any) -> str:
     if not isinstance(message, dict):
         return "invalid"
@@ -149,6 +266,45 @@ def build_context_window_report(
         _json_char_count(message)
         for message in messages
     ]
+    content_manifests = [
+        _content_manifest(
+            message.get("content")
+            if isinstance(message, dict)
+            else message
+        )
+        for message in messages
+    ]
+    tool_calls_json_chars = [
+        _json_char_count(message.get("tool_calls"))
+        if (
+            isinstance(message, dict)
+            and message.get("tool_calls") is not None
+        )
+        else 0
+        for message in messages
+    ]
+    message_manifest = [
+        {
+            "index": index,
+            "role": _message_role(message),
+            "message_json_chars": (
+                message_json_chars[index]
+            ),
+            "tool_calls_json_chars": (
+                tool_calls_json_chars[index]
+            ),
+            "has_tool_calls": bool(
+                isinstance(message, dict)
+                and message.get("tool_calls")
+            ),
+            "has_tool_call_id": bool(
+                isinstance(message, dict)
+                and message.get("tool_call_id")
+            ),
+            **content_manifests[index],
+        }
+        for index, message in enumerate(messages)
+    ]
 
     system_prefix_messages = (
         _leading_system_message_count(messages)
@@ -178,6 +334,38 @@ def build_context_window_report(
         "message_json_chars_total": sum(
             message_json_chars
         ),
+        "text_chars_total": sum(
+            item["text_chars"]
+            for item in content_manifests
+        ),
+        "media_payload_chars_total": sum(
+            item["media_payload_chars"]
+            for item in content_manifests
+        ),
+        "media_data_uri_chars_total": sum(
+            item["media_data_uri_chars"]
+            for item in content_manifests
+        ),
+        "media_reference_chars_total": sum(
+            item["media_reference_chars"]
+            for item in content_manifests
+        ),
+        "media_data_uri_count": sum(
+            item["media_data_uri_count"]
+            for item in content_manifests
+        ),
+        "media_reference_count": sum(
+            item["media_reference_count"]
+            for item in content_manifests
+        ),
+        "other_or_structure_chars_total": sum(
+            item["other_or_structure_chars"]
+            for item in content_manifests
+        ),
+        "tool_calls_json_chars_total": sum(
+            tool_calls_json_chars
+        ),
+        "message_manifest": message_manifest,
         "system_prefix_messages": (
             system_prefix_messages
         ),
