@@ -1,6 +1,7 @@
 import atexit
 import copy
 import json
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -22,6 +23,88 @@ class FakeRequest:
 
 
 class PromptCacheContextTests(unittest.IsolatedAsyncioTestCase):
+    def test_context_window_report_is_disabled_by_default(self):
+        messages = [
+            {
+                "role": "user",
+                "content": "do not inspect this content",
+            }
+        ]
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(
+                "KVEN2_CONTEXT_WINDOW_REPORT_ENABLED",
+                None,
+            )
+            with patch.object(
+                routes,
+                "build_context_window_report",
+            ) as reporter:
+                routes._maybe_log_context_window_report(
+                    messages,
+                    route_label="main",
+                )
+
+        reporter.assert_not_called()
+
+    def test_context_window_report_is_content_free(self):
+        messages = [
+            {
+                "role": "system",
+                "content": "SECRET-SYSTEM-CONTENT",
+            },
+            {
+                "role": "user",
+                "content": "SECRET-USER-CONTENT",
+            },
+            {
+                "role": "assistant",
+                "content": "recent reply",
+            },
+        ]
+        original = copy.deepcopy(messages)
+
+        with patch.dict(
+            os.environ,
+            {
+                "KVEN2_CONTEXT_WINDOW_REPORT_ENABLED": "1",
+                "KVEN2_CONTEXT_WINDOW_TAIL_MESSAGES": "2",
+            },
+            clear=False,
+        ):
+            with self.assertLogs(
+                routes.logger,
+                level="INFO",
+            ) as captured:
+                routes._maybe_log_context_window_report(
+                    messages,
+                    route_label="main",
+                )
+
+        self.assertEqual(messages, original)
+
+        output = "\n".join(captured.output)
+        self.assertIn(
+            "[CONTEXT_WINDOW_REPORT]",
+            output,
+        )
+        self.assertIn(
+            '"configured_tail_messages":2',
+            output,
+        )
+        self.assertIn(
+            '"route_label":"main"',
+            output,
+        )
+        self.assertNotIn(
+            "SECRET-SYSTEM-CONTENT",
+            output,
+        )
+        self.assertNotIn(
+            "SECRET-USER-CONTENT",
+            output,
+        )
+
     def test_native_tool_payload_enables_prompt_cache(self):
         source_body = {
             "model": "owui-visible-model",

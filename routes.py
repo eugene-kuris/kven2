@@ -23,6 +23,7 @@ from retrieval import retrieve_context  # <-- ФАЗА 4: Векторный р�
 from kven2_profile import load_agent_profile
 from write_path import process_episodic, strip_reasoning
 from config import settings
+from context_window import build_context_window_report
 from model_adapters import resolve_model_adapter
 from planner_router import (
     classify_main_thinking as planner_classify_main_thinking,
@@ -895,6 +896,53 @@ def _debug_log_incoming_payload(body: dict) -> None:
         logger.info("[OWUI_PAYLOAD_DEBUG] %s", _json_preview(summary, limit=limit))
     except Exception as exc:
         logger.error("[OWUI_PAYLOAD_DEBUG] failed error=%s", exc, exc_info=True)
+
+
+def _maybe_log_context_window_report(
+    messages: list,
+    *,
+    route_label: str,
+) -> None:
+    """Log content-free context diagnostics when explicitly enabled."""
+
+    if not _env_bool(
+        "KVEN2_CONTEXT_WINDOW_REPORT_ENABLED",
+        False,
+    ):
+        return
+
+    try:
+        tail_messages = _env_int(
+            "KVEN2_CONTEXT_WINDOW_TAIL_MESSAGES",
+            12,
+            1,
+            200,
+        )
+        report = build_context_window_report(
+            messages,
+            tail_messages=tail_messages,
+        )
+        report = {
+            "route_label": str(route_label or "unknown"),
+            **report,
+        }
+        logger.info(
+            "[CONTEXT_WINDOW_REPORT] %s",
+            json.dumps(
+                report,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+        )
+    except Exception as exc:
+        logger.warning(
+            "[CONTEXT_WINDOW_REPORT] failed "
+            "route_label=%s error=%s",
+            route_label,
+            exc,
+            exc_info=True,
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -4237,6 +4285,16 @@ async def handle_chat(request: Request):
                 system_merge_meta.get("merged_system_parts"),
                 system_merge_meta.get("merged_system_chars"),
                 len(enriched_messages),
+            )
+
+        if not internal_request:
+            _maybe_log_context_window_report(
+                enriched_messages,
+                route_label=(
+                    "hybrid_native"
+                    if hybrid_native_user
+                    else "main"
+                ),
             )
 
         payload = {
