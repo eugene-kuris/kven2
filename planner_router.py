@@ -30,7 +30,7 @@ SELECTION_MAX_TOKENS = 24
 ARGUMENTS_MAX_TOKENS = 192
 THINKING_MAX_TOKENS = 8
 MAX_CONTEXT_CHARS = 6000
-MAX_DESCRIPTION_CHARS = 240
+MAX_SELECTION_CONTEXT_CHARS = 1200
 
 
 class PlannerRouterError(RuntimeError):
@@ -136,36 +136,15 @@ def _normalize_tools(
     return normalized
 
 
+
 def _compact_tool_catalog(tools_by_name: dict[str, dict]) -> list[dict]:
     catalog: list[dict] = []
 
     for name in sorted(tools_by_name):
-        tool = tools_by_name[name]
-        parameters = tool["parameters"]
-
-        required = parameters.get("required")
-        if not isinstance(required, list):
-            required = []
-
-        properties = parameters.get("properties")
-        if not isinstance(properties, dict):
-            properties = {}
-
         catalog.append(
             {
                 "id": len(catalog),
                 "name": name,
-                "description": tool["description"][:MAX_DESCRIPTION_CHARS],
-                "required": [
-                    str(field)
-                    for field in required
-                    if isinstance(field, str)
-                ],
-                "argument_names": sorted(
-                    str(field)
-                    for field in properties
-                    if isinstance(field, str)
-                ),
             }
         )
 
@@ -452,12 +431,7 @@ async def _post_planner_tool_call(
             }
         ],
         "tools": [planner_tool],
-        "tool_choice": {
-            "type": "function",
-            "function": {
-                "name": selected_name,
-            },
-        },
+        "tool_choice": "required",
         "temperature": 0.0,
         "max_tokens": max_tokens,
         "stream": False,
@@ -590,47 +564,31 @@ async def classify_main_thinking(
         }
 
 
+
 def _selection_prompt(
     context: str,
     catalog: list[dict],
 ) -> str:
+    selection_context = context[-MAX_SELECTION_CONTEXT_CHARS:]
+    tool_lines = "\n".join(
+        f"{item['id']} {item['name']}"
+        for item in catalog
+    )
+
     return (
-        "You are the Kven II tool and answer-mode router.\n"
-        "Decide whether the user's latest request requires one of the "
-        "available tools. If no tool is required, also decide whether "
-        "the main model needs extended internal reasoning.\n\n"
-        "Tool-routing rules:\n"
-        "- Do not solve the user's task.\n"
-        "- Select NO_TOOL when the request can be answered reliably from "
-        "the existing conversation context and model knowledge.\n"
-        "- Select TOOL for current external data, URL or file content, "
-        "private-data search, or an explicit external action.\n"
-        "- Never invent a tool name.\n"
-        "- Select at most one tool.\n\n"
-        "Answer-mode rules for NO_TOOL:\n"
-        "- Select FAST only when the answer is explicitly present in the "
-        "request or the task is a purely linguistic transformation with "
-        "no inference.\n"
-        "- FAST is suitable for greetings, acknowledgements, translation, "
-        "simple paraphrasing, and extracting an explicitly stated value.\n"
-        "- Applying any rule, even a single short or obvious rule, always "
-        "requires THINK.\n"
-        "- Questions asking what is allowed, what will happen, which route "
-        "applies, or what capacity results from a technical state require "
-        "THINK.\n"
-        "- Select THINK for calculations, diagnosis, routing, permissions, "
-        "configuration, code, storage, security, option comparison, and "
-        "causal analysis.\n"
-        "- When uncertain, select THINK.\n\n"
-        "Return exactly one protocol line:\n"
-        "FAST\n"
-        "or\n"
-        "THINK\n"
-        "or\n"
-        "TOOL <numeric_id>\n\n"
-        "Available tools (use the numeric id field):\n"
-        f"{json.dumps(catalog, ensure_ascii=False, separators=(',', ':'))}"
-        f"\n\nConversation context:\n{context}"
+        "Route the latest user request; do not solve it.\n"
+        "Return exactly one line: FAST, THINK, or TOOL <numeric_id>.\n"
+        "Use TOOL only for current, external, or private data; URL or "
+        "file content; or an external action.\n"
+        "Use FAST for greetings, acknowledgements, translation, "
+        "paraphrasing, direct extraction, or trivial arithmetic.\n"
+        "Use THINK for diagnosis, configuration, code, security, "
+        "comparison, multi-step calculation, causal reasoning, or "
+        "uncertainty.\n"
+        "Never invent a tool id and select at most one tool.\n\n"
+        "Available tools:\n"
+        f"{tool_lines}"
+        f"\n\nConversation context:\n{selection_context}"
     )
 
 

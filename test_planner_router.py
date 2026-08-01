@@ -188,32 +188,43 @@ class PlannerRouterTests(unittest.IsolatedAsyncioTestCase):
             result["error"],
         )
 
+
     def test_selection_prompt_keeps_dynamic_context_last(self):
         prompt = planner_router._selection_prompt(
             "DYNAMIC-CONTEXT",
-            [{"name": "stable_tool"}],
+            [{"id": 0, "name": "stable_tool"}],
         )
 
         self.assertLess(
-            prompt.index("Available tools (use the numeric id"),
+            prompt.index("Available tools:"),
             prompt.index("Conversation context:"),
         )
         self.assertTrue(prompt.endswith("DYNAMIC-CONTEXT"))
-        self.assertIn(
-            "FAST",
-            prompt,
-        )
-        self.assertIn(
-            "THINK",
-            prompt,
-        )
+        self.assertIn("FAST", prompt)
+        self.assertIn("THINK", prompt)
         self.assertIn("TOOL <numeric_id>", prompt)
-        self.assertEqual(
-            planner_router._compact_tool_catalog(
-                planner_router._normalize_tools(TOOLS)
-            )[1]["id"],
-            1,
+        self.assertIn("0 stable_tool", prompt)
+
+        catalog = planner_router._compact_tool_catalog(
+            planner_router._normalize_tools(TOOLS)
         )
+        self.assertEqual(catalog[1]["id"], 1)
+        self.assertEqual(
+            set(catalog[1]),
+            {"id", "name"},
+        )
+        self.assertNotIn("argument_names", prompt)
+        self.assertNotIn('"description"', prompt)
+
+    def test_selection_prompt_limits_dynamic_context(self):
+        context = "OLD-" + ("x" * 5000) + "-LATEST"
+        prompt = planner_router._selection_prompt(
+            context,
+            [{"id": 0, "name": "stable_tool"}],
+        )
+
+        self.assertNotIn("OLD-", prompt)
+        self.assertTrue(prompt.endswith("-LATEST"))
 
     def test_selection_protocol_rejects_out_of_range_tool(self):
         with self.assertRaisesRegex(
@@ -245,6 +256,84 @@ class PlannerRouterTests(unittest.IsolatedAsyncioTestCase):
             prompt,
         )
         self.assertTrue(prompt.endswith("DYNAMIC-CONTEXT"))
+
+
+    async def test_native_tool_request_uses_required_tool_choice(self):
+        captured: dict = {}
+
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "choices": [
+                        {
+                            "finish_reason": "tool_calls",
+                            "message": {
+                                "tool_calls": [
+                                    {
+                                        "function": {
+                                            "name": "search_web",
+                                            "arguments": (
+                                                '{"query":"current weather"}'
+                                            ),
+                                        }
+                                    }
+                                ],
+                            },
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 100,
+                        "completion_tokens": 20,
+                    },
+                }
+
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(
+                self,
+                exc_type,
+                exc,
+                traceback,
+            ):
+                return False
+
+            async def post(self, url, json):
+                captured["url"] = url
+                captured["payload"] = json
+                return FakeResponse()
+
+        selected_tool = planner_router._normalize_tools(TOOLS)[
+            "search_web"
+        ]
+
+        with patch.object(
+            planner_router.httpx,
+            "AsyncClient",
+            return_value=FakeClient(),
+        ):
+            arguments, _ = await planner_router._post_planner_tool_call(
+                "DYNAMIC-CONTEXT",
+                selected_tool,
+                max_tokens=32,
+                timeout_seconds=5.0,
+            )
+
+        payload = captured["payload"]
+        self.assertEqual(payload["tool_choice"], "required")
+        self.assertEqual(len(payload["tools"]), 1)
+        self.assertEqual(
+            payload["tools"][0]["function"]["name"],
+            "search_web",
+        )
+        self.assertEqual(
+            arguments,
+            {"query": "current weather"},
+        )
 
     def test_native_tool_call_rejects_changed_tool(self):
         response = {
