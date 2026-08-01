@@ -23,7 +23,10 @@ from retrieval import retrieve_context  # <-- ФАЗА 4: Векторный р�
 from kven2_profile import load_agent_profile
 from write_path import process_episodic, strip_reasoning
 from config import settings
-from context_window import build_context_window_report
+from context_window import (
+    build_context_window_report,
+    build_historical_media_compaction_preview,
+)
 from model_adapters import resolve_model_adapter
 from planner_router import (
     classify_main_thinking as planner_classify_main_thinking,
@@ -943,6 +946,62 @@ def _maybe_log_context_window_report(
             exc,
             exc_info=True,
         )
+
+
+def _maybe_compact_historical_media(
+    messages: list,
+    *,
+    route_label: str,
+) -> list:
+    """Apply opt-in historical media compaction before backend routing.
+
+    The feature is disabled by default. On any error, preserve the original
+    message list so diagnostics cannot break user requests.
+    """
+
+    if not _env_bool(
+        "KVEN2_HISTORICAL_MEDIA_COMPACTION_ENABLED",
+        False,
+    ):
+        return messages
+
+    try:
+        tail_messages = _env_int(
+            "KVEN2_HISTORICAL_MEDIA_COMPACTION_TAIL_MESSAGES",
+            12,
+            1,
+            200,
+        )
+        compacted_messages, meta = (
+            build_historical_media_compaction_preview(
+                messages,
+                tail_messages=tail_messages,
+            )
+        )
+        log_meta = {
+            "route_label": str(route_label or "unknown"),
+            "configured_tail_messages": tail_messages,
+            **meta,
+        }
+        logger.info(
+            "[HISTORICAL_MEDIA_COMPACTION] %s",
+            json.dumps(
+                log_meta,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+        )
+        return compacted_messages
+    except Exception as exc:
+        logger.warning(
+            "[HISTORICAL_MEDIA_COMPACTION] failed "
+            "route_label=%s error=%s",
+            route_label,
+            exc,
+            exc_info=True,
+        )
+        return messages
 
 
 # -----------------------------------------------------------------------------
@@ -4288,13 +4347,18 @@ async def handle_chat(request: Request):
             )
 
         if not internal_request:
+            context_route_label = (
+                "hybrid_native"
+                if hybrid_native_user
+                else "main"
+            )
             _maybe_log_context_window_report(
                 enriched_messages,
-                route_label=(
-                    "hybrid_native"
-                    if hybrid_native_user
-                    else "main"
-                ),
+                route_label=context_route_label,
+            )
+            enriched_messages = _maybe_compact_historical_media(
+                enriched_messages,
+                route_label=context_route_label,
             )
 
         payload = {

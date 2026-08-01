@@ -105,6 +105,148 @@ class PromptCacheContextTests(unittest.IsolatedAsyncioTestCase):
             output,
         )
 
+    def test_historical_media_compaction_is_disabled_by_default(self):
+        messages = [
+            {
+                "role": "user",
+                "content": "unchanged",
+            }
+        ]
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(
+                "KVEN2_HISTORICAL_MEDIA_COMPACTION_ENABLED",
+                None,
+            )
+            with patch.object(
+                routes,
+                "build_historical_media_compaction_preview",
+            ) as compactor:
+                result = routes._maybe_compact_historical_media(
+                    messages,
+                    route_label="main",
+                )
+
+        self.assertIs(result, messages)
+        compactor.assert_not_called()
+
+    async def test_enabled_historical_media_compaction_reaches_backend(self):
+        captured_payloads = []
+
+        async def capture_backend(payload, chat_url, *, route_label):
+            captured_payloads.append(copy.deepcopy(payload))
+            return (
+                [
+                    "data: "
+                    + json.dumps(
+                        {"content": "OK"},
+                        ensure_ascii=False,
+                    )
+                ],
+                {"detected": False},
+            )
+
+        data_uri = (
+            "data:image/png;base64,"
+            + ("A" * 100)
+        )
+        request_payload = {
+            "model": "test-model",
+            "stream": False,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "inspect image",
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": data_uri,
+                            },
+                        },
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "content": "image answer",
+                },
+                {
+                    "role": "user",
+                    "content": "latest request",
+                },
+            ],
+        }
+        original_payload = copy.deepcopy(request_payload)
+        profile = {
+            "agent_name": "Kven II",
+            "agent_role": "Research assistant",
+            "project_history": "Stable test profile",
+            "owner": "Test Owner",
+            "mission": "Test media compaction",
+        }
+
+        with patch.dict(
+            os.environ,
+            {
+                "KVEN2_HISTORICAL_MEDIA_COMPACTION_ENABLED": "1",
+                "KVEN2_HISTORICAL_MEDIA_COMPACTION_TAIL_MESSAGES": "2",
+            },
+            clear=False,
+        ), patch.object(
+            routes,
+            "load_active_state",
+            AsyncMock(return_value={}),
+        ), patch.object(
+            routes,
+            "save_history_snapshot",
+            AsyncMock(),
+        ), patch.object(
+            routes,
+            "load_agent_profile",
+            Mock(return_value=profile),
+        ), patch.object(
+            routes,
+            "get_semantic_context",
+            AsyncMock(return_value=""),
+        ), patch.object(
+            routes,
+            "get_project_context",
+            AsyncMock(return_value=""),
+        ), patch.object(
+            routes,
+            "retrieve_context",
+            AsyncMock(return_value=[]),
+        ), patch.object(
+            routes,
+            "resolve_model_adapter",
+            Mock(return_value=SimpleNamespace(adapter_id="test-adapter")),
+        ), patch.object(
+            routes,
+            "_forward_to_backend_and_collect",
+            side_effect=capture_backend,
+        ):
+            response = await routes.handle_chat(
+                FakeRequest(request_payload)
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(request_payload, original_payload)
+        self.assertEqual(len(captured_payloads), 1)
+
+        encoded_messages = json.dumps(
+            captured_payloads[0]["messages"],
+            ensure_ascii=False,
+        )
+        self.assertNotIn(data_uri, encoded_messages)
+        self.assertIn(
+            "Historical media omitted from active context",
+            encoded_messages,
+        )
+        self.assertIn("latest request", encoded_messages)
+
     def test_native_tool_payload_enables_prompt_cache(self):
         source_body = {
             "model": "owui-visible-model",
