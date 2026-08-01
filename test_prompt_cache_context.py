@@ -192,7 +192,6 @@ class PromptCacheContextTests(unittest.IsolatedAsyncioTestCase):
             os.environ,
             {
                 "KVEN2_HISTORICAL_MEDIA_COMPACTION_ENABLED": "1",
-                "KVEN2_HISTORICAL_MEDIA_COMPACTION_TAIL_MESSAGES": "2",
             },
             clear=False,
         ), patch.object(
@@ -242,7 +241,7 @@ class PromptCacheContextTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn(data_uri, encoded_messages)
         self.assertIn(
-            "Historical media omitted from active context",
+            "Historical media omitted from active model context",
             encoded_messages,
         )
         self.assertIn("latest request", encoded_messages)

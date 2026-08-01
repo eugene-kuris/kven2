@@ -966,21 +966,13 @@ def _maybe_compact_historical_media(
         return messages
 
     try:
-        tail_messages = _env_int(
-            "KVEN2_HISTORICAL_MEDIA_COMPACTION_TAIL_MESSAGES",
-            12,
-            1,
-            200,
-        )
         compacted_messages, meta = (
             build_historical_media_compaction_preview(
                 messages,
-                tail_messages=tail_messages,
             )
         )
         log_meta = {
             "route_label": str(route_label or "unknown"),
-            "configured_tail_messages": tail_messages,
             **meta,
         }
         logger.info(

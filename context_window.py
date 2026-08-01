@@ -227,7 +227,8 @@ def _completed_tool_protocol_groups(
 
 
 _HISTORICAL_MEDIA_PLACEHOLDER = (
-    "[Historical media omitted from active context after its turn was completed.]"
+    "[Historical media omitted from active model context after its turn "
+    "completed. The original remains visible in the chat UI.]"
 )
 
 
@@ -279,31 +280,70 @@ def _replace_media_content_with_placeholder(
     return copy.deepcopy(content), 0
 
 
+def _latest_user_message_index(
+    messages: list,
+) -> int | None:
+    """Return the latest user-message index, or None when unavailable."""
+
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if (
+            isinstance(message, dict)
+            and message.get("role") == "user"
+        ):
+            return index
+
+    return None
+
+
 def build_historical_media_compaction_preview(
     messages: list,
     *,
-    tail_messages: int = 12,
     placeholder: str = _HISTORICAL_MEDIA_PLACEHOLDER,
 ) -> tuple[list, dict]:
-    """Build a non-runtime preview that removes only older media payloads.
+    """Remove media only from turns completed before the latest user turn.
 
-    Leading system messages and the protected verbatim tail are copied without
-    changes. Historical text remains in place. Each older message that contains
-    one or more media parts receives one deterministic text placeholder.
+    The latest user message and every message after it form the protected
+    current turn. This keeps an attached image available throughout planner,
+    tool-call, and tool-continuation passes. On the next user request, the
+    previous turn becomes historical and its media payload can be replaced in
+    the backend copy. The original OpenWebUI request is never mutated.
     """
 
     source_messages = messages if isinstance(messages, list) else []
     compacted_messages = copy.deepcopy(source_messages)
     before_report = build_context_window_report(
         source_messages,
-        tail_messages=tail_messages,
+        tail_messages=1,
     )
-    candidate_indices = list(
-        before_report.get(
-            "older_media_candidate_indices",
-            [],
-        )
+    current_turn_start = _latest_user_message_index(
+        source_messages
     )
+    system_prefix_messages = int(
+        before_report.get("system_prefix_messages", 0)
+        or 0
+    )
+    message_manifest = list(
+        before_report.get("message_manifest", [])
+        or []
+    )
+
+    candidate_indices = []
+    if current_turn_start is not None:
+        for index in range(
+            system_prefix_messages,
+            current_turn_start,
+        ):
+            if not (0 <= index < len(message_manifest)):
+                continue
+            manifest = message_manifest[index]
+            if not isinstance(manifest, dict):
+                continue
+            if (
+                manifest.get("media_data_uri_count")
+                or manifest.get("media_reference_count")
+            ):
+                candidate_indices.append(index)
 
     compacted_indices = []
     removed_media_parts = 0
@@ -333,10 +373,18 @@ def build_historical_media_compaction_preview(
     after_json_chars = _json_char_count(compacted_messages)
     after_report = build_context_window_report(
         compacted_messages,
-        tail_messages=tail_messages,
+        tail_messages=1,
     )
 
+    protected_roles = []
+    if current_turn_start is not None:
+        protected_roles = [
+            _message_role(message)
+            for message in source_messages[current_turn_start:]
+        ]
+
     return compacted_messages, {
+        "policy": "before_latest_user_message",
         "candidate_indices": candidate_indices,
         "compacted_indices": compacted_indices,
         "compacted_messages": len(compacted_indices),
@@ -355,10 +403,13 @@ def build_historical_media_compaction_preview(
             "media_payload_chars_total",
             0,
         ),
-        "verbatim_tail_start": before_report.get(
-            "verbatim_tail_start",
-            0,
+        "protected_current_turn_start": current_turn_start,
+        "protected_current_turn_messages": (
+            len(source_messages) - current_turn_start
+            if current_turn_start is not None
+            else len(source_messages)
         ),
+        "protected_current_turn_roles": protected_roles,
         "active_tool_continuation": before_report.get(
             "active_tool_continuation",
             False,

@@ -285,12 +285,12 @@ class ContextWindowReportTests(unittest.TestCase):
             0,
         )
 
-    def test_media_compaction_preview_removes_only_older_media(self):
+    def test_media_compaction_preview_removes_previous_turn_media(self):
         old_data_uri = (
             "data:image/png;base64,"
             + ("A" * 100)
         )
-        recent_data_uri = (
+        current_data_uri = (
             "data:image/png;base64,"
             + ("B" * 80)
         )
@@ -304,7 +304,7 @@ class ContextWindowReportTests(unittest.TestCase):
                 "content": [
                     {
                         "type": "text",
-                        "text": "older image question",
+                        "text": "previous image question",
                     },
                     {
                         "type": "image_url",
@@ -316,19 +316,19 @@ class ContextWindowReportTests(unittest.TestCase):
             },
             {
                 "role": "assistant",
-                "content": "older answer",
+                "content": "previous image description",
             },
             {
                 "role": "user",
                 "content": [
                     {
                         "type": "text",
-                        "text": "latest image question",
+                        "text": "current image question",
                     },
                     {
                         "type": "image_url",
                         "image_url": {
-                            "url": recent_data_uri,
+                            "url": current_data_uri,
                         },
                     },
                 ],
@@ -339,7 +339,6 @@ class ContextWindowReportTests(unittest.TestCase):
         compacted, meta = (
             context_window.build_historical_media_compaction_preview(
                 messages,
-                tail_messages=2,
             )
         )
 
@@ -355,15 +354,23 @@ class ContextWindowReportTests(unittest.TestCase):
             json.dumps(compacted, ensure_ascii=False),
         )
         self.assertIn(
-            recent_data_uri,
+            current_data_uri,
             json.dumps(compacted, ensure_ascii=False),
         )
         self.assertEqual(meta["candidate_indices"], [1])
         self.assertEqual(meta["compacted_indices"], [1])
         self.assertEqual(meta["removed_media_parts"], 1)
+        self.assertEqual(
+            meta["protected_current_turn_start"],
+            3,
+        )
+        self.assertEqual(
+            meta["protected_current_turn_roles"],
+            ["user"],
+        )
         self.assertGreater(meta["saved_json_chars"], 0)
 
-    def test_media_compaction_preview_preserves_active_tool_tail(self):
+    def test_media_compaction_preview_preserves_current_tool_turn(self):
         data_uri = (
             "data:image/png;base64,"
             + ("A" * 100)
@@ -409,14 +416,52 @@ class ContextWindowReportTests(unittest.TestCase):
         compacted, meta = (
             context_window.build_historical_media_compaction_preview(
                 messages,
-                tail_messages=1,
             )
         )
 
-        self.assertEqual(compacted[2:], original[2:])
-        self.assertEqual(meta["verbatim_tail_start"], 2)
+        self.assertEqual(compacted, original)
         self.assertTrue(meta["active_tool_continuation"])
-        self.assertEqual(meta["compacted_indices"], [1])
+        self.assertEqual(
+            meta["protected_current_turn_start"],
+            1,
+        )
+        self.assertEqual(
+            meta["protected_current_turn_roles"],
+            ["user", "assistant", "tool"],
+        )
+        self.assertEqual(meta["candidate_indices"], [])
+        self.assertEqual(meta["compacted_indices"], [])
+
+    def test_media_compaction_preview_fails_safe_without_user_message(self):
+        data_uri = (
+            "data:image/png;base64,"
+            + ("A" * 100)
+        )
+        messages = [
+            {
+                "role": "system",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": data_uri,
+                        },
+                    }
+                ],
+            }
+        ]
+
+        compacted, meta = (
+            context_window.build_historical_media_compaction_preview(
+                messages,
+            )
+        )
+
+        self.assertEqual(compacted, messages)
+        self.assertIsNone(
+            meta["protected_current_turn_start"]
+        )
+        self.assertEqual(meta["compacted_indices"], [])
 
     def test_report_does_not_mutate_or_expose_content(self):
         messages = [
