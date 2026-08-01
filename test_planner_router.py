@@ -110,10 +110,7 @@ class PlannerRouterTests(unittest.IsolatedAsyncioTestCase):
         arguments = AsyncMock(
             return_value=(
                 {
-                    "name": "search_web",
-                    "arguments": {
-                        "query": "current USD exchange rate",
-                    },
+                    "query": "current USD exchange rate",
                 },
                 {"elapsed_seconds": 1.2},
             )
@@ -127,7 +124,7 @@ class PlannerRouterTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch.object(
                 planner_router,
-                "_post_planner_json",
+                "_post_planner_tool_call",
                 arguments,
             ),
         ):
@@ -158,10 +155,7 @@ class PlannerRouterTests(unittest.IsolatedAsyncioTestCase):
         selection = AsyncMock(return_value=("TOOL 1", {}))
         arguments = AsyncMock(
             return_value=(
-                {
-                    "name": "search_web",
-                    "arguments": {},
-                },
+                {},
                 {},
             )
         )
@@ -174,7 +168,7 @@ class PlannerRouterTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch.object(
                 planner_router,
-                "_post_planner_json",
+                "_post_planner_tool_call",
                 arguments,
             ),
         ):
@@ -244,31 +238,74 @@ class PlannerRouterTests(unittest.IsolatedAsyncioTestCase):
     def test_arguments_prompt_keeps_dynamic_context_last(self):
         prompt = planner_router._arguments_prompt(
             "DYNAMIC-CONTEXT",
-            {
-                "name": "stable_tool",
-                "description": "Stable description",
-                "parameters": {
-                    "type": "object",
-                    "properties": {},
-                },
-            },
         )
 
-        self.assertLess(
-            prompt.index("Selected tool:"),
-            prompt.index("Conversation context:"),
+        self.assertIn(
+            "Call the provided tool exactly once",
+            prompt,
         )
         self.assertTrue(prompt.endswith("DYNAMIC-CONTEXT"))
+
+    def test_native_tool_call_rejects_changed_tool(self):
+        response = {
+            "choices": [
+                {
+                    "message": {
+                        "tool_calls": [
+                            {
+                                "function": {
+                                    "name": "fetch_url",
+                                    "arguments": "{}",
+                                }
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+
+        with self.assertRaisesRegex(
+            planner_router.PlannerRouterError,
+            "changed the selected tool",
+        ):
+            planner_router._extract_native_tool_arguments(
+                response,
+                "search_web",
+            )
+
+    def test_native_tool_call_rejects_non_object_arguments(self):
+        response = {
+            "choices": [
+                {
+                    "message": {
+                        "tool_calls": [
+                            {
+                                "function": {
+                                    "name": "search_web",
+                                    "arguments": "[]",
+                                }
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+
+        with self.assertRaisesRegex(
+            planner_router.PlannerRouterError,
+            "not an object",
+        ):
+            planner_router._extract_native_tool_arguments(
+                response,
+                "search_web",
+            )
 
 
     async def test_explicit_tool_skips_selection(self):
         mocked = AsyncMock(
             return_value=(
                 {
-                    "name": "fetch_url",
-                    "arguments": {
-                        "url": "https://example.com",
-                    },
+                    "url": "https://example.com",
                 },
                 {
                     "elapsed_seconds": 0.7,
@@ -278,7 +315,7 @@ class PlannerRouterTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(
             planner_router,
-            "_post_planner_json",
+            "_post_planner_tool_call",
             mocked,
         ):
             result = await planner_router.route_tool_request(

@@ -172,37 +172,6 @@ def _compact_tool_catalog(tools_by_name: dict[str, dict]) -> list[dict]:
     return catalog
 
 
-def _extract_json_object(text: str) -> dict:
-    text = str(text or "").strip()
-    if not text:
-        raise PlannerRouterError("planner returned empty content")
-
-    try:
-        parsed = json.loads(text)
-        if isinstance(parsed, dict):
-            return parsed
-    except json.JSONDecodeError:
-        pass
-
-    decoder = json.JSONDecoder()
-
-    for index, char in enumerate(text):
-        if char != "{":
-            continue
-
-        try:
-            parsed, _ = decoder.raw_decode(text[index:])
-        except json.JSONDecodeError:
-            continue
-
-        if isinstance(parsed, dict):
-            return parsed
-
-    raise PlannerRouterError("planner did not return a JSON object")
-
-
-
-
 def _extract_single_protocol_line(text: str) -> str:
     """Return one non-empty planner protocol line or fail closed."""
 
@@ -393,12 +362,87 @@ async def _post_planner_text(
     return content, meta
 
 
-async def _post_planner_json(
+def _extract_native_tool_arguments(
+    response_json: dict,
+    selected_name: str,
+) -> dict:
+    """Extract one forced native tool call and fail closed."""
+
+    choice = (response_json.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    tool_calls = message.get("tool_calls")
+
+    if not isinstance(tool_calls, list) or len(tool_calls) != 1:
+        raise PlannerRouterError(
+            "planner did not return exactly one native tool call"
+        )
+
+    tool_call = tool_calls[0]
+    if not isinstance(tool_call, dict):
+        raise PlannerRouterError("planner native tool call is invalid")
+
+    function = tool_call.get("function")
+    if not isinstance(function, dict):
+        raise PlannerRouterError(
+            "planner native tool call has no function object"
+        )
+
+    returned_name = str(function.get("name") or "").strip()
+    if returned_name != selected_name:
+        raise PlannerRouterError(
+            "planner changed the selected tool from "
+            f"{selected_name!r} to {returned_name!r}"
+        )
+
+    raw_arguments = function.get("arguments")
+
+    if isinstance(raw_arguments, dict):
+        arguments = raw_arguments
+    elif isinstance(raw_arguments, str):
+        try:
+            arguments = json.loads(raw_arguments)
+        except json.JSONDecodeError as exc:
+            raise PlannerRouterError(
+                "planner native tool arguments are not valid JSON"
+            ) from exc
+    else:
+        raise PlannerRouterError(
+            "planner native tool arguments are missing"
+        )
+
+    if not isinstance(arguments, dict):
+        raise PlannerRouterError(
+            "planner native tool arguments are not an object"
+        )
+
+    return arguments
+
+
+async def _post_planner_tool_call(
     prompt: str,
+    tool: dict,
     *,
     max_tokens: int,
     timeout_seconds: float,
 ) -> tuple[dict, dict]:
+    """Ask llama.cpp for one forced native tool call."""
+
+    selected_name = str(tool.get("name") or "").strip()
+    if not selected_name:
+        raise PlannerRouterError("selected tool has no name")
+
+    planner_tool = {
+        "type": "function",
+        "function": {
+            "name": selected_name,
+            "description": str(tool.get("description") or ""),
+            "parameters": tool.get("parameters") or {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    }
+
     payload = {
         "model": PLANNER_MODEL,
         "messages": [
@@ -407,12 +451,16 @@ async def _post_planner_json(
                 "content": prompt,
             }
         ],
+        "tools": [planner_tool],
+        "tool_choice": {
+            "type": "function",
+            "function": {
+                "name": selected_name,
+            },
+        },
         "temperature": 0.0,
         "max_tokens": max_tokens,
         "stream": False,
-        "response_format": {
-            "type": "json_object",
-        },
         "chat_template_kwargs": {
             "enable_thinking": False,
         },
@@ -428,18 +476,19 @@ async def _post_planner_json(
     response.raise_for_status()
     response_json = response.json()
 
-    choice = (response_json.get("choices") or [{}])[0]
-    message = choice.get("message") or {}
-    content = str(message.get("content") or "")
-
-    parsed = _extract_json_object(content)
+    arguments = _extract_native_tool_arguments(
+        response_json,
+        selected_name,
+    )
 
     usage = response_json.get("usage")
     if not isinstance(usage, dict):
         usage = {}
 
+    choice = (response_json.get("choices") or [{}])[0]
     meta = {
         "elapsed_seconds": round(elapsed, 3),
+        "finish_reason": choice.get("finish_reason"),
         "prompt_tokens": usage.get("prompt_tokens"),
         "completion_tokens": usage.get("completion_tokens"),
         "cached_tokens": (
@@ -447,7 +496,7 @@ async def _post_planner_json(
         ).get("cached_tokens"),
     }
 
-    return parsed, meta
+    return arguments, meta
 
 
 def _thinking_prompt(context: str) -> str:
@@ -585,21 +634,14 @@ def _selection_prompt(
     )
 
 
-def _arguments_prompt(
-    context: str,
-    tool: dict,
-) -> str:
+def _arguments_prompt(context: str) -> str:
     return (
-        "You generate arguments for an already selected Kven II tool.\n"
+        "Generate arguments for the provided Kven II tool.\n"
+        "Call the provided tool exactly once.\n"
         "Do not select another tool and do not answer the user's task.\n"
-        "Fill the arguments according to the JSON Schema. Do not invent "
-        "information that is absent from the request or conversation "
-        "context.\n\n"
-        "Return exactly one JSON object:\n"
-        '{"name":"tool_name","arguments":{}}\n\n'
-        "Selected tool:\n"
-        f"{json.dumps(tool, ensure_ascii=False, separators=(',', ':'))}"
-        f"\n\nConversation context:\n{context}"
+        "Use only information grounded in the request or nearby "
+        "conversation context.\n\n"
+        f"Conversation context:\n{context}"
     )
 
 
@@ -687,25 +729,18 @@ async def route_tool_request(
 
         selected_tool = tools_by_name[selected_name]
 
-        constructed, arguments_meta = await _post_planner_json(
-            _arguments_prompt(context, selected_tool),
-            max_tokens=ARGUMENTS_MAX_TOKENS,
-            timeout_seconds=timeout_seconds,
-        )
-
-        returned_name = str(
-            constructed.get("name") or ""
-        ).strip()
-
-        if returned_name != selected_name:
-            raise PlannerRouterError(
-                "planner changed the selected tool from "
-                f"{selected_name!r} to {returned_name!r}"
+        generated_arguments, arguments_meta = (
+            await _post_planner_tool_call(
+                _arguments_prompt(context),
+                selected_tool,
+                max_tokens=ARGUMENTS_MAX_TOKENS,
+                timeout_seconds=timeout_seconds,
             )
+        )
 
         arguments = _validate_arguments(
             selected_tool,
-            constructed.get("arguments"),
+            generated_arguments,
         )
 
         tool_call = {
