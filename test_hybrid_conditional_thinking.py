@@ -279,5 +279,149 @@ class HybridConditionalThinkingTests(
         self.assertTrue(selected)
 
 
+    async def test_tool_continuation_stream_disables_thinking_by_default(
+        self,
+    ):
+        payload = {
+            "model": "test-model",
+            "stream": True,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Use the supplied tool result.",
+                },
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_test",
+                            "type": "function",
+                            "function": {
+                                "name": "search_web",
+                                "arguments": '{"query":"example"}',
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_test",
+                    "content": "Example result",
+                },
+            ],
+        }
+        expected = Response(content=b"continuation-fast")
+
+        with patch.dict(
+            os.environ,
+            {},
+            clear=False,
+        ), patch.object(
+            routes,
+            "_stream_main_chat_response",
+            return_value=expected,
+        ) as stream_response:
+            os.environ.pop(
+                "KVEN2_TOOL_CONTINUATION_ENABLE_THINKING",
+                None,
+            )
+
+            result = await (
+                routes._proxy_hybrid_continuation_final_response(
+                    payload,
+                    "http://main-backend.invalid/v1/chat/completions",
+                    model_adapter=None,
+                    write_path_messages=[],
+                    active_state={},
+                    owui_rag_meta={},
+                    skip_write_path=True,
+                    timeout_seconds=10.0,
+                )
+            )
+
+        self.assertIs(result, expected)
+        guarded_payload = stream_response.call_args.args[0]
+        self.assertFalse(
+            guarded_payload["chat_template_kwargs"][
+                "enable_thinking"
+            ]
+        )
+        self.assertEqual(
+            guarded_payload["reasoning_format"],
+            "none",
+        )
+
+    async def test_tool_continuation_stream_allows_explicit_thinking_opt_in(
+        self,
+    ):
+        payload = {
+            "model": "test-model",
+            "stream": True,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Use the supplied tool result.",
+                },
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_test",
+                            "type": "function",
+                            "function": {
+                                "name": "search_web",
+                                "arguments": '{"query":"example"}',
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_test",
+                    "content": "Example result",
+                },
+            ],
+        }
+        expected = Response(content=b"continuation-thinking")
+
+        with patch.dict(
+            os.environ,
+            {
+                "KVEN2_TOOL_CONTINUATION_ENABLE_THINKING": "1",
+            },
+            clear=False,
+        ), patch.object(
+            routes,
+            "_stream_main_chat_response",
+            return_value=expected,
+        ) as stream_response:
+            result = await (
+                routes._proxy_hybrid_continuation_final_response(
+                    payload,
+                    "http://main-backend.invalid/v1/chat/completions",
+                    model_adapter=None,
+                    write_path_messages=[],
+                    active_state={},
+                    owui_rag_meta={},
+                    skip_write_path=True,
+                    timeout_seconds=10.0,
+                )
+            )
+
+        self.assertIs(result, expected)
+        guarded_payload = stream_response.call_args.args[0]
+        self.assertTrue(
+            guarded_payload["chat_template_kwargs"][
+                "enable_thinking"
+            ]
+        )
+        self.assertEqual(
+            guarded_payload["reasoning_format"],
+            "deepseek",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

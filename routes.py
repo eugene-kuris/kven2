@@ -2186,7 +2186,7 @@ async def _proxy_hybrid_continuation_final_response(
     client_stream_requested = bool(payload.get("stream", False))
     continuation_thinking = _env_bool(
         "KVEN2_TOOL_CONTINUATION_ENABLE_THINKING",
-        True,
+        False,
     )
 
     base_payload = _apply_final_answer_safeguards(
