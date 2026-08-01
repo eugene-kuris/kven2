@@ -296,16 +296,27 @@ def _apply_final_answer_safeguards(
     *,
     route_label: str,
     enable_thinking: bool = False,
+    min_tokens_override: int | None = None,
+    max_tokens_cap: int | None = None,
 ) -> dict:
     """Apply the final-answer budget, sampling, and explicit thinking policy."""
     safe = dict(payload or {})
 
-    min_tokens = _env_int(
+    configured_min_tokens = _env_int(
         "KVEN2_FINAL_MIN_TOKENS",
         4096,
         256,
         131072,
     )
+
+    if min_tokens_override is None:
+        min_tokens = configured_min_tokens
+    else:
+        try:
+            min_tokens = int(min_tokens_override)
+        except Exception:
+            min_tokens = configured_min_tokens
+        min_tokens = max(1, min(min_tokens, 131072))
 
     requested_value = safe.get("max_tokens")
     if requested_value is None:
@@ -320,8 +331,28 @@ def _apply_final_answer_safeguards(
     except Exception:
         requested_max_tokens = min_tokens
 
-    # Enforce only a lower bound. Larger client-supplied budgets are preserved.
-    safe["max_tokens"] = max(min_tokens, requested_max_tokens)
+    resolved_max_tokens = max(min_tokens, requested_max_tokens)
+    resolved_max_tokens_cap = None
+
+    if max_tokens_cap is not None:
+        try:
+            resolved_max_tokens_cap = int(max_tokens_cap)
+        except Exception:
+            resolved_max_tokens_cap = None
+
+        if resolved_max_tokens_cap is not None:
+            resolved_max_tokens_cap = max(
+                min_tokens,
+                resolved_max_tokens_cap,
+            )
+            resolved_max_tokens = min(
+                resolved_max_tokens,
+                resolved_max_tokens_cap,
+            )
+
+    # Normal routes preserve larger client budgets. Explicit fallback routes
+    # may supply a cap so a routing failure cannot start an unbounded answer.
+    safe["max_tokens"] = resolved_max_tokens
     safe.pop("max_completion_tokens", None)
 
     # Qwen thinking/greedy generation is the main source of the observed
@@ -355,11 +386,12 @@ def _apply_final_answer_safeguards(
 
     logger.info(
         "[FINAL_GUARD] payload_applied route_label=%s max_tokens=%s min_tokens=%s "
-        "temperature=%s top_p=%s top_k=%s repeat_penalty=%s "
+        "max_tokens_cap=%s temperature=%s top_p=%s top_k=%s repeat_penalty=%s "
         "repeat_last_n=%s thinking=%s reasoning_format=%s",
         route_label,
         safe.get("max_tokens"),
         min_tokens,
+        resolved_max_tokens_cap,
         safe.get("temperature"),
         safe.get("top_p"),
         safe.get("top_k"),
@@ -2050,6 +2082,8 @@ async def _proxy_hybrid_final_response(
     owui_rag_meta: dict,
     skip_write_path: bool,
     enable_thinking: bool = False,
+    final_min_tokens_override: int | None = None,
+    final_max_tokens_cap: int | None = None,
     timeout_seconds: float = 1200.0,
 ) -> Response:
     """Proxy a bounded hybrid final answer and safely schedule write_path."""
@@ -2057,6 +2091,8 @@ async def _proxy_hybrid_final_response(
         payload,
         route_label="hybrid_final",
         enable_thinking=enable_thinking,
+        min_tokens_override=final_min_tokens_override,
+        max_tokens_cap=final_max_tokens_cap,
     )
     stream_requested = bool(final_payload.get("stream", False))
 
@@ -2361,6 +2397,8 @@ async def _proxy_hybrid_no_tool_final_response(
     owui_rag_meta: dict,
     skip_write_path: bool,
     answer_mode: str | None = None,
+    final_min_tokens_override: int | None = None,
+    final_max_tokens_cap: int | None = None,
     timeout_seconds: float = 1200.0,
 ) -> Response:
     """Produce the real answer after the bounded decision says no tool is needed."""
@@ -2381,6 +2419,8 @@ async def _proxy_hybrid_no_tool_final_response(
             final_payload,
             route_label="hybrid_no_tool_live",
             enable_thinking=thinking_enabled,
+            min_tokens_override=final_min_tokens_override,
+            max_tokens_cap=final_max_tokens_cap,
         )
 
         logger.info(
@@ -2415,6 +2455,8 @@ async def _proxy_hybrid_no_tool_final_response(
         owui_rag_meta=owui_rag_meta,
         skip_write_path=skip_write_path,
         enable_thinking=thinking_enabled,
+        final_min_tokens_override=final_min_tokens_override,
+        final_max_tokens_cap=final_max_tokens_cap,
         timeout_seconds=timeout_seconds,
     )
 
@@ -2690,6 +2732,53 @@ async def _proxy_hybrid_native_openai_tool_protocol(
             ),
             str(planner_result.get("error") or "")[:500],
         )
+
+        if planner_decision == "ERROR":
+            if speculative_stream is not None:
+                await speculative_stream.cancel(
+                    reason="planner_error"
+                )
+                speculative_stream = None
+
+            fallback_min_tokens = _env_int(
+                "KVEN2_PLANNER_ERROR_FALLBACK_MIN_TOKENS",
+                256,
+                1,
+                4096,
+            )
+            fallback_max_tokens = _env_int(
+                "KVEN2_PLANNER_ERROR_FALLBACK_MAX_TOKENS",
+                2048,
+                256,
+                8192,
+            )
+            fallback_max_tokens = max(
+                fallback_min_tokens,
+                fallback_max_tokens,
+            )
+
+            logger.warning(
+                "[PLANNER_ROUTER] unavailable "
+                "fallback=direct_no_tool_fast decision=ERROR "
+                "legacy_guard_skipped=True min_tokens=%s "
+                "max_tokens=%s error=%s",
+                fallback_min_tokens,
+                fallback_max_tokens,
+                str(planner_result.get("error") or "")[:500],
+            )
+
+            return await _proxy_hybrid_no_tool_final_response(
+                payload,
+                chat_url,
+                write_path_messages=write_path_messages,
+                active_state=active_state,
+                owui_rag_meta=owui_rag_meta,
+                skip_write_path=skip_write_path,
+                answer_mode="FAST",
+                final_min_tokens_override=fallback_min_tokens,
+                final_max_tokens_cap=fallback_max_tokens,
+                timeout_seconds=timeout_seconds,
+            )
 
         if planner_decision == "TOOL":
             planned_call = planner_result.get("tool_call")

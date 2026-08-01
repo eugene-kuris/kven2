@@ -224,7 +224,7 @@ class PlannerRoutesTests(unittest.IsolatedAsyncioTestCase):
         legacy_decision.assert_not_awaited()
         final_response.assert_not_awaited()
 
-    async def test_planner_error_falls_back_to_legacy_decision(self):
+    async def test_planner_error_routes_direct_fast_without_legacy(self):
         planner = AsyncMock(
             return_value={
                 "decision": "ERROR",
@@ -232,28 +232,17 @@ class PlannerRoutesTests(unittest.IsolatedAsyncioTestCase):
                 "meta": {},
             }
         )
-        legacy_decision = AsyncMock(
-            return_value=(
-                {
-                    "model": "test-model",
-                    "choices": [
-                        {
-                            "finish_reason": "stop",
-                            "message": {
-                                "content": "KVEN_NO_TOOL",
-                            },
-                        }
-                    ],
-                },
-                None,
-            )
-        )
+        legacy_decision = AsyncMock()
         expected = Response(content=b"fallback-final")
         final_response = AsyncMock(return_value=expected)
 
         with patch.dict(
             os.environ,
-            {"KVEN2_PLANNER_TOOL_ROUTING_ENABLED": "1"},
+            {
+                "KVEN2_PLANNER_TOOL_ROUTING_ENABLED": "1",
+                "KVEN2_PLANNER_ERROR_FALLBACK_MIN_TOKENS": "256",
+                "KVEN2_PLANNER_ERROR_FALLBACK_MAX_TOKENS": "2048",
+            },
             clear=False,
         ), patch.object(
             routes,
@@ -272,8 +261,24 @@ class PlannerRoutesTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(result, expected)
         planner.assert_awaited_once()
-        legacy_decision.assert_awaited_once()
+        legacy_decision.assert_not_awaited()
         final_response.assert_awaited_once()
+        self.assertEqual(
+            final_response.await_args.kwargs["answer_mode"],
+            "FAST",
+        )
+        self.assertEqual(
+            final_response.await_args.kwargs[
+                "final_min_tokens_override"
+            ],
+            256,
+        )
+        self.assertEqual(
+            final_response.await_args.kwargs[
+                "final_max_tokens_cap"
+            ],
+            2048,
+        )
 
     async def test_tool_continuation_bypasses_planner(self):
         messages = [
@@ -483,7 +488,7 @@ class PlannerRoutesTests(unittest.IsolatedAsyncioTestCase):
         )
         speculative.release_response.assert_not_called()
 
-    async def test_speculative_error_cancels_before_legacy(self):
+    async def test_speculative_error_cancels_before_direct_fast(self):
         planner = AsyncMock(
             return_value={
                 "decision": "ERROR",
@@ -508,7 +513,7 @@ class PlannerRoutesTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        expected = Response(content=b"legacy-after-cancel")
+        expected = Response(content=b"direct-fast-after-cancel")
         final_response = AsyncMock(return_value=expected)
         speculative = FakeSpeculativeStream(
             Response(content=b"unused")
@@ -544,10 +549,26 @@ class PlannerRoutesTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(result, expected)
         speculative.cancel.assert_awaited_once_with(
-            reason="planner_fallback"
+            reason="planner_error"
         )
-        legacy_decision.assert_awaited_once()
+        legacy_decision.assert_not_awaited()
         final_response.assert_awaited_once()
+        self.assertEqual(
+            final_response.await_args.kwargs["answer_mode"],
+            "FAST",
+        )
+        self.assertEqual(
+            final_response.await_args.kwargs[
+                "final_min_tokens_override"
+            ],
+            256,
+        )
+        self.assertEqual(
+            final_response.await_args.kwargs[
+                "final_max_tokens_cap"
+            ],
+            2048,
+        )
 
     async def test_speculation_is_skipped_for_non_stream_request(self):
         planner = AsyncMock(
@@ -586,6 +607,29 @@ class PlannerRoutesTests(unittest.IsolatedAsyncioTestCase):
         start_speculative.assert_not_called()
         final_response.assert_awaited_once()
 
+
+    def test_planner_error_budget_disables_thinking_and_caps_tokens(self):
+        guarded = routes._apply_final_answer_safeguards(
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "complex request",
+                    }
+                ],
+                "max_tokens": 24687,
+            },
+            route_label="planner_error_fallback",
+            enable_thinking=False,
+            min_tokens_override=256,
+            max_tokens_cap=2048,
+        )
+
+        self.assertEqual(guarded["max_tokens"], 2048)
+        self.assertFalse(
+            guarded["chat_template_kwargs"]["enable_thinking"]
+        )
+        self.assertEqual(guarded["reasoning_format"], "none")
 
     async def test_tool_choice_none_bypasses_all_decisions(self):
         planner = AsyncMock()
