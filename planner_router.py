@@ -26,9 +26,9 @@ PLANNER_CHAT_URL = (
 )
 
 DEFAULT_TIMEOUT_SECONDS = 20.0
-SELECTION_MAX_TOKENS = 96
+SELECTION_MAX_TOKENS = 24
 ARGUMENTS_MAX_TOKENS = 192
-THINKING_MAX_TOKENS = 64
+THINKING_MAX_TOKENS = 8
 MAX_CONTEXT_CHARS = 6000
 MAX_DESCRIPTION_CHARS = 240
 
@@ -153,6 +153,7 @@ def _compact_tool_catalog(tools_by_name: dict[str, dict]) -> list[dict]:
 
         catalog.append(
             {
+                "id": len(catalog),
                 "name": name,
                 "description": tool["description"][:MAX_DESCRIPTION_CHARS],
                 "required": [
@@ -198,6 +199,66 @@ def _extract_json_object(text: str) -> dict:
             return parsed
 
     raise PlannerRouterError("planner did not return a JSON object")
+
+
+
+
+def _extract_single_protocol_line(text: str) -> str:
+    """Return one non-empty planner protocol line or fail closed."""
+
+    lines = [
+        line.strip()
+        for line in str(text or "").splitlines()
+        if line.strip()
+    ]
+
+    if len(lines) != 1:
+        raise PlannerRouterError(
+            "planner did not return exactly one protocol line"
+        )
+
+    return lines[0]
+
+
+def _parse_thinking_protocol(text: str) -> str:
+    line = _extract_single_protocol_line(text).upper()
+
+    if line not in {"FAST", "THINK"}:
+        raise PlannerRouterError(
+            f"unknown thinking mode: {line!r}"
+        )
+
+    return line
+
+
+def _parse_selection_protocol(
+    text: str,
+    catalog: list[dict],
+) -> tuple[str, str | None]:
+    line = _extract_single_protocol_line(text).upper()
+
+    if line in {"FAST", "THINK"}:
+        return line, None
+
+    parts = line.split()
+    if len(parts) != 2 or parts[0] != "TOOL":
+        raise PlannerRouterError(
+            f"unknown planner protocol response: {line!r}"
+        )
+
+    try:
+        tool_index = int(parts[1], 10)
+    except ValueError as exc:
+        raise PlannerRouterError(
+            f"invalid planner tool index: {parts[1]!r}"
+        ) from exc
+
+    if tool_index < 0 or tool_index >= len(catalog):
+        raise PlannerRouterError(
+            f"planner tool index is out of range: {tool_index}"
+        )
+
+    return "TOOL", str(catalog[tool_index]["name"])
 
 
 def _matches_json_type(value: Any, json_type: str) -> bool:
@@ -277,6 +338,59 @@ def _validate_arguments(tool: dict, arguments: Any) -> dict:
                 )
 
     return arguments
+
+
+async def _post_planner_text(
+    prompt: str,
+    *,
+    max_tokens: int,
+    timeout_seconds: float,
+) -> tuple[str, dict]:
+    payload = {
+        "model": PLANNER_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt,
+            }
+        ],
+        "temperature": 0.0,
+        "max_tokens": max_tokens,
+        "stream": False,
+        "stop": ["\n"],
+        "chat_template_kwargs": {
+            "enable_thinking": False,
+        },
+        "reasoning_format": "none",
+    }
+
+    started = time.perf_counter()
+
+    async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+        response = await client.post(PLANNER_CHAT_URL, json=payload)
+
+    elapsed = time.perf_counter() - started
+    response.raise_for_status()
+    response_json = response.json()
+
+    choice = (response_json.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    content = str(message.get("content") or "")
+
+    usage = response_json.get("usage")
+    if not isinstance(usage, dict):
+        usage = {}
+
+    meta = {
+        "elapsed_seconds": round(elapsed, 3),
+        "prompt_tokens": usage.get("prompt_tokens"),
+        "completion_tokens": usage.get("completion_tokens"),
+        "cached_tokens": (
+            usage.get("prompt_tokens_details") or {}
+        ).get("cached_tokens"),
+    }
+
+    return content, meta
 
 
 async def _post_planner_json(
@@ -361,10 +475,10 @@ def _thinking_prompt(context: str) -> str:
         "longest-prefix routing; RAID calculation; systemd dependency "
         "behavior.\n"
         "- When uncertain, select THINK.\n\n"
-        "Return exactly one JSON object:\n"
-        '{"mode":"FAST"}\n'
+        "Return exactly one line containing one token:\n"
+        "FAST\n"
         "or\n"
-        '{"mode":"THINK"}\n\n'
+        "THINK\n\n"
         f"Conversation context:\n{context}"
     )
 
@@ -387,17 +501,13 @@ async def classify_main_thinking(
     selection_meta: dict = {}
 
     try:
-        selection, selection_meta = await _post_planner_json(
+        response_text, selection_meta = await _post_planner_text(
             _thinking_prompt(context),
             max_tokens=THINKING_MAX_TOKENS,
             timeout_seconds=timeout_seconds,
         )
 
-        mode = str(selection.get("mode") or "").strip().upper()
-        if mode not in {"FAST", "THINK"}:
-            raise PlannerRouterError(
-                f"unknown thinking mode: {mode!r}"
-            )
+        mode = _parse_thinking_protocol(response_text)
 
         logger.info(
             "[PLANNER_THINKING] mode=%s elapsed=%s "
@@ -463,13 +573,13 @@ def _selection_prompt(
         "configuration, code, storage, security, option comparison, and "
         "causal analysis.\n"
         "- When uncertain, select THINK.\n\n"
-        "Return exactly one JSON object:\n"
-        '{"decision":"NO_TOOL","mode":"FAST"}\n'
+        "Return exactly one protocol line:\n"
+        "FAST\n"
         "or\n"
-        '{"decision":"NO_TOOL","mode":"THINK"}\n'
+        "THINK\n"
         "or\n"
-        '{"decision":"TOOL","name":"tool_name"}\n\n'
-        "Available tools:\n"
+        "TOOL <numeric_id>\n\n"
+        "Available tools (use the numeric id field):\n"
         f"{json.dumps(catalog, ensure_ascii=False, separators=(',', ':'))}"
         f"\n\nConversation context:\n{context}"
     )
@@ -541,55 +651,36 @@ async def route_tool_request(
                     f"explicit tool is not allowed: {selected_name}"
                 )
         else:
-            selection, selection_meta = await _post_planner_json(
-                _selection_prompt(
-                    context,
-                    _compact_tool_catalog(tools_by_name),
-                ),
+            catalog = _compact_tool_catalog(tools_by_name)
+            response_text, selection_meta = await _post_planner_text(
+                _selection_prompt(context, catalog),
                 max_tokens=SELECTION_MAX_TOKENS,
                 timeout_seconds=timeout_seconds,
             )
 
-            decision = str(
-                selection.get("decision") or ""
-            ).strip().upper()
+            decision, selected_name = _parse_selection_protocol(
+                response_text,
+                catalog,
+            )
 
-            if decision == "NO_TOOL":
-                mode = str(
-                    selection.get("mode") or ""
-                ).strip().upper()
-
-                if mode not in {"FAST", "THINK"}:
-                    raise PlannerRouterError(
-                        f"unknown NO_TOOL answer mode: {mode!r}"
-                    )
-
+            if decision in {"FAST", "THINK"}:
                 logger.info(
                     "[PLANNER_ROUTER] no_tool mode=%s elapsed=%s "
                     "prompt_tokens=%s cached_tokens=%s",
-                    mode,
+                    decision,
                     selection_meta.get("elapsed_seconds"),
                     selection_meta.get("prompt_tokens"),
                     selection_meta.get("cached_tokens"),
                 )
                 return {
                     "decision": "NO_TOOL",
-                    "mode": mode,
+                    "mode": decision,
                     "meta": {
                         "selection": selection_meta,
                     },
                 }
 
-            if decision != "TOOL":
-                raise PlannerRouterError(
-                    f"unknown planner decision: {decision!r}"
-                )
-
-            selected_name = str(
-                selection.get("name") or ""
-            ).strip()
-
-            if selected_name not in tools_by_name:
+            if not selected_name or selected_name not in tools_by_name:
                 raise PlannerRouterError(
                     f"planner selected unknown tool: {selected_name!r}"
                 )

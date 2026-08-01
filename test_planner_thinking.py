@@ -14,10 +14,10 @@ class PlannerThinkingTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(
             planner_router,
-            "_post_planner_json",
+            "_post_planner_text",
             AsyncMock(
                 return_value=(
-                    {"mode": "FAST"},
+                    "FAST",
                     planner_meta,
                 )
             ),
@@ -50,10 +50,10 @@ class PlannerThinkingTests(unittest.IsolatedAsyncioTestCase):
     async def test_think_mode(self):
         with patch.object(
             planner_router,
-            "_post_planner_json",
+            "_post_planner_text",
             AsyncMock(
                 return_value=(
-                    {"mode": "think"},
+                    "think",
                     {"elapsed_seconds": 0.4},
                 )
             ),
@@ -72,10 +72,10 @@ class PlannerThinkingTests(unittest.IsolatedAsyncioTestCase):
     async def test_invalid_mode_returns_error(self):
         with patch.object(
             planner_router,
-            "_post_planner_json",
+            "_post_planner_text",
             AsyncMock(
                 return_value=(
-                    {"mode": "MAYBE"},
+                    "MAYBE",
                     {"elapsed_seconds": 0.2},
                 )
             ),
@@ -95,6 +95,15 @@ class PlannerThinkingTests(unittest.IsolatedAsyncioTestCase):
             result["error"],
         )
 
+    def test_protocol_rejects_explanation(self):
+        with self.assertRaisesRegex(
+            planner_router.PlannerRouterError,
+            "exactly one protocol line",
+        ):
+            planner_router._parse_thinking_protocol(
+                "THINK\nThis requires calculation"
+            )
+
     def test_prompt_keeps_dynamic_context_last(self):
         context = "DYNAMIC-CONTEXT-MARKER"
         prompt = planner_router._thinking_prompt(context)
@@ -106,11 +115,11 @@ class PlannerThinkingTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         self.assertIn(
-            '{"mode":"FAST"}',
+            "FAST",
             prompt,
         )
         self.assertIn(
-            '{"mode":"THINK"}',
+            "THINK",
             prompt,
         )
         self.assertIn(

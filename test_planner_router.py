@@ -45,14 +45,14 @@ class PlannerRouterTests(unittest.IsolatedAsyncioTestCase):
     async def test_no_tool(self):
         mocked = AsyncMock(
             return_value=(
-                {"decision": "NO_TOOL", "mode": "THINK"},
+                "THINK",
                 {"elapsed_seconds": 0.5},
             )
         )
 
         with patch.object(
             planner_router,
-            "_post_planner_json",
+            "_post_planner_text",
             mocked,
         ):
             result = await planner_router.route_tool_request(
@@ -72,10 +72,7 @@ class PlannerRouterTests(unittest.IsolatedAsyncioTestCase):
     async def test_no_tool_requires_valid_answer_mode(self):
         mocked = AsyncMock(
             return_value=(
-                {
-                    "decision": "NO_TOOL",
-                    "mode": "MAYBE",
-                },
+                "MAYBE",
                 {
                     "elapsed_seconds": 0.2,
                 },
@@ -84,7 +81,7 @@ class PlannerRouterTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(
             planner_router,
-            "_post_planner_json",
+            "_post_planner_text",
             mocked,
         ):
             result = await planner_router.route_tool_request(
@@ -99,40 +96,40 @@ class PlannerRouterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["decision"], "ERROR")
         self.assertIn(
-            "unknown NO_TOOL answer mode",
+            "unknown planner protocol response",
             result["error"],
         )
 
     async def test_tool_selection_and_arguments(self):
-        mocked = AsyncMock(
-            side_effect=[
-                (
-                    {
-                        "decision": "TOOL",
-                        "name": "search_web",
+        selection = AsyncMock(
+            return_value=(
+                "TOOL 1",
+                {"elapsed_seconds": 1.0},
+            )
+        )
+        arguments = AsyncMock(
+            return_value=(
+                {
+                    "name": "search_web",
+                    "arguments": {
+                        "query": "current USD exchange rate",
                     },
-                    {
-                        "elapsed_seconds": 1.0,
-                    },
-                ),
-                (
-                    {
-                        "name": "search_web",
-                        "arguments": {
-                            "query": "current USD exchange rate",
-                        },
-                    },
-                    {
-                        "elapsed_seconds": 1.2,
-                    },
-                ),
-            ]
+                },
+                {"elapsed_seconds": 1.2},
+            )
         )
 
-        with patch.object(
-            planner_router,
-            "_post_planner_json",
-            mocked,
+        with (
+            patch.object(
+                planner_router,
+                "_post_planner_text",
+                selection,
+            ),
+            patch.object(
+                planner_router,
+                "_post_planner_json",
+                arguments,
+            ),
         ):
             result = await planner_router.route_tool_request(
                 [
@@ -145,7 +142,8 @@ class PlannerRouterTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(result["decision"], "TOOL")
-        self.assertEqual(mocked.await_count, 2)
+        self.assertEqual(selection.await_count, 1)
+        self.assertEqual(arguments.await_count, 1)
 
         function = result["tool_call"]["function"]
         self.assertEqual(function["name"], "search_web")
@@ -157,29 +155,28 @@ class PlannerRouterTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_missing_required_argument_is_error(self):
-        mocked = AsyncMock(
-            side_effect=[
-                (
-                    {
-                        "decision": "TOOL",
-                        "name": "search_web",
-                    },
-                    {},
-                ),
-                (
-                    {
-                        "name": "search_web",
-                        "arguments": {},
-                    },
-                    {},
-                ),
-            ]
+        selection = AsyncMock(return_value=("TOOL 1", {}))
+        arguments = AsyncMock(
+            return_value=(
+                {
+                    "name": "search_web",
+                    "arguments": {},
+                },
+                {},
+            )
         )
 
-        with patch.object(
-            planner_router,
-            "_post_planner_json",
-            mocked,
+        with (
+            patch.object(
+                planner_router,
+                "_post_planner_text",
+                selection,
+            ),
+            patch.object(
+                planner_router,
+                "_post_planner_json",
+                arguments,
+            ),
         ):
             result = await planner_router.route_tool_request(
                 [
@@ -204,18 +201,45 @@ class PlannerRouterTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertLess(
-            prompt.index("Available tools:"),
+            prompt.index("Available tools (use the numeric id"),
             prompt.index("Conversation context:"),
         )
         self.assertTrue(prompt.endswith("DYNAMIC-CONTEXT"))
         self.assertIn(
-            '{"decision":"NO_TOOL","mode":"FAST"}',
+            "FAST",
             prompt,
         )
         self.assertIn(
-            '{"decision":"NO_TOOL","mode":"THINK"}',
+            "THINK",
             prompt,
         )
+        self.assertIn("TOOL <numeric_id>", prompt)
+        self.assertEqual(
+            planner_router._compact_tool_catalog(
+                planner_router._normalize_tools(TOOLS)
+            )[1]["id"],
+            1,
+        )
+
+    def test_selection_protocol_rejects_out_of_range_tool(self):
+        with self.assertRaisesRegex(
+            planner_router.PlannerRouterError,
+            "out of range",
+        ):
+            planner_router._parse_selection_protocol(
+                "TOOL 99",
+                [{"name": "search_web"}],
+            )
+
+    def test_selection_protocol_rejects_extra_text(self):
+        with self.assertRaisesRegex(
+            planner_router.PlannerRouterError,
+            "exactly one protocol line",
+        ):
+            planner_router._parse_selection_protocol(
+                "THINK\nBecause this is difficult",
+                [],
+            )
 
     def test_arguments_prompt_keeps_dynamic_context_last(self):
         prompt = planner_router._arguments_prompt(
