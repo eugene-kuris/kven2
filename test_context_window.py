@@ -114,6 +114,14 @@ class ContextWindowReportTests(unittest.TestCase):
             report["verbatim_tail_roles"],
             ["assistant", "tool", "tool"],
         )
+        self.assertEqual(
+            report["older_tool_protocol_groups"],
+            0,
+        )
+        self.assertEqual(
+            report["older_tool_protocol_indices"],
+            [],
+        )
 
     def test_report_splits_text_and_media_payloads(self):
         data_uri = (
@@ -185,6 +193,96 @@ class ContextWindowReportTests(unittest.TestCase):
         self.assertEqual(
             manifest["media_payload_chars"],
             len(data_uri) + len(remote_url),
+        )
+
+    def test_report_identifies_older_media_and_tool_candidates(self):
+        data_uri = (
+            "data:image/png;base64,"
+            + ("A" * 100)
+        )
+        messages = [
+            {
+                "role": "system",
+                "content": "system",
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "inspect image",
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": data_uri,
+                        },
+                    },
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "search_web",
+                            "arguments": "{}",
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "raw historical result",
+            },
+            {
+                "role": "assistant",
+                "content": "recent answer",
+            },
+            {
+                "role": "user",
+                "content": "latest request",
+            },
+        ]
+
+        report = context_window.build_context_window_report(
+            messages,
+            tail_messages=2,
+        )
+
+        self.assertEqual(
+            report["older_media_candidate_indices"],
+            [1],
+        )
+        self.assertEqual(
+            report["older_media_candidate_messages"],
+            1,
+        )
+        self.assertEqual(
+            report[
+                "older_media_candidate_payload_chars"
+            ],
+            len(data_uri),
+        )
+        self.assertEqual(
+            report["older_tool_protocol_groups"],
+            1,
+        )
+        self.assertEqual(
+            report["older_tool_protocol_indices"],
+            [2, 3],
+        )
+        self.assertEqual(
+            report["older_tool_protocol_messages"],
+            2,
+        )
+        self.assertGreater(
+            report["older_tool_protocol_json_chars"],
+            0,
         )
 
     def test_report_does_not_mutate_or_expose_content(self):

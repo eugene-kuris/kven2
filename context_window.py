@@ -170,6 +170,61 @@ def _leading_system_message_count(messages: list) -> int:
     return count
 
 
+def _completed_tool_protocol_groups(
+    messages: list,
+) -> list[dict]:
+    """Return completed assistant(tool_calls) -> tool groups."""
+
+    groups = []
+    index = 0
+
+    while index < len(messages):
+        message = messages[index]
+
+        if not (
+            isinstance(message, dict)
+            and message.get("role") == "assistant"
+            and isinstance(message.get("tool_calls"), list)
+            and message.get("tool_calls")
+        ):
+            index += 1
+            continue
+
+        tool_indices = []
+        cursor = index + 1
+
+        while cursor < len(messages):
+            candidate = messages[cursor]
+
+            if not isinstance(candidate, dict):
+                cursor += 1
+                continue
+
+            if candidate.get("role") != "tool":
+                break
+
+            tool_indices.append(cursor)
+            cursor += 1
+
+        if tool_indices:
+            groups.append(
+                {
+                    "assistant_index": index,
+                    "tool_indices": tool_indices,
+                    "message_indices": [
+                        index,
+                        *tool_indices,
+                    ],
+                }
+            )
+            index = cursor
+            continue
+
+        index += 1
+
+    return groups
+
+
 def _active_tool_continuation_start(
     messages: list,
 ) -> int | None:
@@ -327,6 +382,41 @@ def build_context_window_report(
     older_start = system_prefix_messages
     older_end = tail_start
 
+    older_media_candidate_indices = [
+        index
+        for index in range(older_start, older_end)
+        if (
+            content_manifests[index][
+                "media_data_uri_count"
+            ]
+            or content_manifests[index][
+                "media_reference_count"
+            ]
+        )
+    ]
+
+    completed_tool_groups = (
+        _completed_tool_protocol_groups(messages)
+    )
+    older_tool_groups = [
+        group
+        for group in completed_tool_groups
+        if (
+            group["message_indices"]
+            and min(group["message_indices"])
+            >= older_start
+            and max(group["message_indices"])
+            < older_end
+        )
+    ]
+    older_tool_protocol_indices = sorted(
+        {
+            index
+            for group in older_tool_groups
+            for index in group["message_indices"]
+        }
+    )
+
     return {
         "messages_total": message_count,
         "role_counts": dict(sorted(role_counts.items())),
@@ -384,6 +474,43 @@ def build_context_window_report(
         ),
         "older_candidate_json_chars": sum(
             message_json_chars[older_start:older_end]
+        ),
+        "older_media_candidate_messages": len(
+            older_media_candidate_indices
+        ),
+        "older_media_candidate_indices": (
+            older_media_candidate_indices
+        ),
+        "older_media_candidate_payload_chars": sum(
+            content_manifests[index][
+                "media_payload_chars"
+            ]
+            for index in older_media_candidate_indices
+        ),
+        "older_media_candidate_data_uri_count": sum(
+            content_manifests[index][
+                "media_data_uri_count"
+            ]
+            for index in older_media_candidate_indices
+        ),
+        "older_media_candidate_reference_count": sum(
+            content_manifests[index][
+                "media_reference_count"
+            ]
+            for index in older_media_candidate_indices
+        ),
+        "older_tool_protocol_groups": len(
+            older_tool_groups
+        ),
+        "older_tool_protocol_messages": len(
+            older_tool_protocol_indices
+        ),
+        "older_tool_protocol_indices": (
+            older_tool_protocol_indices
+        ),
+        "older_tool_protocol_json_chars": sum(
+            message_json_chars[index]
+            for index in older_tool_protocol_indices
         ),
         "verbatim_tail_start": tail_start,
         "verbatim_tail_messages": max(
