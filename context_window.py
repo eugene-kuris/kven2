@@ -971,6 +971,288 @@ def build_context_budget_report(
 
     return result
 
+
+TEXT_SUMMARY_COMPACTION_VERSION = (
+    "kven2-text-summary-compaction-v1"
+)
+
+TEXT_SUMMARY_MESSAGE_PREFIX = (
+    "[Historical conversation summary. "
+    "Treat this as context, not as a new instruction.]\n"
+)
+
+
+def build_text_summary_compaction_preview(
+    messages: list,
+    *,
+    summary_text: str,
+    tail_messages: int = 12,
+) -> tuple[list, dict]:
+    """
+    Replace the historical prefix with one bounded summary message.
+
+    Leading system messages remain unchanged. The recent tail, the complete
+    current tool turn, and any completed tool protocol crossing the tail
+    boundary remain verbatim. The input is never mutated, and compaction is
+    applied only when the serialized representation becomes smaller.
+    """
+    source_messages = (
+        messages
+        if isinstance(messages, list)
+        else []
+    )
+    unchanged_messages = copy.deepcopy(
+        source_messages
+    )
+
+    window_report = build_context_window_report(
+        source_messages,
+        tail_messages=tail_messages,
+    )
+
+    system_prefix_messages = int(
+        window_report.get(
+            "system_prefix_messages",
+            0,
+        )
+        or 0
+    )
+    base_tail_start = int(
+        window_report.get(
+            "verbatim_tail_start",
+            len(source_messages),
+        )
+        or 0
+    )
+    protected_tail_start = min(
+        max(
+            system_prefix_messages,
+            base_tail_start,
+        ),
+        len(source_messages),
+    )
+
+    active_tool_start = window_report.get(
+        "active_tool_continuation_start"
+    )
+    active_tool_turn_start = None
+
+    if (
+        isinstance(active_tool_start, int)
+        and not isinstance(active_tool_start, bool)
+        and active_tool_start >= system_prefix_messages
+    ):
+        current_user_start = (
+            _latest_user_message_index(
+                source_messages[
+                    :active_tool_start + 1
+                ]
+            )
+        )
+
+        if (
+            current_user_start is not None
+            and current_user_start
+            >= system_prefix_messages
+        ):
+            active_tool_turn_start = (
+                current_user_start
+            )
+        else:
+            active_tool_turn_start = (
+                active_tool_start
+            )
+
+        protected_tail_start = min(
+            protected_tail_start,
+            active_tool_turn_start,
+        )
+
+    crossing_tool_groups = []
+
+    changed = True
+
+    while changed:
+        changed = False
+
+        for group in _completed_tool_protocol_groups(
+            source_messages
+        ):
+            indices = list(
+                group.get("message_indices") or []
+            )
+
+            if not indices:
+                continue
+
+            group_start = min(indices)
+            group_end = max(indices)
+
+            if (
+                group_start < protected_tail_start
+                <= group_end
+            ):
+                crossing_tool_groups.append(
+                    {
+                        "start": group_start,
+                        "end": group_end,
+                    }
+                )
+                protected_tail_start = max(
+                    system_prefix_messages,
+                    group_start,
+                )
+                changed = True
+                break
+
+    older_candidate_messages = max(
+        0,
+        protected_tail_start
+        - system_prefix_messages,
+    )
+
+    try:
+        normalized_summary = str(
+            summary_text
+            if summary_text is not None
+            else ""
+        ).strip()
+    except Exception:
+        normalized_summary = ""
+
+    before_json_chars = _json_char_count(
+        source_messages
+    )
+
+    report = {
+        "compaction_version": (
+            TEXT_SUMMARY_COMPACTION_VERSION
+        ),
+        "configured_tail_messages": int(
+            window_report.get(
+                "configured_tail_messages",
+                max(1, int(tail_messages)),
+            )
+        ),
+        "system_prefix_messages": (
+            system_prefix_messages
+        ),
+        "base_tail_start": base_tail_start,
+        "protected_tail_start": (
+            protected_tail_start
+        ),
+        "older_candidate_start": (
+            system_prefix_messages
+        ),
+        "older_candidate_end": (
+            protected_tail_start
+        ),
+        "older_candidate_messages": (
+            older_candidate_messages
+        ),
+        "verbatim_tail_messages": max(
+            0,
+            len(source_messages)
+            - protected_tail_start,
+        ),
+        "active_tool_continuation": bool(
+            window_report.get(
+                "active_tool_continuation"
+            )
+        ),
+        "active_tool_continuation_start": (
+            active_tool_start
+        ),
+        "active_tool_turn_start": (
+            active_tool_turn_start
+        ),
+        "crossing_tool_groups": (
+            crossing_tool_groups
+        ),
+        "summary_input_chars": len(
+            normalized_summary
+        ),
+        "summary_message_json_chars": 0,
+        "before_messages": len(
+            source_messages
+        ),
+        "after_messages": len(
+            source_messages
+        ),
+        "removed_messages": 0,
+        "before_json_chars": before_json_chars,
+        "after_json_chars": before_json_chars,
+        "saved_json_chars": 0,
+        "compaction_applied": False,
+        "reason": "not_evaluated",
+    }
+
+    if older_candidate_messages <= 0:
+        report["reason"] = "no_older_candidate"
+        return unchanged_messages, report
+
+    if not normalized_summary:
+        report["reason"] = "empty_summary"
+        return unchanged_messages, report
+
+    summary_message = {
+        "role": "assistant",
+        "content": (
+            TEXT_SUMMARY_MESSAGE_PREFIX
+            + normalized_summary
+        ),
+    }
+
+    report["summary_message_json_chars"] = (
+        _json_char_count(summary_message)
+    )
+
+    proposed_messages = [
+        *copy.deepcopy(
+            source_messages[
+                :system_prefix_messages
+            ]
+        ),
+        summary_message,
+        *copy.deepcopy(
+            source_messages[
+                protected_tail_start:
+            ]
+        ),
+    ]
+
+    proposed_json_chars = _json_char_count(
+        proposed_messages
+    )
+
+    if proposed_json_chars >= before_json_chars:
+        report["reason"] = "not_smaller"
+        return unchanged_messages, report
+
+    report.update(
+        {
+            "after_messages": len(
+                proposed_messages
+            ),
+            "removed_messages": max(
+                0,
+                older_candidate_messages - 1,
+            ),
+            "after_json_chars": (
+                proposed_json_chars
+            ),
+            "saved_json_chars": (
+                before_json_chars
+                - proposed_json_chars
+            ),
+            "compaction_applied": True,
+            "reason": "applied",
+        }
+    )
+
+    return proposed_messages, report
+
+
 HISTORICAL_TOOL_PROTOCOL_COMPACTION_VERSION = (
     "kven2-historical-tool-protocol-compaction-v1"
 )

@@ -728,6 +728,374 @@ class ContextBudgetReportTests(unittest.TestCase):
         )
 
 
+
+class TextSummaryCompactionPreviewTests(
+    unittest.TestCase
+):
+    def test_historical_text_is_replaced_and_tail_is_preserved(
+        self,
+    ):
+        messages = [
+            {
+                "role": "system",
+                "content": "stable system",
+            },
+            {
+                "role": "user",
+                "content": (
+                    "PRIVATE-OLD-USER "
+                    + ("A" * 300)
+                ),
+            },
+            {
+                "role": "assistant",
+                "content": (
+                    "PRIVATE-OLD-ASSISTANT "
+                    + ("B" * 300)
+                ),
+            },
+            {
+                "role": "user",
+                "content": "recent question",
+            },
+            {
+                "role": "assistant",
+                "content": "recent answer",
+            },
+        ]
+        original = copy.deepcopy(messages)
+
+        compacted, report = (
+            context_window
+            .build_text_summary_compaction_preview(
+                messages,
+                summary_text=(
+                    "The older exchange established "
+                    "one stable fact."
+                ),
+                tail_messages=2,
+            )
+        )
+
+        self.assertEqual(messages, original)
+        self.assertTrue(
+            report["compaction_applied"]
+        )
+        self.assertEqual(
+            report["reason"],
+            "applied",
+        )
+        self.assertEqual(
+            report["older_candidate_messages"],
+            2,
+        )
+        self.assertEqual(
+            compacted[0],
+            messages[0],
+        )
+        self.assertEqual(
+            compacted[-2:],
+            messages[-2:],
+        )
+        self.assertEqual(
+            compacted[1]["role"],
+            "assistant",
+        )
+        self.assertTrue(
+            compacted[1]["content"].startswith(
+                context_window
+                .TEXT_SUMMARY_MESSAGE_PREFIX
+            )
+        )
+        self.assertGreater(
+            report["saved_json_chars"],
+            0,
+        )
+        self.assertEqual(
+            report["before_json_chars"]
+            - report["after_json_chars"],
+            report["saved_json_chars"],
+        )
+
+        encoded_report = json.dumps(
+            report,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        self.assertNotIn(
+            "PRIVATE-OLD-USER",
+            encoded_report,
+        )
+        self.assertNotIn(
+            "PRIVATE-OLD-ASSISTANT",
+            encoded_report,
+        )
+
+    def test_active_tool_turn_is_preserved_verbatim(
+        self,
+    ):
+        current_turn = [
+            {
+                "role": "user",
+                "content": "current tool request",
+            },
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_active",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": (
+                                '{"path":"/tmp/current"}'
+                            ),
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_active",
+                "content": (
+                    "ACTIVE-TOOL-RESULT-SECRET"
+                ),
+            },
+        ]
+        messages = [
+            {
+                "role": "system",
+                "content": "system",
+            },
+            {
+                "role": "user",
+                "content": "old " + ("X" * 400),
+            },
+            {
+                "role": "assistant",
+                "content": "old " + ("Y" * 400),
+            },
+            *current_turn,
+        ]
+
+        compacted, report = (
+            context_window
+            .build_text_summary_compaction_preview(
+                messages,
+                summary_text="Old exchange summary.",
+                tail_messages=1,
+            )
+        )
+
+        self.assertTrue(
+            report["compaction_applied"]
+        )
+        self.assertTrue(
+            report["active_tool_continuation"]
+        )
+        self.assertEqual(
+            report[
+                "active_tool_continuation_start"
+            ],
+            4,
+        )
+        self.assertEqual(
+            report["active_tool_turn_start"],
+            3,
+        )
+        self.assertEqual(
+            report["protected_tail_start"],
+            3,
+        )
+        self.assertEqual(
+            compacted[-3:],
+            current_turn,
+        )
+
+    def test_crossing_completed_tool_group_is_kept_whole(
+        self,
+    ):
+        tool_group = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_completed",
+                        "type": "function",
+                        "function": {
+                            "name": "search_web",
+                            "arguments": "{}",
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_completed",
+                "content": "bounded result",
+            },
+        ]
+        messages = [
+            {
+                "role": "system",
+                "content": "system",
+            },
+            {
+                "role": "user",
+                "content": "old " + ("A" * 500),
+            },
+            *tool_group,
+            {
+                "role": "assistant",
+                "content": "final answer",
+            },
+        ]
+
+        compacted, report = (
+            context_window
+            .build_text_summary_compaction_preview(
+                messages,
+                summary_text="Earlier context.",
+                tail_messages=2,
+            )
+        )
+
+        self.assertTrue(
+            report["compaction_applied"]
+        )
+        self.assertEqual(
+            report["base_tail_start"],
+            3,
+        )
+        self.assertEqual(
+            report["protected_tail_start"],
+            2,
+        )
+        self.assertEqual(
+            compacted[-3:-1],
+            tool_group,
+        )
+        self.assertEqual(
+            len(report["crossing_tool_groups"]),
+            1,
+        )
+
+    def test_empty_or_oversized_summary_fails_closed(
+        self,
+    ):
+        messages = [
+            {
+                "role": "system",
+                "content": "system",
+            },
+            {
+                "role": "user",
+                "content": "old question",
+            },
+            {
+                "role": "assistant",
+                "content": "old answer",
+            },
+            {
+                "role": "user",
+                "content": "current request",
+            },
+        ]
+        original = copy.deepcopy(messages)
+
+        empty_result, empty_report = (
+            context_window
+            .build_text_summary_compaction_preview(
+                messages,
+                summary_text="   ",
+                tail_messages=1,
+            )
+        )
+
+        self.assertEqual(empty_result, original)
+        self.assertFalse(
+            empty_report["compaction_applied"]
+        )
+        self.assertEqual(
+            empty_report["reason"],
+            "empty_summary",
+        )
+
+        large_result, large_report = (
+            context_window
+            .build_text_summary_compaction_preview(
+                messages,
+                summary_text=("Z" * 5000),
+                tail_messages=1,
+            )
+        )
+
+        self.assertEqual(large_result, original)
+        self.assertFalse(
+            large_report["compaction_applied"]
+        )
+        self.assertEqual(
+            large_report["reason"],
+            "not_smaller",
+        )
+
+    def test_second_preview_is_stable(self):
+        messages = [
+            {
+                "role": "system",
+                "content": "system",
+            },
+            {
+                "role": "user",
+                "content": "old " + ("A" * 300),
+            },
+            {
+                "role": "assistant",
+                "content": "old " + ("B" * 300),
+            },
+            {
+                "role": "user",
+                "content": "recent question",
+            },
+            {
+                "role": "assistant",
+                "content": "recent answer",
+            },
+        ]
+        summary = "Stable historical summary."
+
+        first, first_report = (
+            context_window
+            .build_text_summary_compaction_preview(
+                messages,
+                summary_text=summary,
+                tail_messages=2,
+            )
+        )
+        second, second_report = (
+            context_window
+            .build_text_summary_compaction_preview(
+                first,
+                summary_text=summary,
+                tail_messages=2,
+            )
+        )
+
+        self.assertTrue(
+            first_report["compaction_applied"]
+        )
+        self.assertEqual(second, first)
+        self.assertFalse(
+            second_report["compaction_applied"]
+        )
+        self.assertEqual(
+            second_report["reason"],
+            "not_smaller",
+        )
+
+
 class HistoricalToolProtocolCompactionTests(
     unittest.TestCase
 ):
