@@ -292,6 +292,65 @@ def _resolve_hybrid_no_tool_thinking(
     return selected
 
 
+FINAL_ANSWER_TOKEN_POLICIES = {
+    "FAST": (
+        "KVEN2_FINAL_FAST_DEFAULT_TOKENS",
+        2048,
+        "KVEN2_FINAL_FAST_MAX_TOKENS",
+        4096,
+    ),
+    "THINK": (
+        "KVEN2_FINAL_THINK_DEFAULT_TOKENS",
+        8192,
+        "KVEN2_FINAL_THINK_MAX_TOKENS",
+        12288,
+    ),
+    "CONTINUATION": (
+        "KVEN2_FINAL_CONTINUATION_DEFAULT_TOKENS",
+        2048,
+        "KVEN2_FINAL_CONTINUATION_MAX_TOKENS",
+        4096,
+    ),
+}
+
+
+def _resolve_final_answer_token_budget(
+    policy: str,
+) -> tuple[int, int]:
+    """Resolve a bounded default and cap for one final-answer route."""
+    normalized = str(policy or "").strip().upper()
+
+    if normalized not in FINAL_ANSWER_TOKEN_POLICIES:
+        raise ValueError(
+            f"Unknown final-answer token policy: {policy!r}"
+        )
+
+    (
+        default_env,
+        default_value,
+        cap_env,
+        cap_value,
+    ) = FINAL_ANSWER_TOKEN_POLICIES[normalized]
+
+    default_tokens = _env_int(
+        default_env,
+        default_value,
+        1,
+        131072,
+    )
+    max_tokens_cap = _env_int(
+        cap_env,
+        cap_value,
+        1,
+        131072,
+    )
+
+    return (
+        min(default_tokens, max_tokens_cap),
+        max_tokens_cap,
+    )
+
+
 def _apply_final_answer_safeguards(
     payload: dict,
     *,
@@ -388,6 +447,11 @@ def _apply_final_answer_safeguards(
     safe["repeat_last_n"] = _env_int("KVEN2_FINAL_REPEAT_LAST_N", 512, 64, 4096)
 
     thinking_enabled = bool(enable_thinking)
+    token_policy = (
+        "CONTINUATION"
+        if route_label.startswith("hybrid_continuation")
+        else ("THINK" if thinking_enabled else "FAST")
+    )
 
     chat_template_kwargs = safe.get("chat_template_kwargs")
     if not isinstance(chat_template_kwargs, dict):
@@ -407,13 +471,15 @@ def _apply_final_answer_safeguards(
 
     logger.info(
         "[FINAL_GUARD] payload_applied route_label=%s max_tokens=%s "
-        "default_tokens=%s budget_source=%s max_tokens_cap=%s "
-        "temperature=%s top_p=%s top_k=%s repeat_penalty=%s "
-        "repeat_last_n=%s thinking=%s reasoning_format=%s",
+        "default_tokens=%s budget_source=%s token_policy=%s "
+        "max_tokens_cap=%s temperature=%s top_p=%s top_k=%s "
+        "repeat_penalty=%s repeat_last_n=%s thinking=%s "
+        "reasoning_format=%s",
         route_label,
         safe.get("max_tokens"),
         default_tokens,
         budget_source,
+        token_policy,
         resolved_max_tokens_cap,
         safe.get("temperature"),
         safe.get("top_p"),
@@ -2316,6 +2382,12 @@ async def _proxy_hybrid_continuation_final_response(
         "KVEN2_TOOL_CONTINUATION_ENABLE_THINKING",
         False,
     )
+    (
+        continuation_default_tokens,
+        continuation_max_tokens,
+    ) = _resolve_final_answer_token_budget(
+        "CONTINUATION"
+    )
 
     base_payload = _apply_final_answer_safeguards(
         payload,
@@ -2329,6 +2401,8 @@ async def _proxy_hybrid_continuation_final_response(
             if client_stream_requested
             else False
         ),
+        min_tokens_override=continuation_default_tokens,
+        max_tokens_cap=continuation_max_tokens,
     )
 
     if client_stream_requested:
@@ -2541,6 +2615,25 @@ async def _proxy_hybrid_no_tool_final_response(
         answer_mode=answer_mode,
         rag_detected=rag_detected,
     )
+    token_policy = (
+        "THINK"
+        if thinking_enabled
+        else "FAST"
+    )
+    (
+        route_default_tokens,
+        route_max_tokens,
+    ) = _resolve_final_answer_token_budget(
+        token_policy
+    )
+
+    if final_min_tokens_override is None:
+        final_min_tokens_override = (
+            route_default_tokens
+        )
+
+    if final_max_tokens_cap is None:
+        final_max_tokens_cap = route_max_tokens
 
     if stream_requested and not rag_detected:
         final_payload = _apply_final_answer_safeguards(
@@ -2613,11 +2706,24 @@ def _start_speculative_no_tool_stream(
     final_payload.pop("parallel_tool_calls", None)
 
     thinking_enabled = bool(enable_thinking)
+    speculative_token_policy = (
+        "THINK"
+        if thinking_enabled
+        else "FAST"
+    )
+    (
+        speculative_default_tokens,
+        speculative_max_tokens,
+    ) = _resolve_final_answer_token_budget(
+        speculative_token_policy
+    )
 
     final_payload = _apply_final_answer_safeguards(
         final_payload,
         route_label="hybrid_no_tool_speculative",
         enable_thinking=thinking_enabled,
+        min_tokens_override=speculative_default_tokens,
+        max_tokens_cap=speculative_max_tokens,
     )
     final_payload["stream"] = True
 
@@ -4919,10 +5025,24 @@ async def handle_chat(request: Request):
                 gateway_tool_loop_enabled=gateway_tool_loop_enabled,
             )
 
+            main_token_policy = (
+                "THINK"
+                if main_chat_thinking
+                else "FAST"
+            )
+            (
+                main_default_tokens,
+                main_max_tokens,
+            ) = _resolve_final_answer_token_budget(
+                main_token_policy
+            )
+
             payload = _apply_final_answer_safeguards(
                 payload,
                 route_label="main_final",
                 enable_thinking=main_chat_thinking,
+                min_tokens_override=main_default_tokens,
+                max_tokens_cap=main_max_tokens,
             )
 
             logger.info(
