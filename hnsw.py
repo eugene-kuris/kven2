@@ -15,10 +15,48 @@ from config import settings
 index_path = settings.INDEX_PATH
 id_map_path = index_path + ".id_map.json"
 
-# Увеличиваем лимит до 2 миллионов элементов
-MAX_ELEMENTS = 2000000
 DIMENSION = 768
 SPACE = 'cosine'
+
+# This is an initial allocation size, not a lifetime record limit.
+# The index grows geometrically before new items exceed its capacity.
+DEFAULT_INITIAL_CAPACITY = 10_000
+GROWTH_FACTOR = 2
+
+
+def _read_positive_int_env(name: str, default: int) -> int:
+    raw_value = os.getenv(name)
+
+    if raw_value is None:
+        return default
+
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        logger.warning(
+            "[HNSW] Invalid %s=%r; using default=%s.",
+            name,
+            raw_value,
+            default,
+        )
+        return default
+
+    if value < 1:
+        logger.warning(
+            "[HNSW] Non-positive %s=%r; using default=%s.",
+            name,
+            raw_value,
+            default,
+        )
+        return default
+
+    return value
+
+
+INITIAL_CAPACITY = _read_positive_int_env(
+    "KVEN2_HNSW_INITIAL_CAPACITY",
+    DEFAULT_INITIAL_CAPACITY,
+)
 
 hnsw_index = None
 id_to_hnsw = {}   # db_id -> hnsw_id
@@ -86,15 +124,75 @@ def _save_id_map() -> bool:
         return False
 
 
+def _next_capacity(
+    required_count: int,
+    current_capacity: int,
+) -> int:
+    """Return a geometrically grown capacity with no application cap."""
+    required = max(0, int(required_count))
+    current = max(0, int(current_capacity))
+
+    if required <= current:
+        return current
+
+    capacity = max(
+        current,
+        INITIAL_CAPACITY,
+        1,
+    )
+
+    while capacity < required:
+        capacity = max(
+            capacity + 1,
+            capacity * GROWTH_FACTOR,
+        )
+
+    return capacity
+
+
+def _ensure_capacity(required_count: int) -> int:
+    """Expand the active index before adding new records."""
+    if hnsw_index is None:
+        raise RuntimeError(
+            "Cannot resize an uninitialized HNSW index"
+        )
+
+    current_capacity = int(
+        hnsw_index.get_max_elements()
+    )
+    target_capacity = _next_capacity(
+        required_count,
+        current_capacity,
+    )
+
+    if target_capacity > current_capacity:
+        hnsw_index.resize_index(target_capacity)
+        logger.info(
+            "[HNSW] Capacity expanded: old=%s new=%s required=%s",
+            current_capacity,
+            target_capacity,
+            required_count,
+        )
+
+    return target_capacity
+
+
 def _create_new_index(persist_empty: bool = True):
     """Создаёт новый пустой HNSW index с текущими параметрами."""
     global hnsw_index, _SAVE_COUNTER
 
     hnsw_index = hnswlib.Index(space=SPACE, dim=DIMENSION)
-    hnsw_index.init_index(max_elements=MAX_ELEMENTS, ef_construction=200, M=16)
+    hnsw_index.init_index(
+        max_elements=INITIAL_CAPACITY,
+        ef_construction=200,
+        M=16,
+    )
     hnsw_index.set_ef(50)
     _SAVE_COUNTER = 0
-    logger.info(f"[HNSW] Index initialized (new). Max Limit: {MAX_ELEMENTS}")
+    logger.info(
+        "[HNSW] Index initialized (new). Initial Capacity: %s",
+        INITIAL_CAPACITY,
+    )
 
     if persist_empty:
         try:
@@ -153,19 +251,71 @@ def init_hnsw():
             hnsw_index.load_index(index_path)
             hnsw_index.set_ef(50)
 
-            loaded_max = int(hnsw_index.get_max_elements())
-            loaded_count = int(hnsw_index.get_current_count())
-            logger.info(f"[HNSW] Index loaded. Current: {loaded_count}, Max Limit: {loaded_max}")
+            loaded_capacity = int(
+                hnsw_index.get_max_elements()
+            )
+            loaded_count = int(
+                hnsw_index.get_current_count()
+            )
 
-            if loaded_max < MAX_ELEMENTS:
-                logger.warning(
-                    f"[HNSW] Loaded index limit ({loaded_max}) is smaller than required "
-                    f"({MAX_ELEMENTS}). Recreating index and resetting ID map."
+            logger.info(
+                "[HNSW] Index loaded. Current: %s, Capacity: %s",
+                loaded_count,
+                loaded_capacity,
+            )
+
+            # hnswlib 0.8.0 does not persist max_elements for an
+            # empty index. Reload it with an explicit runtime capacity.
+            if loaded_count == 0 and loaded_capacity == 0:
+                logger.info(
+                    "[HNSW] Empty index has no persisted capacity; "
+                    "reloading with initial capacity=%s.",
+                    INITIAL_CAPACITY,
                 )
-                _reset_id_map(save_empty=True)
-                _create_new_index(persist_empty=True)
-                _check_integrity()
-                return
+
+                hnsw_index = hnswlib.Index(
+                    space=SPACE,
+                    dim=DIMENSION,
+                )
+                hnsw_index.load_index(
+                    index_path,
+                    max_elements=INITIAL_CAPACITY,
+                )
+                hnsw_index.set_ef(50)
+
+                loaded_capacity = int(
+                    hnsw_index.get_max_elements()
+                )
+
+            if loaded_capacity < loaded_count:
+                raise RuntimeError(
+                    "Loaded HNSW capacity is smaller than its "
+                    f"record count: capacity={loaded_capacity}, "
+                    f"count={loaded_count}"
+                )
+
+            # Preserve every existing record and enlarge the index
+            # in place when an older index has a smaller capacity.
+            if loaded_capacity < INITIAL_CAPACITY:
+                previous_capacity = loaded_capacity
+
+                hnsw_index.resize_index(
+                    INITIAL_CAPACITY
+                )
+                loaded_capacity = int(
+                    hnsw_index.get_max_elements()
+                )
+
+                if loaded_count > 0:
+                    hnsw_index.save_index(index_path)
+
+                logger.info(
+                    "[HNSW] Loaded index capacity expanded: "
+                    "old=%s new=%s count=%s",
+                    previous_capacity,
+                    loaded_capacity,
+                    loaded_count,
+                )
 
             map_loaded = _load_id_map()
             if not map_loaded:
@@ -225,15 +375,36 @@ def add_to_hnsw(labels, vectors):
                     f"vector dimension mismatch: got={vectors.shape[1]}, expected={DIMENSION}"
                 )
 
+            new_labels = {
+                label
+                for label in labels
+                if label not in id_to_hnsw
+            }
+            required_count = (
+                int(hnsw_index.get_current_count())
+                + len(new_labels)
+            )
+
+            _ensure_capacity(required_count)
+
             hnsw_ids = []
+
             for label in labels:
                 if label not in id_to_hnsw:
                     next_hnsw_id += 1
                     id_to_hnsw[label] = next_hnsw_id
                     hnsw_to_id[next_hnsw_id] = label
-                hnsw_ids.append(id_to_hnsw[label])
 
-            hnsw_ids = np.asarray(hnsw_ids, dtype=np.int32)
+                hnsw_ids.append(
+                    id_to_hnsw[label]
+                )
+
+            # hnswlib accepts 64-bit labels. Avoid introducing an
+            # artificial signed 32-bit identifier ceiling.
+            hnsw_ids = np.asarray(
+                hnsw_ids,
+                dtype=np.int64,
+            )
 
             hnsw_index.add_items(data=vectors, ids=hnsw_ids)
             _SAVE_COUNTER += len(labels)
