@@ -81,6 +81,38 @@ def _sync_init_db():
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                 snapshot_json TEXT NOT NULL
             )""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS text_summary_checkpoints (
+                checkpoint_id TEXT PRIMARY KEY,
+                checkpoint_version TEXT NOT NULL,
+                hash_scope TEXT NOT NULL,
+                summarized_message_count INTEGER NOT NULL
+                    CHECK (summarized_message_count > 0),
+                prefix_sha256 TEXT NOT NULL,
+                summary_sha256 TEXT NOT NULL,
+                summary_chars INTEGER NOT NULL
+                    CHECK (summary_chars > 0),
+                checkpoint_json TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_used TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                usage_count INTEGER DEFAULT 0
+            )""")
+            conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS
+                ux_text_summary_checkpoints_prefix
+                ON text_summary_checkpoints (
+                    checkpoint_version,
+                    hash_scope,
+                    summarized_message_count,
+                    prefix_sha256
+                )
+            """)
+            conn.execute("""CREATE INDEX IF NOT EXISTS
+                ix_text_summary_checkpoints_lookup
+                ON text_summary_checkpoints (
+                    summarized_message_count DESC,
+                    last_used DESC
+                )
+            """)
             try:
                 conn.execute("INSERT OR IGNORE INTO projects (id, name, goal) VALUES (1, 'Kven2 Engineering', 'Implementing a self-learning memory system for the LLM Agent.')")
             except:
