@@ -1,4 +1,5 @@
 import sys
+import os
 import logging
 import asyncio
 
@@ -6,6 +7,7 @@ sys.path.append('/opt/kven2')
 import hnsw
 import embedder
 from sqlite import query
+from memory_reranker import select_relevant_memories
 
 logger = logging.getLogger("Kven.Retrieval")
 
@@ -60,6 +62,75 @@ _MEMORY_QUERY_MARKERS = (
     "routes.py",
     "hnsw",
 )
+
+_TRUE_ENV_VALUES = {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+
+def _read_bool_env(
+    name: str,
+    default: bool,
+) -> bool:
+    raw_value = os.getenv(name)
+
+    if raw_value is None:
+        return default
+
+    return (
+        raw_value.strip().lower()
+        in _TRUE_ENV_VALUES
+    )
+
+
+def _read_int_env(
+    name: str,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    raw_value = os.getenv(name)
+
+    try:
+        value = (
+            int(raw_value)
+            if raw_value is not None
+            else int(default)
+        )
+    except (TypeError, ValueError):
+        value = int(default)
+
+    return max(
+        minimum,
+        min(maximum, value),
+    )
+
+
+def _read_float_env(
+    name: str,
+    default: float,
+    minimum: float,
+    maximum: float,
+) -> float:
+    raw_value = os.getenv(name)
+
+    try:
+        value = (
+            float(raw_value)
+            if raw_value is not None
+            else float(default)
+        )
+    except (TypeError, ValueError):
+        value = float(default)
+
+    return max(
+        minimum,
+        min(maximum, value),
+    )
+
 
 
 def classify_retrieval_query(query_text: str) -> str:
@@ -131,8 +202,8 @@ async def retrieve_context(query_text: str, top_k_raw=TOP_K_RAW, top_k_final=TOP
     4. Берём HNSW top_k_raw.
     5. Фильтруем по threshold, зависящему от режима.
     6. Достаём строки из SQLite.
-    7. Ранжируем по combined score: similarity + confidence.
-    8. Возвращаем до top_k_final элементов.
+    7. When enabled, let the planner select directly relevant IDs.
+    8. Otherwise preserve the legacy similarity/confidence ranking.
     """
     if not query_text or not query_text.strip():
         logger.info("[RETRIEVAL_MODE] mode=skip reason=empty_query")
@@ -250,12 +321,147 @@ async def retrieve_context(query_text: str, top_k_raw=TOP_K_RAW, top_k_final=TOP
                 "retrieval_mode": mode,
             })
 
-        # 5. Сортировка по комбинированному score (reverse=True)
-        retrieved_items.sort(key=lambda x: x["score"], reverse=True)
+        rerank_enabled = _read_bool_env(
+            "KVEN2_RAG_PLANNER_RERANK_ENABLED",
+            False,
+        )
+        rerank_status = "disabled"
+        rerank_error = ""
+        rerank_meta = {}
+        selected_ids = []
 
-        # 6. Возврат финального среза
-        final_results = retrieved_items[:top_k_final]
-        total_mem_tokens = sum(r.get("tokens", 0) for r in final_results)
+        if rerank_enabled:
+            if not retrieved_items:
+                rerank_status = "none"
+                final_results = []
+            else:
+                candidate_limit = _read_int_env(
+                    "KVEN2_RAG_PLANNER_CANDIDATES",
+                    12,
+                    1,
+                    max(1, int(top_k_raw)),
+                )
+                # This is a safety ceiling for the experimental
+                # reranker, not an acceptable latency target.
+                rerank_timeout = _read_float_env(
+                    "KVEN2_RAG_PLANNER_RERANK_TIMEOUT",
+                    15.0,
+                    0.5,
+                    60.0,
+                )
+                planner_candidates = retrieved_items[
+                    :candidate_limit
+                ]
+
+                rerank_result = (
+                    await select_relevant_memories(
+                        query_text,
+                        planner_candidates,
+                        max_items=top_k_final,
+                        timeout_seconds=rerank_timeout,
+                    )
+                )
+
+                rerank_status = str(
+                    rerank_result.get("status")
+                    or "error"
+                )
+                rerank_error = str(
+                    rerank_result.get("error")
+                    or ""
+                )[:500]
+                rerank_meta = (
+                    rerank_result.get("meta")
+                    if isinstance(
+                        rerank_result.get("meta"),
+                        dict,
+                    )
+                    else {}
+                )
+
+                try:
+                    selected_ids = [
+                        int(memory_id)
+                        for memory_id
+                        in (
+                            rerank_result.get(
+                                "selected_ids"
+                            )
+                            or []
+                        )
+                    ]
+                except (TypeError, ValueError):
+                    selected_ids = []
+                    rerank_status = "error"
+                    rerank_error = (
+                        "planner returned invalid "
+                        "memory identifiers"
+                    )
+
+                candidates_by_id = {
+                    int(item["id"]): item
+                    for item in planner_candidates
+                }
+                invalid_selection = (
+                    len(selected_ids)
+                    > int(top_k_final)
+                    or len(selected_ids)
+                    != len(set(selected_ids))
+                    or any(
+                        memory_id
+                        not in candidates_by_id
+                        for memory_id
+                        in selected_ids
+                    )
+                )
+
+                if (
+                    rerank_status == "selected"
+                    and not invalid_selection
+                ):
+                    final_results = [
+                        candidates_by_id[memory_id]
+                        for memory_id in selected_ids
+                    ]
+                elif rerank_status == "none":
+                    final_results = []
+                else:
+                    final_results = []
+
+                    if invalid_selection:
+                        rerank_status = "error"
+                        rerank_error = (
+                            "planner selection failed "
+                            "defensive validation"
+                        )
+
+                logger.info(
+                    "[RETRIEVAL_RERANK] "
+                    "enabled=True status=%s "
+                    "candidates=%s selected_ids=%s "
+                    "timeout=%s error=%s meta=%s",
+                    rerank_status,
+                    len(planner_candidates),
+                    selected_ids,
+                    rerank_timeout,
+                    rerank_error,
+                    rerank_meta,
+                )
+        else:
+            # Preserve the previous behavior until the
+            # planner reranker is explicitly enabled.
+            retrieved_items.sort(
+                key=lambda item: item["score"],
+                reverse=True,
+            )
+            final_results = retrieved_items[
+                :top_k_final
+            ]
+
+        total_mem_tokens = sum(
+            item.get("tokens", 0)
+            for item in final_results
+        )
 
         logger.info(
             f"[RETRIEVAL_SUMMARY] "
@@ -267,7 +473,9 @@ async def retrieve_context(query_text: str, top_k_raw=TOP_K_RAW, top_k_final=TOP
             f"Missing DB rows: {missing_db_rows} | "
             f"Best distance: {best_distance if best_distance is not None else 'n/a'} | "
             f"Max distance: {max_distance} | "
-            f"Memory tokens injected: {total_mem_tokens}"
+            f"Memory tokens injected: {total_mem_tokens} | "
+            f"Planner rerank: {rerank_status} | "
+            f"Planner error: {rerank_error}"
         )
 
         if rejected_preview:
