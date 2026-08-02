@@ -394,5 +394,400 @@ class PromptCacheContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(system_prompts[0], system_prompts[1])
 
 
+class HistoricalToolProtocolRouteTests(
+    unittest.IsolatedAsyncioTestCase
+):
+    @staticmethod
+    def _historical_messages():
+        return [
+            {
+                "role": "user",
+                "content": "Historical tool request.",
+            },
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_old",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": (
+                                '{"path":"/tmp/private",'
+                                '"padding":"'
+                                + ("A" * 600)
+                                + '"}'
+                            ),
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_old",
+                "content": (
+                    "PRIVATE-HISTORICAL-RESULT-"
+                    + ("B" * 900)
+                ),
+            },
+            {
+                "role": "assistant",
+                "content": "Historical final answer.",
+            },
+            {
+                "role": "user",
+                "content": "Current request.",
+            },
+        ]
+
+    def test_tool_compaction_is_disabled_by_default(
+        self,
+    ):
+        messages = self._historical_messages()
+
+        with patch.dict(
+            os.environ,
+            {},
+            clear=False,
+        ):
+            os.environ.pop(
+                (
+                    "KVEN2_HISTORICAL_TOOL_"
+                    "PROTOCOL_COMPACTION_ENABLED"
+                ),
+                None,
+            )
+
+            with patch.object(
+                routes,
+                (
+                    "build_historical_tool_protocol_"
+                    "compaction_preview"
+                ),
+            ) as compactor:
+                result = (
+                    routes
+                    ._maybe_compact_historical_tool_protocol(
+                        messages,
+                        route_label="main",
+                    )
+                )
+
+        self.assertIs(result, messages)
+        compactor.assert_not_called()
+
+    def test_enabled_helper_is_content_free_and_non_mutating(
+        self,
+    ):
+        messages = self._historical_messages()
+        original = copy.deepcopy(messages)
+
+        with patch.dict(
+            os.environ,
+            {
+                (
+                    "KVEN2_HISTORICAL_TOOL_"
+                    "PROTOCOL_COMPACTION_ENABLED"
+                ): "1",
+                (
+                    "KVEN2_CONTEXT_WINDOW_"
+                    "TAIL_MESSAGES"
+                ): "2",
+            },
+            clear=False,
+        ):
+            with self.assertLogs(
+                routes.logger,
+                level="INFO",
+            ) as captured:
+                compacted = (
+                    routes
+                    ._maybe_compact_historical_tool_protocol(
+                        messages,
+                        route_label="main",
+                    )
+                )
+
+        self.assertEqual(messages, original)
+        self.assertNotEqual(compacted, original)
+
+        output = "\n".join(captured.output)
+
+        self.assertIn(
+            (
+                "[HISTORICAL_TOOL_PROTOCOL_"
+                "COMPACTION]"
+            ),
+            output,
+        )
+        self.assertIn(
+            '"route_label":"main"',
+            output,
+        )
+        self.assertIn(
+            '"compacted_groups":1',
+            output,
+        )
+        self.assertNotIn(
+            "PRIVATE-HISTORICAL-RESULT",
+            output,
+        )
+        self.assertNotIn(
+            '"/tmp/private"',
+            output,
+        )
+
+    def test_tool_compaction_failure_is_fail_open(
+        self,
+    ):
+        messages = self._historical_messages()
+
+        with patch.dict(
+            os.environ,
+            {
+                (
+                    "KVEN2_HISTORICAL_TOOL_"
+                    "PROTOCOL_COMPACTION_ENABLED"
+                ): "1",
+            },
+            clear=False,
+        ), patch.object(
+            routes,
+            (
+                "build_historical_tool_protocol_"
+                "compaction_preview"
+            ),
+            side_effect=RuntimeError(
+                "compaction failure"
+            ),
+        ):
+            with self.assertLogs(
+                routes.logger,
+                level="WARNING",
+            ) as captured:
+                result = (
+                    routes
+                    ._maybe_compact_historical_tool_protocol(
+                        messages,
+                        route_label="main",
+                    )
+                )
+
+        self.assertIs(result, messages)
+        self.assertIn(
+            (
+                "[HISTORICAL_TOOL_PROTOCOL_"
+                "COMPACTION] failed"
+            ),
+            "\n".join(captured.output),
+        )
+
+    async def test_enabled_tool_compaction_reaches_backend(
+        self,
+    ):
+        normal_backend = AsyncMock(
+            side_effect=AssertionError(
+                "normal backend path must not be used"
+            )
+        )
+        hybrid_backend = AsyncMock(
+            return_value=SimpleNamespace(
+                status_code=200,
+            )
+        )
+
+        request_payload = {
+            "model": "test-model",
+            "stream": False,
+            "messages": (
+                self._historical_messages()
+            ),
+        }
+        original_payload = copy.deepcopy(
+            request_payload
+        )
+
+        profile = {
+            "agent_name": "Kven II",
+            "agent_role": "Research assistant",
+            "project_history": (
+                "Stable test profile"
+            ),
+            "owner": "Test Owner",
+            "mission": (
+                "Test historical tool compaction"
+            ),
+        }
+
+        environment = {
+            (
+                "KVEN2_HISTORICAL_TOOL_"
+                "PROTOCOL_COMPACTION_ENABLED"
+            ): "1",
+            (
+                "KVEN2_CONTEXT_WINDOW_"
+                "TAIL_MESSAGES"
+            ): "2",
+            (
+                "KVEN2_HISTORICAL_MEDIA_"
+                "COMPACTION_ENABLED"
+            ): "0",
+            (
+                "KVEN2_CONTEXT_BUDGET_"
+                "REPORT_ENABLED"
+            ): "0",
+        }
+
+        with patch.dict(
+            os.environ,
+            environment,
+            clear=False,
+        ), patch.object(
+            routes,
+            "load_active_state",
+            AsyncMock(return_value={}),
+        ), patch.object(
+            routes,
+            "save_history_snapshot",
+            AsyncMock(),
+        ), patch.object(
+            routes,
+            "load_agent_profile",
+            Mock(return_value=profile),
+        ), patch.object(
+            routes,
+            "get_project_context",
+            AsyncMock(return_value=""),
+        ), patch.object(
+            routes,
+            "retrieve_context",
+            AsyncMock(return_value=[]),
+        ), patch.object(
+            routes,
+            "resolve_model_adapter",
+            Mock(
+                return_value=SimpleNamespace(
+                    adapter_id="test-adapter"
+                )
+            ),
+        ), patch.object(
+            routes,
+            "_resolve_main_chat_thinking",
+            AsyncMock(return_value=False),
+        ), patch.object(
+            routes,
+            "_forward_to_backend_and_collect",
+            normal_backend,
+        ), patch.object(
+            routes,
+            "_proxy_hybrid_native_openai_tool_protocol",
+            hybrid_backend,
+        ):
+            response = await routes.handle_chat(
+                FakeRequest(request_payload)
+            )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+        )
+        self.assertEqual(
+            request_payload,
+            original_payload,
+        )
+
+        normal_backend.assert_not_awaited()
+        hybrid_backend.assert_awaited_once()
+
+        native_payload = (
+            hybrid_backend.await_args.args[0]
+        )
+
+        self.assertIsInstance(
+            native_payload,
+            dict,
+        )
+
+        backend_messages = native_payload[
+            "messages"
+        ]
+
+        tool_call_messages = [
+            message
+            for message in backend_messages
+            if (
+                message.get("role") == "assistant"
+                and message.get("tool_calls")
+            )
+        ]
+        tool_result_messages = [
+            message
+            for message in backend_messages
+            if message.get("role") == "tool"
+        ]
+
+        self.assertEqual(
+            len(tool_call_messages),
+            1,
+        )
+        self.assertEqual(
+            len(tool_result_messages),
+            1,
+        )
+
+        tool_call = tool_call_messages[0][
+            "tool_calls"
+        ][0]
+
+        self.assertEqual(
+            tool_call["id"],
+            "call_old",
+        )
+        self.assertEqual(
+            tool_call["function"]["name"],
+            "read_file",
+        )
+        self.assertEqual(
+            tool_call["function"]["arguments"],
+            "{}",
+        )
+        self.assertEqual(
+            tool_result_messages[0][
+                "tool_call_id"
+            ],
+            "call_old",
+        )
+        self.assertEqual(
+            tool_result_messages[0]["content"],
+            (
+                "[Historical tool result omitted "
+                "from active context.]"
+            ),
+        )
+
+        encoded_messages = json.dumps(
+            backend_messages,
+            ensure_ascii=False,
+        )
+
+        self.assertNotIn(
+            "PRIVATE-HISTORICAL-RESULT",
+            encoded_messages,
+        )
+        self.assertNotIn(
+            '"/tmp/private"',
+            encoded_messages,
+        )
+        self.assertIn(
+            "Historical final answer.",
+            encoded_messages,
+        )
+        self.assertIn(
+            "Current request.",
+            encoded_messages,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

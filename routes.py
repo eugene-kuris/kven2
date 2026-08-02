@@ -28,6 +28,7 @@ from context_window import (
     build_context_budget_report,
     build_context_window_report,
     build_historical_media_compaction_preview,
+    build_historical_tool_protocol_compaction_preview,
 )
 from model_adapters import resolve_model_adapter
 from planner_router import (
@@ -1306,6 +1307,67 @@ def _maybe_compact_historical_media(
         logger.warning(
             "[HISTORICAL_MEDIA_COMPACTION] failed "
             "route_label=%s error=%s",
+            route_label,
+            exc,
+            exc_info=True,
+        )
+        return messages
+
+
+def _maybe_compact_historical_tool_protocol(
+    messages: list,
+    *,
+    route_label: str,
+) -> list:
+    """
+    Apply opt-in historical tool protocol compaction.
+
+    The feature is disabled by default. Any telemetry or
+    compaction failure preserves the original message list.
+    """
+    if not _env_bool(
+        "KVEN2_HISTORICAL_TOOL_PROTOCOL_COMPACTION_ENABLED",
+        False,
+    ):
+        return messages
+
+    try:
+        tail_messages = _env_int(
+            "KVEN2_CONTEXT_WINDOW_TAIL_MESSAGES",
+            12,
+            1,
+            200,
+        )
+
+        compacted_messages, meta = (
+            build_historical_tool_protocol_compaction_preview(
+                messages,
+                tail_messages=tail_messages,
+            )
+        )
+
+        log_meta = {
+            "route_label": str(
+                route_label or "unknown"
+            ),
+            **meta,
+        }
+
+        logger.info(
+            "[HISTORICAL_TOOL_PROTOCOL_COMPACTION] %s",
+            json.dumps(
+                log_meta,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+        )
+
+        return compacted_messages
+    except Exception as exc:
+        logger.warning(
+            "[HISTORICAL_TOOL_PROTOCOL_COMPACTION] "
+            "failed route_label=%s error=%s",
             route_label,
             exc,
             exc_info=True,
@@ -5053,6 +5115,12 @@ async def handle_chat(request: Request):
             enriched_messages = _maybe_compact_historical_media(
                 enriched_messages,
                 route_label=context_route_label,
+            )
+            enriched_messages = (
+                _maybe_compact_historical_tool_protocol(
+                    enriched_messages,
+                    route_label=context_route_label,
+                )
             )
 
         payload = {
