@@ -25,6 +25,7 @@ from kven2_profile import load_agent_profile
 from write_path import process_episodic, strip_reasoning
 from config import settings
 from context_window import (
+    build_context_budget_report,
     build_context_window_report,
     build_historical_media_compaction_preview,
 )
@@ -351,6 +352,87 @@ def _resolve_final_answer_token_budget(
     )
 
 
+def _maybe_log_context_budget_report(
+    messages: list,
+    *,
+    route_label: str,
+    reserved_completion_tokens: int,
+) -> None:
+    """
+    Log content-free prompt budget telemetry when explicitly enabled.
+
+    Telemetry failures must never alter or interrupt a user request.
+    """
+    if not _env_bool(
+        "KVEN2_CONTEXT_BUDGET_REPORT_ENABLED",
+        False,
+    ):
+        return
+
+    try:
+        tail_messages = _env_int(
+            "KVEN2_CONTEXT_WINDOW_TAIL_MESSAGES",
+            12,
+            1,
+            200,
+        )
+        context_tokens = _env_int(
+            "KVEN2_CONTEXT_BUDGET_TOKENS",
+            49152,
+            1024,
+            262144,
+        )
+        summary_target_tokens = _env_int(
+            "KVEN2_CONTEXT_BUDGET_SUMMARY_TARGET_TOKENS",
+            2048,
+            0,
+            131072,
+        )
+        chars_per_token = _env_float(
+            "KVEN2_CONTEXT_BUDGET_CHARS_PER_TOKEN",
+            4.0,
+            1.0,
+            16.0,
+        )
+
+        report = build_context_budget_report(
+            messages,
+            tail_messages=tail_messages,
+            context_tokens=context_tokens,
+            reserved_completion_tokens=(
+                reserved_completion_tokens
+            ),
+            summary_target_tokens=(
+                summary_target_tokens
+            ),
+            chars_per_token=chars_per_token,
+        )
+        report = {
+            "route_label": str(
+                route_label or "unknown"
+            ),
+            **report,
+        }
+
+        logger.info(
+            "[CONTEXT_BUDGET_REPORT] %s",
+            json.dumps(
+                report,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+        )
+    except Exception as exc:
+        logger.warning(
+            "[CONTEXT_BUDGET_REPORT] failed "
+            "route_label=%s error=%s",
+            route_label,
+            exc,
+            exc_info=True,
+        )
+
+
 def _apply_final_answer_safeguards(
     payload: dict,
     *,
@@ -468,6 +550,15 @@ def _apply_final_answer_safeguards(
     )
 
     safe["messages"] = _inject_final_answer_control(safe.get("messages", []))
+
+    _maybe_log_context_budget_report(
+        safe.get("messages", []),
+        route_label=route_label,
+        reserved_completion_tokens=safe.get(
+            "max_tokens",
+            default_tokens,
+        ),
+    )
 
     logger.info(
         "[FINAL_GUARD] payload_applied route_label=%s max_tokens=%s "

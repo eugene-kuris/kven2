@@ -551,5 +551,172 @@ class FinalAnswerRouteBudgetTests(
         )
 
 
+class ContextBudgetTelemetryTests(
+    unittest.TestCase
+):
+    @staticmethod
+    def _guard_payload():
+        return routes._apply_final_answer_safeguards(
+            {
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "SECRET-SYSTEM-CONTENT"
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            "SECRET-USER-CONTENT"
+                        ),
+                    },
+                ],
+                "max_tokens": 50000,
+            },
+            route_label="main_final",
+            enable_thinking=True,
+            min_tokens_override=8192,
+            max_tokens_cap=4096,
+        )
+
+    def test_budget_report_is_disabled_by_default(
+        self,
+    ):
+        with patch.dict(
+            os.environ,
+            {},
+            clear=False,
+        ):
+            for name in (
+                "KVEN2_CONTEXT_BUDGET_REPORT_ENABLED",
+                "KVEN2_CONTEXT_BUDGET_TOKENS",
+                "KVEN2_CONTEXT_BUDGET_SUMMARY_TARGET_TOKENS",
+                "KVEN2_CONTEXT_BUDGET_CHARS_PER_TOKEN",
+            ):
+                os.environ.pop(name, None)
+
+            with patch.object(
+                routes,
+                "build_context_budget_report",
+            ) as reporter:
+                guarded = self._guard_payload()
+
+        reporter.assert_not_called()
+        self.assertEqual(
+            guarded["max_tokens"],
+            4096,
+        )
+
+    def test_enabled_report_uses_final_budget_without_payload_changes(
+        self,
+    ):
+        environment = {
+            "KVEN2_CONTEXT_BUDGET_REPORT_ENABLED": "1",
+            "KVEN2_CONTEXT_WINDOW_TAIL_MESSAGES": "2",
+            "KVEN2_CONTEXT_BUDGET_TOKENS": "10000",
+            "KVEN2_CONTEXT_BUDGET_SUMMARY_TARGET_TOKENS": "300",
+            "KVEN2_CONTEXT_BUDGET_CHARS_PER_TOKEN": "4.0",
+        }
+
+        with patch.dict(
+            os.environ,
+            environment,
+            clear=False,
+        ):
+            with self.assertLogs(
+                routes.logger,
+                level="INFO",
+            ) as captured:
+                enabled_payload = (
+                    self._guard_payload()
+                )
+
+        with patch.dict(
+            os.environ,
+            {
+                "KVEN2_CONTEXT_BUDGET_REPORT_ENABLED": "0",
+            },
+            clear=False,
+        ):
+            disabled_payload = self._guard_payload()
+
+        self.assertEqual(
+            enabled_payload,
+            disabled_payload,
+        )
+        self.assertEqual(
+            enabled_payload["max_tokens"],
+            4096,
+        )
+
+        output = "\n".join(captured.output)
+
+        self.assertIn(
+            "[CONTEXT_BUDGET_REPORT]",
+            output,
+        )
+        self.assertIn(
+            '"route_label":"main_final"',
+            output,
+        )
+        self.assertIn(
+            '"budget_report_version":'
+            '"kven2-context-budget-v1"',
+            output,
+        )
+        self.assertIn(
+            '"reserved_completion_tokens":4096',
+            output,
+        )
+        self.assertIn(
+            '"context_token_budget":10000',
+            output,
+        )
+        self.assertIn(
+            '"configured_tail_messages":2',
+            output,
+        )
+        self.assertNotIn(
+            "SECRET-SYSTEM-CONTENT",
+            output,
+        )
+        self.assertNotIn(
+            "SECRET-USER-CONTENT",
+            output,
+        )
+
+    def test_budget_report_failure_does_not_break_guard(
+        self,
+    ):
+        with patch.dict(
+            os.environ,
+            {
+                "KVEN2_CONTEXT_BUDGET_REPORT_ENABLED": "1",
+            },
+            clear=False,
+        ), patch.object(
+            routes,
+            "build_context_budget_report",
+            side_effect=RuntimeError(
+                "telemetry failure"
+            ),
+        ):
+            with self.assertLogs(
+                routes.logger,
+                level="WARNING",
+            ) as captured:
+                guarded = self._guard_payload()
+
+        self.assertEqual(
+            guarded["max_tokens"],
+            4096,
+        )
+        self.assertIn(
+            "[CONTEXT_BUDGET_REPORT] failed",
+            "\n".join(captured.output),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
