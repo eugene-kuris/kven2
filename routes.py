@@ -303,7 +303,9 @@ def _apply_final_answer_safeguards(
     """Apply the final-answer budget, sampling, and explicit thinking policy."""
     safe = dict(payload or {})
 
-    configured_min_tokens = _env_int(
+    # Keep the historical environment and argument names for compatibility,
+    # but treat the value as a default capacity, not as a forced minimum.
+    configured_default_tokens = _env_int(
         "KVEN2_FINAL_MIN_TOKENS",
         4096,
         256,
@@ -311,48 +313,66 @@ def _apply_final_answer_safeguards(
     )
 
     if min_tokens_override is None:
-        min_tokens = configured_min_tokens
+        default_tokens = configured_default_tokens
     else:
         try:
-            min_tokens = int(min_tokens_override)
+            default_tokens = int(min_tokens_override)
         except Exception:
-            min_tokens = configured_min_tokens
-        min_tokens = max(1, min(min_tokens, 131072))
+            default_tokens = configured_default_tokens
+        default_tokens = max(
+            1,
+            min(default_tokens, 131072),
+        )
 
     requested_value = safe.get("max_tokens")
     if requested_value is None:
-        requested_value = safe.get("max_completion_tokens")
-
-    try:
-        requested_max_tokens = (
-            int(requested_value)
-            if requested_value is not None
-            else min_tokens
+        requested_value = safe.get(
+            "max_completion_tokens"
         )
-    except Exception:
-        requested_max_tokens = min_tokens
 
-    resolved_max_tokens = max(min_tokens, requested_max_tokens)
+    if requested_value is None:
+        resolved_max_tokens = default_tokens
+        budget_source = "default_missing"
+    else:
+        try:
+            requested_max_tokens = (
+                0
+                if isinstance(requested_value, bool)
+                else int(requested_value)
+            )
+        except Exception:
+            requested_max_tokens = 0
+
+        if requested_max_tokens > 0:
+            resolved_max_tokens = requested_max_tokens
+            budget_source = "client"
+        else:
+            resolved_max_tokens = default_tokens
+            budget_source = "default_invalid"
+
     resolved_max_tokens_cap = None
 
     if max_tokens_cap is not None:
         try:
-            resolved_max_tokens_cap = int(max_tokens_cap)
+            candidate_cap = int(max_tokens_cap)
         except Exception:
-            resolved_max_tokens_cap = None
+            candidate_cap = 0
 
-        if resolved_max_tokens_cap is not None:
-            resolved_max_tokens_cap = max(
-                min_tokens,
-                resolved_max_tokens_cap,
-            )
+        if candidate_cap > 0:
+            resolved_max_tokens_cap = candidate_cap
+            tokens_before_cap = resolved_max_tokens
             resolved_max_tokens = min(
                 resolved_max_tokens,
                 resolved_max_tokens_cap,
             )
 
-    # Normal routes preserve larger client budgets. Explicit fallback routes
-    # may supply a cap so a routing failure cannot start an unbounded answer.
+            if resolved_max_tokens < tokens_before_cap:
+                budget_source = (
+                    f"{budget_source}_capped"
+                )
+
+    # Explicit positive client limits are preserved. A route-specific cap may
+    # only reduce a budget; it must never raise a small client request.
     safe["max_tokens"] = resolved_max_tokens
     safe.pop("max_completion_tokens", None)
 
@@ -386,12 +406,14 @@ def _apply_final_answer_safeguards(
     safe["messages"] = _inject_final_answer_control(safe.get("messages", []))
 
     logger.info(
-        "[FINAL_GUARD] payload_applied route_label=%s max_tokens=%s min_tokens=%s "
-        "max_tokens_cap=%s temperature=%s top_p=%s top_k=%s repeat_penalty=%s "
+        "[FINAL_GUARD] payload_applied route_label=%s max_tokens=%s "
+        "default_tokens=%s budget_source=%s max_tokens_cap=%s "
+        "temperature=%s top_p=%s top_k=%s repeat_penalty=%s "
         "repeat_last_n=%s thinking=%s reasoning_format=%s",
         route_label,
         safe.get("max_tokens"),
-        min_tokens,
+        default_tokens,
+        budget_source,
         resolved_max_tokens_cap,
         safe.get("temperature"),
         safe.get("top_p"),
