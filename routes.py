@@ -599,6 +599,24 @@ def _summarize_main_backend_usage(usage) -> dict:
         if value is not None:
             summary[target] = value
 
+    if "cached_tokens" not in summary:
+        prompt_details = usage.get(
+            "prompt_tokens_details"
+        )
+
+        if isinstance(prompt_details, dict):
+            cached_tokens = prompt_details.get(
+                "cached_tokens"
+            )
+
+            if (
+                cached_tokens is not None
+                and not isinstance(cached_tokens, bool)
+            ):
+                summary["cached_tokens"] = (
+                    cached_tokens
+                )
+
     if "total_tokens" not in summary:
         input_tokens = summary.get("input_tokens")
         output_tokens = summary.get("output_tokens")
@@ -3360,8 +3378,27 @@ def _stream_main_chat_response(
         gate_released_at = None
         backend_status = None
         backend_usage = {}
+        backend_timings = {}
         telemetry_outcome = "completed"
         telemetry_logged = False
+
+        client_stream_options = payload.get(
+            "stream_options"
+        )
+
+        backend_payload = dict(payload)
+        backend_stream_options = (
+            dict(client_stream_options)
+            if isinstance(
+                client_stream_options,
+                dict,
+            )
+            else {}
+        )
+        backend_stream_options["include_usage"] = True
+        backend_payload["stream_options"] = (
+            backend_stream_options
+        )
 
         def elapsed_ms(mark) -> float | None:
             if mark is None:
@@ -3386,12 +3423,33 @@ def _stream_main_chat_response(
                 if backend_usage
                 else completion_base.get("usage")
             )
-            usage_summary = _summarize_main_backend_usage(
-                usage
+            timings = (
+                backend_timings
+                if backend_timings
+                else completion_base.get("timings")
+            )
+
+            combined_metrics = {}
+
+            if isinstance(timings, dict):
+                combined_metrics.update(timings)
+
+            if isinstance(usage, dict):
+                combined_metrics.update(usage)
+
+            usage_summary = (
+                _summarize_main_backend_usage(
+                    combined_metrics
+                )
             )
             usage_keys = (
                 sorted(str(key) for key in usage)
                 if isinstance(usage, dict)
+                else []
+            )
+            timings_keys = (
+                sorted(str(key) for key in timings)
+                if isinstance(timings, dict)
                 else []
             )
 
@@ -3423,7 +3481,8 @@ def _stream_main_chat_response(
                 "cached_tokens=%s output_tokens=%s "
                 "total_tokens=%s prompt_ms=%s "
                 "generation_ms=%s prompt_tps=%s "
-                "generation_tps=%s usage_keys=%s",
+                "generation_tps=%s usage_keys=%s "
+                "timings_keys=%s",
                 outcome,
                 stream_phase,
                 completion_gate is not None,
@@ -3469,6 +3528,10 @@ def _stream_main_chat_response(
                     usage_keys,
                     limit=400,
                 ),
+                _json_preview(
+                    timings_keys,
+                    limit=400,
+                ),
             )
 
         try:
@@ -3478,7 +3541,7 @@ def _stream_main_chat_response(
                 async with client.stream(
                     "POST",
                     chat_url,
-                    json=payload,
+                    json=backend_payload,
                 ) as response:
                     backend_status = response.status_code
                     backend_headers_at = time.monotonic()
@@ -3527,6 +3590,16 @@ def _stream_main_chat_response(
 
                             if isinstance(obj_usage, dict):
                                 backend_usage = dict(obj_usage)
+
+                            obj_timings = obj.get("timings")
+
+                            if isinstance(
+                                obj_timings,
+                                dict,
+                            ):
+                                backend_timings = dict(
+                                    obj_timings
+                                )
 
                             completion_base = obj
                             choice0 = (
@@ -3877,6 +3950,18 @@ def _stream_main_chat_response(
                         ):
                             backend_usage = dict(
                                 response_usage
+                            )
+
+                        response_timings = (
+                            response_json.get("timings")
+                        )
+
+                        if isinstance(
+                            response_timings,
+                            dict,
+                        ):
+                            backend_timings = dict(
+                                response_timings
                             )
 
                         completion_base = response_json

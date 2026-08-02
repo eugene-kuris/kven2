@@ -105,12 +105,20 @@ class _FakeStreamingResponse:
                     }
                 ],
                 "usage": {
-                    "prompt_n": 12,
+                    "prompt_tokens": 12,
+                    "completion_tokens": 3,
+                    "total_tokens": 15,
+                    "prompt_tokens_details": {
+                        "cached_tokens": 8
+                    },
+                },
+                "timings": {
                     "cache_n": 8,
-                    "predicted_n": 3,
+                    "prompt_n": 12,
                     "prompt_ms": 20.5,
-                    "predicted_ms": 10.0,
                     "prompt_per_second": 585.4,
+                    "predicted_n": 3,
+                    "predicted_ms": 10.0,
                     "predicted_per_second": 300.0,
                 },
             }
@@ -120,6 +128,8 @@ class _FakeStreamingResponse:
 
 
 class _FakeAsyncClient:
+    last_json = None
+
     def __init__(
         self,
         *args,
@@ -143,6 +153,9 @@ class _FakeAsyncClient:
         *args,
         **kwargs,
     ):
+        type(self).last_json = kwargs.get(
+            "json"
+        )
         return _FakeStreamingResponse()
 
 
@@ -227,6 +240,9 @@ class MainBackendTelemetryTests(
                 },
             ],
             "stream": True,
+            "stream_options": {
+                "include_usage": True,
+            },
             "max_tokens": 128,
             "chat_template_kwargs": {
                 "enable_thinking": False,
@@ -279,11 +295,11 @@ class MainBackendTelemetryTests(
         )
 
         self.assertIn(
-            '"prompt_n": 12',
+            '"prompt_tokens": 12',
             output,
         )
         self.assertIn(
-            '"cache_n": 8',
+            '"cached_tokens": 8',
             output,
         )
         self.assertIn(
@@ -311,8 +327,29 @@ class MainBackendTelemetryTests(
             logs,
         )
         self.assertIn(
+            "prompt_ms=20.5",
+            logs,
+        )
+        self.assertIn(
+            "generation_ms=10.0",
+            logs,
+        )
+        self.assertIn(
+            "prompt_tps=585.4",
+            logs,
+        )
+        self.assertIn(
+            "generation_tps=300.0",
+            logs,
+        )
+        self.assertIn(
             "max_tokens=128",
             logs,
+        )
+        self.assertTrue(
+            _FakeAsyncClient.last_json[
+                "stream_options"
+            ]["include_usage"]
         )
         self.assertNotIn(
             "<think>",
@@ -333,6 +370,106 @@ class MainBackendTelemetryTests(
         self.assertRegex(
             logs,
             r"stream_total_ms=\d",
+        )
+
+    async def test_internal_usage_is_exposed_without_client_opt_in(
+        self,
+    ):
+        payload = {
+            "model": "test-model",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "test",
+                },
+            ],
+            "stream": True,
+            "max_tokens": 64,
+            "chat_template_kwargs": {
+                "enable_thinking": False,
+            },
+        }
+
+        with patch.object(
+            routes.httpx,
+            "AsyncClient",
+            _FakeAsyncClient,
+        ):
+            with self.assertLogs(
+                routes.logger,
+                level="INFO",
+            ) as captured:
+                response = (
+                    routes
+                    ._stream_main_chat_response(
+                        payload,
+                        (
+                            "http://backend.invalid/"
+                            "v1/chat/completions"
+                        ),
+                        write_path_messages=(
+                            payload["messages"]
+                        ),
+                        active_state={},
+                        skip_write_path=True,
+                    )
+                )
+
+                chunks = []
+
+                async for chunk in (
+                    response.body_iterator
+                ):
+                    if isinstance(chunk, bytes):
+                        chunk = chunk.decode(
+                            "utf-8"
+                        )
+
+                    chunks.append(chunk)
+
+        output = "".join(chunks)
+        logs = "\n".join(captured.output)
+
+        self.assertTrue(
+            _FakeAsyncClient.last_json[
+                "stream_options"
+            ]["include_usage"]
+        )
+        self.assertIn(
+            '"usage"',
+            output,
+        )
+        self.assertIn(
+            '"prompt_tokens": 12',
+            output,
+        )
+        self.assertIn(
+            '"completion_tokens": 3',
+            output,
+        )
+        self.assertIn(
+            '"total_tokens": 15',
+            output,
+        )
+        self.assertNotIn(
+            '"timings"',
+            output,
+        )
+        self.assertIn(
+            "input_tokens=12",
+            logs,
+        )
+        self.assertIn(
+            "cached_tokens=8",
+            logs,
+        )
+        self.assertIn(
+            "prompt_ms=20.5",
+            logs,
+        )
+        self.assertIn(
+            "generation_ms=10.0",
+            logs,
         )
 
 
