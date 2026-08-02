@@ -36,6 +36,9 @@ from text_summary_checkpoint_store import (
     load_text_summary_checkpoints,
     mark_text_summary_checkpoint_used,
 )
+from text_summary_checkpoint_manager import (
+    maybe_generate_text_summary_checkpoint,
+)
 from model_adapters import resolve_model_adapter
 from planner_router import (
     classify_main_thinking as planner_classify_main_thinking,
@@ -84,7 +87,8 @@ logger.addFilter(_RequestIdLogFilter())
 
 router = APIRouter()
 BASE_BACKEND = settings.LLM_BACKEND_URL
-ROUTES_TOOLS_PROBE_VERSION = "text-summary-checkpoint-reuse-2026-08-02-v13"
+ROUTES_TOOLS_PROBE_VERSION = "text-summary-checkpoint-generation-2026-08-02-v14"
+
 
 
 # -----------------------------------------------------------------------------
@@ -5295,6 +5299,10 @@ async def handle_chat(request: Request):
                 else "main"
             )
             _maybe_log_context_window_report(
+                enriched_messages,
+                route_label=context_route_label,
+            )
+            await maybe_generate_text_summary_checkpoint(
                 enriched_messages,
                 route_label=context_route_label,
             )
