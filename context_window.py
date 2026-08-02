@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 from collections import Counter
 from typing import Any
@@ -970,6 +971,337 @@ def build_context_budget_report(
     )
 
     return result
+
+
+TEXT_SUMMARY_CHECKPOINT_VERSION = (
+    "kven2-text-summary-checkpoint-v1"
+)
+
+TEXT_SUMMARY_CHECKPOINT_HASH_SCOPE = (
+    "conversation-prefix-after-leading-system-v1"
+)
+
+
+_SHA256_HEX_DIGITS = frozenset("0123456789abcdef")
+
+
+def _canonical_json_sha256(value: Any) -> str:
+    """Return SHA-256 for deterministic compact UTF-8 JSON."""
+
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _is_sha256_hex(value: Any) -> bool:
+    """Return whether value is a lowercase SHA-256 hex digest."""
+
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and set(value) <= _SHA256_HEX_DIGITS
+    )
+
+
+def build_text_summary_checkpoint(
+    messages: list,
+    *,
+    summary_text: str,
+    summarized_prefix_end: int,
+) -> dict:
+    """Build a deterministic checkpoint for one exact chat prefix.
+
+    ``summarized_prefix_end`` is an absolute, exclusive message index in the
+    supplied request. Leading system messages are excluded from the identity
+    because OpenWebUI can regenerate that runtime prefix between otherwise
+    identical requests.
+    """
+
+    if not isinstance(messages, list):
+        raise ValueError("messages must be a list")
+
+    if (
+        not isinstance(summarized_prefix_end, int)
+        or isinstance(summarized_prefix_end, bool)
+    ):
+        raise ValueError(
+            "summarized_prefix_end must be an integer"
+        )
+
+    system_prefix_messages = (
+        _leading_system_message_count(messages)
+    )
+
+    if summarized_prefix_end <= system_prefix_messages:
+        raise ValueError(
+            "summarized prefix must contain at least one "
+            "non-system message"
+        )
+
+    if summarized_prefix_end > len(messages):
+        raise ValueError(
+            "summarized_prefix_end exceeds message count"
+        )
+
+    if not isinstance(summary_text, str):
+        raise ValueError("summary_text must be a string")
+
+    normalized_summary = summary_text.strip()
+
+    if not normalized_summary:
+        raise ValueError("summary_text must not be empty")
+
+    summarized_messages = messages[
+        system_prefix_messages:summarized_prefix_end
+    ]
+    summarized_message_count = len(
+        summarized_messages
+    )
+    prefix_sha256 = _canonical_json_sha256(
+        summarized_messages
+    )
+    summary_sha256 = hashlib.sha256(
+        normalized_summary.encode("utf-8")
+    ).hexdigest()
+
+    checkpoint_identity = {
+        "checkpoint_version": (
+            TEXT_SUMMARY_CHECKPOINT_VERSION
+        ),
+        "hash_scope": (
+            TEXT_SUMMARY_CHECKPOINT_HASH_SCOPE
+        ),
+        "summarized_message_count": (
+            summarized_message_count
+        ),
+        "prefix_sha256": prefix_sha256,
+        "summary_sha256": summary_sha256,
+    }
+
+    return {
+        **checkpoint_identity,
+        "checkpoint_id": _canonical_json_sha256(
+            checkpoint_identity
+        ),
+        "summary_text": normalized_summary,
+        "summary_chars": len(normalized_summary),
+    }
+
+
+def find_matching_text_summary_checkpoint(
+    messages: list,
+    checkpoints: list,
+) -> tuple[dict | None, dict]:
+    """Return the longest valid checkpoint matching the current prefix.
+
+    Invalid, corrupt, edited, branched-before-boundary, or overlong
+    checkpoints are ignored. A branch after the summarized boundary remains a
+    valid continuation of that checkpoint.
+    """
+
+    source_messages = (
+        messages
+        if isinstance(messages, list)
+        else []
+    )
+    source_checkpoints = (
+        checkpoints
+        if isinstance(checkpoints, list)
+        else []
+    )
+    system_prefix_messages = (
+        _leading_system_message_count(source_messages)
+    )
+    conversation_messages = source_messages[
+        system_prefix_messages:
+    ]
+
+    report = {
+        "checkpoint_version": (
+            TEXT_SUMMARY_CHECKPOINT_VERSION
+        ),
+        "hash_scope": (
+            TEXT_SUMMARY_CHECKPOINT_HASH_SCOPE
+        ),
+        "candidate_checkpoints": len(
+            source_checkpoints
+        ),
+        "valid_checkpoints": 0,
+        "invalid_checkpoints": 0,
+        "insufficient_history_checkpoints": 0,
+        "prefix_hash_mismatches": 0,
+        "prefix_hash_errors": 0,
+        "matching_checkpoints": 0,
+        "selected": False,
+        "selected_checkpoint_index": None,
+        "selected_summarized_message_count": 0,
+        "selected_summary_chars": 0,
+    }
+
+    selected_checkpoint = None
+    selected_index = None
+    selected_message_count = -1
+
+    for index, checkpoint in enumerate(
+        source_checkpoints
+    ):
+        if not isinstance(checkpoint, dict):
+            report["invalid_checkpoints"] += 1
+            continue
+
+        checkpoint_version = checkpoint.get(
+            "checkpoint_version"
+        )
+        hash_scope = checkpoint.get("hash_scope")
+        summarized_message_count = checkpoint.get(
+            "summarized_message_count"
+        )
+        prefix_sha256 = checkpoint.get(
+            "prefix_sha256"
+        )
+        summary_text = checkpoint.get(
+            "summary_text"
+        )
+        summary_chars = checkpoint.get(
+            "summary_chars"
+        )
+        summary_sha256 = checkpoint.get(
+            "summary_sha256"
+        )
+        checkpoint_id = checkpoint.get(
+            "checkpoint_id"
+        )
+
+        structurally_valid = (
+            checkpoint_version
+            == TEXT_SUMMARY_CHECKPOINT_VERSION
+            and hash_scope
+            == TEXT_SUMMARY_CHECKPOINT_HASH_SCOPE
+            and isinstance(
+                summarized_message_count,
+                int,
+            )
+            and not isinstance(
+                summarized_message_count,
+                bool,
+            )
+            and summarized_message_count > 0
+            and _is_sha256_hex(prefix_sha256)
+            and isinstance(summary_text, str)
+            and bool(summary_text)
+            and summary_text == summary_text.strip()
+            and isinstance(summary_chars, int)
+            and not isinstance(summary_chars, bool)
+            and summary_chars == len(summary_text)
+            and _is_sha256_hex(summary_sha256)
+            and summary_sha256
+            == hashlib.sha256(
+                summary_text.encode("utf-8")
+            ).hexdigest()
+            and _is_sha256_hex(checkpoint_id)
+        )
+
+        if structurally_valid:
+            checkpoint_identity = {
+                "checkpoint_version": (
+                    checkpoint_version
+                ),
+                "hash_scope": hash_scope,
+                "summarized_message_count": (
+                    summarized_message_count
+                ),
+                "prefix_sha256": prefix_sha256,
+                "summary_sha256": summary_sha256,
+            }
+            structurally_valid = (
+                checkpoint_id
+                == _canonical_json_sha256(
+                    checkpoint_identity
+                )
+            )
+
+        if not structurally_valid:
+            report["invalid_checkpoints"] += 1
+            continue
+
+        report["valid_checkpoints"] += 1
+
+        if (
+            summarized_message_count
+            > len(conversation_messages)
+        ):
+            report[
+                "insufficient_history_checkpoints"
+            ] += 1
+            continue
+
+        try:
+            current_prefix_sha256 = (
+                _canonical_json_sha256(
+                    conversation_messages[
+                        :summarized_message_count
+                    ]
+                )
+            )
+        except Exception:
+            report["prefix_hash_errors"] += 1
+            continue
+
+        if current_prefix_sha256 != prefix_sha256:
+            report["prefix_hash_mismatches"] += 1
+            continue
+
+        report["matching_checkpoints"] += 1
+
+        if (
+            summarized_message_count
+            > selected_message_count
+            or (
+                summarized_message_count
+                == selected_message_count
+                and (
+                    selected_index is None
+                    or index > selected_index
+                )
+            )
+        ):
+            try:
+                selected_checkpoint = copy.deepcopy(
+                    checkpoint
+                )
+            except Exception:
+                report["invalid_checkpoints"] += 1
+                report["valid_checkpoints"] -= 1
+                report["matching_checkpoints"] -= 1
+                continue
+
+            selected_index = index
+            selected_message_count = (
+                summarized_message_count
+            )
+
+    if selected_checkpoint is not None:
+        report.update(
+            {
+                "selected": True,
+                "selected_checkpoint_index": (
+                    selected_index
+                ),
+                "selected_summarized_message_count": (
+                    selected_message_count
+                ),
+                "selected_summary_chars": len(
+                    selected_checkpoint["summary_text"]
+                ),
+            }
+        )
+
+    return selected_checkpoint, report
 
 
 TEXT_SUMMARY_COMPACTION_VERSION = (

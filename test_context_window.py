@@ -729,6 +729,384 @@ class ContextBudgetReportTests(unittest.TestCase):
 
 
 
+class TextSummaryCheckpointTests(unittest.TestCase):
+    def test_checkpoint_matches_extended_history_and_ignores_system_prefix(
+        self,
+    ):
+        original_messages = [
+            {
+                "role": "system",
+                "content": "runtime system A",
+            },
+            {
+                "role": "user",
+                "content": "first question",
+            },
+            {
+                "role": "assistant",
+                "content": "first answer",
+            },
+        ]
+        checkpoint = (
+            context_window
+            .build_text_summary_checkpoint(
+                original_messages,
+                summary_text=(
+                    "The first exchange established "
+                    "a stable result."
+                ),
+                summarized_prefix_end=3,
+            )
+        )
+        current_messages = [
+            {
+                "role": "system",
+                "content": "runtime system B",
+            },
+            {
+                "role": "system",
+                "content": "additional runtime policy",
+            },
+            {
+                "role": "user",
+                "content": "first question",
+            },
+            {
+                "role": "assistant",
+                "content": "first answer",
+            },
+            {
+                "role": "user",
+                "content": "second question",
+            },
+        ]
+        original_current = copy.deepcopy(
+            current_messages
+        )
+        original_checkpoint = copy.deepcopy(
+            checkpoint
+        )
+
+        matched, report = (
+            context_window
+            .find_matching_text_summary_checkpoint(
+                current_messages,
+                [checkpoint],
+            )
+        )
+
+        self.assertEqual(
+            current_messages,
+            original_current,
+        )
+        self.assertEqual(
+            checkpoint,
+            original_checkpoint,
+        )
+        self.assertIsNotNone(matched)
+        self.assertEqual(
+            matched["checkpoint_id"],
+            checkpoint["checkpoint_id"],
+        )
+        self.assertTrue(report["selected"])
+        self.assertEqual(
+            report["matching_checkpoints"],
+            1,
+        )
+        self.assertEqual(
+            report[
+                "selected_summarized_message_count"
+            ],
+            2,
+        )
+
+    def test_edit_before_boundary_invalidates_checkpoint(
+        self,
+    ):
+        messages = [
+            {
+                "role": "system",
+                "content": "system",
+            },
+            {
+                "role": "user",
+                "content": "original question",
+            },
+            {
+                "role": "assistant",
+                "content": "original answer",
+            },
+        ]
+        checkpoint = (
+            context_window
+            .build_text_summary_checkpoint(
+                messages,
+                summary_text="Original exchange.",
+                summarized_prefix_end=3,
+            )
+        )
+        edited_messages = copy.deepcopy(messages)
+        edited_messages[1]["content"] = (
+            "edited question"
+        )
+
+        matched, report = (
+            context_window
+            .find_matching_text_summary_checkpoint(
+                edited_messages,
+                [checkpoint],
+            )
+        )
+
+        self.assertIsNone(matched)
+        self.assertFalse(report["selected"])
+        self.assertEqual(
+            report["prefix_hash_mismatches"],
+            1,
+        )
+
+    def test_branch_after_boundary_keeps_checkpoint_valid(
+        self,
+    ):
+        messages = [
+            {
+                "role": "system",
+                "content": "system",
+            },
+            {
+                "role": "user",
+                "content": "question one",
+            },
+            {
+                "role": "assistant",
+                "content": "answer one",
+            },
+        ]
+        checkpoint = (
+            context_window
+            .build_text_summary_checkpoint(
+                messages,
+                summary_text="First exchange.",
+                summarized_prefix_end=3,
+            )
+        )
+        branched_messages = [
+            *messages,
+            {
+                "role": "user",
+                "content": "different continuation",
+            },
+        ]
+
+        matched, report = (
+            context_window
+            .find_matching_text_summary_checkpoint(
+                branched_messages,
+                [checkpoint],
+            )
+        )
+
+        self.assertIsNotNone(matched)
+        self.assertTrue(report["selected"])
+        self.assertEqual(
+            report["matching_checkpoints"],
+            1,
+        )
+
+    def test_longest_matching_checkpoint_wins_and_latest_breaks_tie(
+        self,
+    ):
+        messages = [
+            {
+                "role": "system",
+                "content": "system",
+            },
+            {
+                "role": "user",
+                "content": "question one",
+            },
+            {
+                "role": "assistant",
+                "content": "answer one",
+            },
+            {
+                "role": "user",
+                "content": "question two",
+            },
+            {
+                "role": "assistant",
+                "content": "answer two",
+            },
+            {
+                "role": "user",
+                "content": "question three",
+            },
+        ]
+        short_checkpoint = (
+            context_window
+            .build_text_summary_checkpoint(
+                messages,
+                summary_text="Short summary.",
+                summarized_prefix_end=3,
+            )
+        )
+        first_long_checkpoint = (
+            context_window
+            .build_text_summary_checkpoint(
+                messages,
+                summary_text="First long summary.",
+                summarized_prefix_end=5,
+            )
+        )
+        second_long_checkpoint = (
+            context_window
+            .build_text_summary_checkpoint(
+                messages,
+                summary_text="Second long summary.",
+                summarized_prefix_end=5,
+            )
+        )
+
+        matched, report = (
+            context_window
+            .find_matching_text_summary_checkpoint(
+                messages,
+                [
+                    first_long_checkpoint,
+                    short_checkpoint,
+                    second_long_checkpoint,
+                ],
+            )
+        )
+
+        self.assertIsNotNone(matched)
+        self.assertEqual(
+            matched["summary_text"],
+            "Second long summary.",
+        )
+        self.assertEqual(
+            report["matching_checkpoints"],
+            3,
+        )
+        self.assertEqual(
+            report[
+                "selected_summarized_message_count"
+            ],
+            4,
+        )
+        self.assertEqual(
+            report["selected_checkpoint_index"],
+            2,
+        )
+
+    def test_corrupt_and_insufficient_checkpoints_fail_closed(
+        self,
+    ):
+        long_messages = [
+            {
+                "role": "system",
+                "content": "system",
+            },
+            {
+                "role": "user",
+                "content": "question one",
+            },
+            {
+                "role": "assistant",
+                "content": "answer one",
+            },
+            {
+                "role": "user",
+                "content": "question two",
+            },
+            {
+                "role": "assistant",
+                "content": "answer two",
+            },
+        ]
+        insufficient_checkpoint = (
+            context_window
+            .build_text_summary_checkpoint(
+                long_messages,
+                summary_text="Long history.",
+                summarized_prefix_end=5,
+            )
+        )
+        corrupt_checkpoint = copy.deepcopy(
+            context_window
+            .build_text_summary_checkpoint(
+                long_messages[:3],
+                summary_text="Short history.",
+                summarized_prefix_end=3,
+            )
+        )
+        corrupt_checkpoint["checkpoint_id"] = (
+            "0" * 64
+        )
+
+        matched, report = (
+            context_window
+            .find_matching_text_summary_checkpoint(
+                long_messages[:3],
+                [
+                    None,
+                    corrupt_checkpoint,
+                    insufficient_checkpoint,
+                ],
+            )
+        )
+
+        self.assertIsNone(matched)
+        self.assertFalse(report["selected"])
+        self.assertEqual(
+            report["candidate_checkpoints"],
+            3,
+        )
+        self.assertEqual(
+            report["invalid_checkpoints"],
+            2,
+        )
+        self.assertEqual(
+            report[
+                "insufficient_history_checkpoints"
+            ],
+            1,
+        )
+
+    def test_builder_rejects_invalid_inputs(self):
+        messages = [
+            {
+                "role": "system",
+                "content": "system",
+            },
+            {
+                "role": "user",
+                "content": "question",
+            },
+        ]
+
+        with self.assertRaises(ValueError):
+            context_window.build_text_summary_checkpoint(
+                messages,
+                summary_text="summary",
+                summarized_prefix_end=1,
+            )
+
+        with self.assertRaises(ValueError):
+            context_window.build_text_summary_checkpoint(
+                messages,
+                summary_text="   ",
+                summarized_prefix_end=2,
+            )
+
+        with self.assertRaises(ValueError):
+            context_window.build_text_summary_checkpoint(
+                messages,
+                summary_text="summary",
+                summarized_prefix_end=True,
+            )
+
+
 class TextSummaryCompactionPreviewTests(
     unittest.TestCase
 ):
