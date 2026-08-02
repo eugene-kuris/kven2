@@ -970,3 +970,328 @@ def build_context_budget_report(
     )
 
     return result
+
+HISTORICAL_TOOL_PROTOCOL_COMPACTION_VERSION = (
+    "kven2-historical-tool-protocol-compaction-v1"
+)
+
+HISTORICAL_TOOL_RESULT_PLACEHOLDER = (
+    "[Historical tool result omitted from active context.]"
+)
+
+
+def build_historical_tool_protocol_compaction_preview(
+    messages: list,
+    *,
+    tail_messages: int = 12,
+) -> tuple[list, dict]:
+    """
+    Compact completed historical tool exchanges without mutating input.
+
+    Only tool protocols already classified as historical by the
+    context-window report are eligible. Active tool continuation and
+    the protected verbatim tail are never rediscovered or modified.
+
+    Tool call IDs and function names are preserved. Historical
+    arguments are replaced with an empty JSON object and historical
+    tool results with a bounded placeholder. A group is changed only
+    when the serialized representation becomes smaller.
+    """
+    import copy
+    import json
+
+    source_messages = (
+        messages
+        if isinstance(messages, list)
+        else []
+    )
+    compacted_messages = copy.deepcopy(
+        source_messages
+    )
+
+    report = build_context_window_report(
+        source_messages,
+        tail_messages=tail_messages,
+    )
+
+    def json_chars(value) -> int:
+        return len(
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
+
+    raw_indices = report.get(
+        "older_tool_protocol_indices",
+        [],
+    )
+
+    candidate_indices = sorted(
+        {
+            int(index)
+            for index in raw_indices
+            if (
+                isinstance(index, int)
+                and not isinstance(index, bool)
+                and 0 <= index < len(source_messages)
+            )
+        }
+    )
+
+    validated_groups = []
+    invalid_candidate_indices = []
+    position = 0
+
+    while position < len(candidate_indices):
+        start_index = candidate_indices[position]
+        start_message = source_messages[start_index]
+
+        if not isinstance(start_message, dict):
+            invalid_candidate_indices.append(
+                start_index
+            )
+            position += 1
+            continue
+
+        if start_message.get("role") != "assistant":
+            invalid_candidate_indices.append(
+                start_index
+            )
+            position += 1
+            continue
+
+        tool_calls = start_message.get("tool_calls")
+
+        if not isinstance(tool_calls, list) or not tool_calls:
+            invalid_candidate_indices.append(
+                start_index
+            )
+            position += 1
+            continue
+
+        call_ids = []
+        calls_valid = True
+
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                calls_valid = False
+                break
+
+            call_id = str(
+                tool_call.get("id") or ""
+            ).strip()
+            function = tool_call.get("function")
+
+            if (
+                not call_id
+                or not isinstance(function, dict)
+                or not str(
+                    function.get("name") or ""
+                ).strip()
+                or call_id in call_ids
+            ):
+                calls_valid = False
+                break
+
+            call_ids.append(call_id)
+
+        if not calls_valid:
+            invalid_candidate_indices.append(
+                start_index
+            )
+            position += 1
+            continue
+
+        group_indices = [start_index]
+        result_ids = []
+        cursor = position + 1
+
+        while cursor < len(candidate_indices):
+            candidate_index = candidate_indices[
+                cursor
+            ]
+
+            if candidate_index != (
+                group_indices[-1] + 1
+            ):
+                break
+
+            candidate_message = source_messages[
+                candidate_index
+            ]
+
+            if (
+                not isinstance(candidate_message, dict)
+                or candidate_message.get("role")
+                != "tool"
+            ):
+                break
+
+            tool_call_id = str(
+                candidate_message.get(
+                    "tool_call_id"
+                )
+                or ""
+            ).strip()
+
+            # Collect every contiguous historical tool result first.
+            # Validate the complete group only after collection so an
+            # extra, duplicate, or unknown result cannot be orphaned.
+            group_indices.append(
+                candidate_index
+            )
+            result_ids.append(tool_call_id)
+            cursor += 1
+
+        if (
+            len(group_indices)
+            != 1 + len(call_ids)
+            or len(result_ids)
+            != len(set(result_ids))
+            or set(result_ids) != set(call_ids)
+        ):
+            invalid_candidate_indices.extend(
+                group_indices
+            )
+            position = max(
+                position + 1,
+                cursor,
+            )
+            continue
+
+        validated_groups.append(
+            {
+                "indices": group_indices,
+                "call_ids": call_ids,
+            }
+        )
+        position = cursor
+
+    compacted_indices = []
+    compacted_groups = 0
+    skipped_non_shrinking_groups = 0
+
+    for group in validated_groups:
+        indices = group["indices"]
+        assistant_index = indices[0]
+
+        original_group = [
+            source_messages[index]
+            for index in indices
+        ]
+        replacement_group = copy.deepcopy(
+            original_group
+        )
+
+        assistant_message = replacement_group[0]
+        sanitized_calls = []
+
+        for tool_call in assistant_message[
+            "tool_calls"
+        ]:
+            sanitized_call = copy.deepcopy(
+                tool_call
+            )
+            sanitized_function = copy.deepcopy(
+                sanitized_call["function"]
+            )
+            sanitized_function["arguments"] = "{}"
+            sanitized_call["function"] = (
+                sanitized_function
+            )
+            sanitized_calls.append(
+                sanitized_call
+            )
+
+        assistant_message["tool_calls"] = (
+            sanitized_calls
+        )
+
+        for tool_message in replacement_group[1:]:
+            tool_message["content"] = (
+                HISTORICAL_TOOL_RESULT_PLACEHOLDER
+            )
+
+        before_group_chars = json_chars(
+            original_group
+        )
+        after_group_chars = json_chars(
+            replacement_group
+        )
+
+        if after_group_chars >= before_group_chars:
+            skipped_non_shrinking_groups += 1
+            continue
+
+        for index, replacement in zip(
+            indices,
+            replacement_group,
+        ):
+            compacted_messages[index] = replacement
+            compacted_indices.append(index)
+
+        compacted_groups += 1
+
+    before_json_chars = json_chars(
+        source_messages
+    )
+    after_json_chars = json_chars(
+        compacted_messages
+    )
+
+    meta = {
+        "compaction_version": (
+            HISTORICAL_TOOL_PROTOCOL_COMPACTION_VERSION
+        ),
+        "policy": (
+            "sanitize_historical_tool_arguments_and_results"
+        ),
+        "configured_tail_messages": report.get(
+            "configured_tail_messages"
+        ),
+        "active_tool_continuation": report.get(
+            "active_tool_continuation",
+            False,
+        ),
+        "active_tool_continuation_start": report.get(
+            "active_tool_continuation_start"
+        ),
+        "verbatim_tail_start": report.get(
+            "verbatim_tail_start"
+        ),
+        "candidate_groups": report.get(
+            "older_tool_protocol_groups",
+            0,
+        ),
+        "candidate_messages": len(
+            candidate_indices
+        ),
+        "candidate_indices": candidate_indices,
+        "validated_candidate_groups": len(
+            validated_groups
+        ),
+        "invalid_candidate_indices": sorted(
+            set(invalid_candidate_indices)
+        ),
+        "compacted_groups": compacted_groups,
+        "compacted_messages": len(
+            compacted_indices
+        ),
+        "compacted_indices": sorted(
+            compacted_indices
+        ),
+        "skipped_non_shrinking_groups": (
+            skipped_non_shrinking_groups
+        ),
+        "before_json_chars": before_json_chars,
+        "after_json_chars": after_json_chars,
+        "saved_json_chars": max(
+            0,
+            before_json_chars - after_json_chars,
+        ),
+    }
+
+    return compacted_messages, meta

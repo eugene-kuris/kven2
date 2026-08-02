@@ -728,5 +728,580 @@ class ContextBudgetReportTests(unittest.TestCase):
         )
 
 
+class HistoricalToolProtocolCompactionTests(
+    unittest.TestCase
+):
+    @staticmethod
+    def _tool_call(
+        call_id,
+        *,
+        arguments,
+    ):
+        return {
+            "id": call_id,
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "arguments": arguments,
+            },
+        }
+
+    def test_completed_historical_tool_group_is_compacted(
+        self,
+    ):
+        import copy
+        import json
+
+        old_arguments = (
+            '{"path":"/tmp/private","padding":"'
+            + ("A" * 500)
+            + '"}'
+        )
+        old_result = (
+            "PRIVATE-HISTORICAL-RESULT-"
+            + ("B" * 700)
+        )
+
+        messages = [
+            {
+                "role": "system",
+                "content": "System policy.",
+            },
+            {
+                "role": "user",
+                "content": "Read the historical file.",
+            },
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    self._tool_call(
+                        "call_old",
+                        arguments=old_arguments,
+                    )
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_old",
+                "content": old_result,
+            },
+            {
+                "role": "assistant",
+                "content": (
+                    "Historical final answer."
+                ),
+            },
+            {
+                "role": "user",
+                "content": "Current question.",
+            },
+        ]
+        original = copy.deepcopy(messages)
+
+        compacted, meta = (
+            context_window
+            .build_historical_tool_protocol_compaction_preview(
+                messages,
+                tail_messages=2,
+            )
+        )
+
+        self.assertEqual(messages, original)
+        self.assertNotEqual(compacted, original)
+
+        self.assertEqual(
+            compacted[2]["tool_calls"][0]["id"],
+            "call_old",
+        )
+        self.assertEqual(
+            compacted[2]["tool_calls"][0][
+                "function"
+            ]["name"],
+            "read_file",
+        )
+        self.assertEqual(
+            compacted[2]["tool_calls"][0][
+                "function"
+            ]["arguments"],
+            "{}",
+        )
+        self.assertEqual(
+            compacted[3]["tool_call_id"],
+            "call_old",
+        )
+        self.assertEqual(
+            compacted[3]["content"],
+            context_window
+            .HISTORICAL_TOOL_RESULT_PLACEHOLDER,
+        )
+
+        self.assertEqual(
+            compacted[4],
+            original[4],
+        )
+        self.assertEqual(
+            compacted[5],
+            original[5],
+        )
+
+        encoded = json.dumps(
+            compacted,
+            ensure_ascii=False,
+        )
+
+        self.assertNotIn(
+            "PRIVATE-HISTORICAL-RESULT",
+            encoded,
+        )
+        self.assertNotIn(
+            '"padding"',
+            encoded,
+        )
+
+        self.assertEqual(
+            meta["candidate_groups"],
+            1,
+        )
+        self.assertEqual(
+            meta["validated_candidate_groups"],
+            1,
+        )
+        self.assertEqual(
+            meta["compacted_groups"],
+            1,
+        )
+        self.assertEqual(
+            meta["compacted_indices"],
+            [2, 3],
+        )
+        self.assertGreater(
+            meta["saved_json_chars"],
+            0,
+        )
+
+    def test_active_current_tool_group_is_preserved(
+        self,
+    ):
+        import copy
+
+        active_result = (
+            "PRIVATE-ACTIVE-RESULT-"
+            + ("C" * 700)
+        )
+
+        messages = [
+            {
+                "role": "system",
+                "content": "System policy.",
+            },
+            {
+                "role": "user",
+                "content": "Old question.",
+            },
+            {
+                "role": "assistant",
+                "content": "Old answer.",
+            },
+            {
+                "role": "user",
+                "content": "Read current file.",
+            },
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    self._tool_call(
+                        "call_current",
+                        arguments=(
+                            '{"path":"/tmp/current"}'
+                        ),
+                    )
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_current",
+                "content": active_result,
+            },
+        ]
+        original = copy.deepcopy(messages)
+
+        compacted, meta = (
+            context_window
+            .build_historical_tool_protocol_compaction_preview(
+                messages,
+                tail_messages=2,
+            )
+        )
+
+        self.assertEqual(messages, original)
+        self.assertEqual(compacted, original)
+        self.assertTrue(
+            meta["active_tool_continuation"]
+        )
+        self.assertEqual(
+            meta["active_tool_continuation_start"],
+            4,
+        )
+        self.assertEqual(
+            meta["candidate_groups"],
+            0,
+        )
+        self.assertEqual(
+            meta["compacted_groups"],
+            0,
+        )
+        self.assertEqual(
+            meta["saved_json_chars"],
+            0,
+        )
+
+    def test_mixed_history_compacts_only_old_group(
+        self,
+    ):
+        import copy
+        import json
+
+        old_result = (
+            "PRIVATE-OLD-RESULT-"
+            + ("D" * 700)
+        )
+        current_result = (
+            "PRIVATE-CURRENT-RESULT-"
+            + ("E" * 700)
+        )
+
+        messages = [
+            {
+                "role": "system",
+                "content": "System policy.",
+            },
+            {
+                "role": "user",
+                "content": "Old tool request.",
+            },
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    self._tool_call(
+                        "call_old",
+                        arguments=(
+                            '{"data":"'
+                            + ("F" * 500)
+                            + '"}'
+                        ),
+                    )
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_old",
+                "content": old_result,
+            },
+            {
+                "role": "assistant",
+                "content": "Old final answer.",
+            },
+            {
+                "role": "user",
+                "content": "Current tool request.",
+            },
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    self._tool_call(
+                        "call_current",
+                        arguments=(
+                            '{"path":"/tmp/current"}'
+                        ),
+                    )
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_current",
+                "content": current_result,
+            },
+        ]
+        original = copy.deepcopy(messages)
+
+        compacted, meta = (
+            context_window
+            .build_historical_tool_protocol_compaction_preview(
+                messages,
+                tail_messages=2,
+            )
+        )
+
+        self.assertEqual(messages, original)
+        self.assertEqual(
+            compacted[2]["tool_calls"][0][
+                "function"
+            ]["arguments"],
+            "{}",
+        )
+        self.assertEqual(
+            compacted[3]["content"],
+            context_window
+            .HISTORICAL_TOOL_RESULT_PLACEHOLDER,
+        )
+
+        self.assertEqual(
+            compacted[6],
+            original[6],
+        )
+        self.assertEqual(
+            compacted[7],
+            original[7],
+        )
+
+        encoded = json.dumps(
+            compacted,
+            ensure_ascii=False,
+        )
+
+        self.assertNotIn(
+            "PRIVATE-OLD-RESULT",
+            encoded,
+        )
+        self.assertIn(
+            "PRIVATE-CURRENT-RESULT",
+            encoded,
+        )
+
+        self.assertEqual(
+            meta["compacted_indices"],
+            [2, 3],
+        )
+        self.assertTrue(
+            meta["active_tool_continuation"]
+        )
+        self.assertEqual(
+            meta["active_tool_continuation_start"],
+            6,
+        )
+
+    def test_short_group_is_not_expanded(
+        self,
+    ):
+        import copy
+
+        messages = [
+            {
+                "role": "system",
+                "content": "System.",
+            },
+            {
+                "role": "user",
+                "content": "Old request.",
+            },
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    self._tool_call(
+                        "call_short",
+                        arguments="{}",
+                    )
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_short",
+                "content": "OK",
+            },
+            {
+                "role": "assistant",
+                "content": "Old answer.",
+            },
+            {
+                "role": "user",
+                "content": "Current request.",
+            },
+        ]
+        original = copy.deepcopy(messages)
+
+        compacted, meta = (
+            context_window
+            .build_historical_tool_protocol_compaction_preview(
+                messages,
+                tail_messages=2,
+            )
+        )
+
+        self.assertEqual(messages, original)
+        self.assertEqual(compacted, original)
+        self.assertEqual(
+            meta["compacted_groups"],
+            0,
+        )
+        self.assertEqual(
+            meta["skipped_non_shrinking_groups"],
+            1,
+        )
+        self.assertEqual(
+            meta["saved_json_chars"],
+            0,
+        )
+
+    def test_duplicate_tool_result_fails_closed(
+        self,
+    ):
+        import copy
+        from unittest.mock import patch
+
+        messages = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    self._tool_call(
+                        "call_duplicate",
+                        arguments=(
+                            '{"secret":"'
+                            + ("X" * 500)
+                            + '"}'
+                        ),
+                    )
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_duplicate",
+                "content": (
+                    "FIRST-PRIVATE-RESULT-"
+                    + ("Y" * 700)
+                ),
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_duplicate",
+                "content": (
+                    "SECOND-PRIVATE-RESULT-"
+                    + ("Z" * 700)
+                ),
+            },
+        ]
+        original = copy.deepcopy(messages)
+
+        fake_report = {
+            "configured_tail_messages": 1,
+            "active_tool_continuation": False,
+            "active_tool_continuation_start": None,
+            "verbatim_tail_start": 3,
+            "older_tool_protocol_groups": 1,
+            "older_tool_protocol_indices": [
+                0,
+                1,
+                2,
+            ],
+        }
+
+        with patch.object(
+            context_window,
+            "build_context_window_report",
+            return_value=fake_report,
+        ):
+            compacted, meta = (
+                context_window
+                .build_historical_tool_protocol_compaction_preview(
+                    messages,
+                    tail_messages=1,
+                )
+            )
+
+        self.assertEqual(messages, original)
+        self.assertEqual(compacted, original)
+        self.assertEqual(
+            meta["compacted_groups"],
+            0,
+        )
+        self.assertEqual(
+            meta["compacted_indices"],
+            [],
+        )
+        self.assertEqual(
+            meta["saved_json_chars"],
+            0,
+        )
+        self.assertEqual(
+            meta["invalid_candidate_indices"],
+            [0, 1, 2],
+        )
+
+    def test_metadata_is_content_free(
+        self,
+    ):
+        import json
+
+        secret = (
+            "PRIVATE-METADATA-SECRET-"
+            + ("G" * 700)
+        )
+
+        messages = [
+            {
+                "role": "system",
+                "content": "System.",
+            },
+            {
+                "role": "user",
+                "content": "Old request.",
+            },
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    self._tool_call(
+                        "call_secret",
+                        arguments=secret,
+                    )
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_secret",
+                "content": secret,
+            },
+            {
+                "role": "assistant",
+                "content": "Old answer.",
+            },
+            {
+                "role": "user",
+                "content": "Current request.",
+            },
+        ]
+
+        _, meta = (
+            context_window
+            .build_historical_tool_protocol_compaction_preview(
+                messages,
+                tail_messages=2,
+            )
+        )
+
+        encoded_meta = json.dumps(
+            meta,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+
+        self.assertNotIn(
+            "PRIVATE-METADATA-SECRET",
+            encoded_meta,
+        )
+        self.assertEqual(
+            meta["compaction_version"],
+            (
+                "kven2-historical-tool-"
+                "protocol-compaction-v1"
+            ),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
