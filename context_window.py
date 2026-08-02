@@ -1137,9 +1137,13 @@ def find_matching_text_summary_checkpoint(
         "prefix_hash_mismatches": 0,
         "prefix_hash_errors": 0,
         "matching_checkpoints": 0,
+        "system_prefix_messages": (
+            system_prefix_messages
+        ),
         "selected": False,
         "selected_checkpoint_index": None,
         "selected_summarized_message_count": 0,
+        "selected_summarized_prefix_end": None,
         "selected_summary_chars": 0,
     }
 
@@ -1295,6 +1299,10 @@ def find_matching_text_summary_checkpoint(
                 "selected_summarized_message_count": (
                     selected_message_count
                 ),
+                "selected_summarized_prefix_end": (
+                    system_prefix_messages
+                    + selected_message_count
+                ),
                 "selected_summary_chars": len(
                     selected_checkpoint["summary_text"]
                 ),
@@ -1319,13 +1327,16 @@ def build_text_summary_compaction_preview(
     *,
     summary_text: str,
     tail_messages: int = 12,
+    summarized_prefix_end: int | None = None,
 ) -> tuple[list, dict]:
     """
     Replace the historical prefix with one bounded summary message.
 
     Leading system messages remain unchanged. The recent tail, the complete
     current tool turn, and any completed tool protocol crossing the tail
-    boundary remain verbatim. The input is never mutated, and compaction is
+    boundary remain verbatim. When ``summarized_prefix_end`` is supplied, it
+    is an absolute exclusive message index and may only shorten the automatic
+    safe compaction boundary. The input is never mutated, and compaction is
     applied only when the serialized representation becomes smaller.
     """
     source_messages = (
@@ -1437,9 +1448,70 @@ def build_text_summary_compaction_preview(
                 changed = True
                 break
 
+    safe_summary_boundary_end = (
+        protected_tail_start
+    )
+    requested_summary_boundary_end = (
+        summarized_prefix_end
+    )
+    selected_summary_boundary_end = (
+        safe_summary_boundary_end
+    )
+    summary_boundary_reason = "automatic_safe_boundary"
+
+    if summarized_prefix_end is not None:
+        if (
+            isinstance(summarized_prefix_end, bool)
+            or not isinstance(
+                summarized_prefix_end,
+                int,
+            )
+        ):
+            selected_summary_boundary_end = None
+            summary_boundary_reason = (
+                "invalid_summary_boundary"
+            )
+        elif (
+            summarized_prefix_end
+            <= system_prefix_messages
+        ):
+            selected_summary_boundary_end = None
+            summary_boundary_reason = (
+                "summary_boundary_before_history"
+            )
+        elif summarized_prefix_end > len(
+            source_messages
+        ):
+            selected_summary_boundary_end = None
+            summary_boundary_reason = (
+                "summary_boundary_out_of_range"
+            )
+        elif (
+            summarized_prefix_end
+            > safe_summary_boundary_end
+        ):
+            selected_summary_boundary_end = None
+            summary_boundary_reason = (
+                "summary_boundary_crosses_protected_tail"
+            )
+        else:
+            selected_summary_boundary_end = (
+                summarized_prefix_end
+            )
+            summary_boundary_reason = (
+                "explicit_safe_boundary"
+            )
+
     older_candidate_messages = max(
         0,
-        protected_tail_start
+        (
+            selected_summary_boundary_end
+            if isinstance(
+                selected_summary_boundary_end,
+                int,
+            )
+            else system_prefix_messages
+        )
         - system_prefix_messages,
     )
 
@@ -1473,11 +1545,23 @@ def build_text_summary_compaction_preview(
         "protected_tail_start": (
             protected_tail_start
         ),
+        "safe_summary_boundary_end": (
+            safe_summary_boundary_end
+        ),
+        "requested_summarized_prefix_end": (
+            requested_summary_boundary_end
+        ),
+        "selected_summarized_prefix_end": (
+            selected_summary_boundary_end
+        ),
+        "summary_boundary_reason": (
+            summary_boundary_reason
+        ),
         "older_candidate_start": (
             system_prefix_messages
         ),
         "older_candidate_end": (
-            protected_tail_start
+            selected_summary_boundary_end
         ),
         "older_candidate_messages": (
             older_candidate_messages
@@ -1485,7 +1569,14 @@ def build_text_summary_compaction_preview(
         "verbatim_tail_messages": max(
             0,
             len(source_messages)
-            - protected_tail_start,
+            - (
+                selected_summary_boundary_end
+                if isinstance(
+                    selected_summary_boundary_end,
+                    int,
+                )
+                else len(source_messages)
+            ),
         ),
         "active_tool_continuation": bool(
             window_report.get(
@@ -1519,6 +1610,10 @@ def build_text_summary_compaction_preview(
         "reason": "not_evaluated",
     }
 
+    if selected_summary_boundary_end is None:
+        report["reason"] = summary_boundary_reason
+        return unchanged_messages, report
+
     if older_candidate_messages <= 0:
         report["reason"] = "no_older_candidate"
         return unchanged_messages, report
@@ -1548,7 +1643,7 @@ def build_text_summary_compaction_preview(
         summary_message,
         *copy.deepcopy(
             source_messages[
-                protected_tail_start:
+                selected_summary_boundary_end:
             ]
         ),
     ]

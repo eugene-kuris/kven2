@@ -819,6 +819,16 @@ class TextSummaryCheckpointTests(unittest.TestCase):
             ],
             2,
         )
+        self.assertEqual(
+            report["system_prefix_messages"],
+            2,
+        )
+        self.assertEqual(
+            report[
+                "selected_summarized_prefix_end"
+            ],
+            4,
+        )
 
     def test_edit_before_boundary_invalidates_checkpoint(
         self,
@@ -1359,6 +1369,204 @@ class TextSummaryCompactionPreviewTests(
             len(report["crossing_tool_groups"]),
             1,
         )
+
+    def test_explicit_checkpoint_boundary_preserves_unsummarized_middle(
+        self,
+    ):
+        messages = [
+            {
+                "role": "system",
+                "content": "system",
+            },
+            {
+                "role": "user",
+                "content": "old " + ("A" * 400),
+            },
+            {
+                "role": "assistant",
+                "content": "old " + ("B" * 400),
+            },
+            {
+                "role": "user",
+                "content": "unsummarized middle question",
+            },
+            {
+                "role": "assistant",
+                "content": "unsummarized middle answer",
+            },
+            {
+                "role": "user",
+                "content": "current question",
+            },
+            {
+                "role": "assistant",
+                "content": "current answer",
+            },
+        ]
+
+        compacted, report = (
+            context_window
+            .build_text_summary_compaction_preview(
+                messages,
+                summary_text="First exchange summary.",
+                tail_messages=2,
+                summarized_prefix_end=3,
+            )
+        )
+
+        self.assertTrue(
+            report["compaction_applied"]
+        )
+        self.assertEqual(
+            report["safe_summary_boundary_end"],
+            5,
+        )
+        self.assertEqual(
+            report[
+                "requested_summarized_prefix_end"
+            ],
+            3,
+        )
+        self.assertEqual(
+            report[
+                "selected_summarized_prefix_end"
+            ],
+            3,
+        )
+        self.assertEqual(
+            report["summary_boundary_reason"],
+            "explicit_safe_boundary",
+        )
+        self.assertEqual(
+            compacted[2:],
+            messages[3:],
+        )
+        self.assertEqual(
+            report["older_candidate_messages"],
+            2,
+        )
+        self.assertEqual(
+            report["verbatim_tail_messages"],
+            4,
+        )
+
+    def test_explicit_boundary_cannot_cross_protected_tail(
+        self,
+    ):
+        current_turn = [
+            {
+                "role": "user",
+                "content": "current tool request",
+            },
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_active",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": "{}",
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_active",
+                "content": "active result",
+            },
+        ]
+        messages = [
+            {
+                "role": "system",
+                "content": "system",
+            },
+            {
+                "role": "user",
+                "content": "old " + ("A" * 400),
+            },
+            {
+                "role": "assistant",
+                "content": "old " + ("B" * 400),
+            },
+            *current_turn,
+        ]
+        original = copy.deepcopy(messages)
+
+        compacted, report = (
+            context_window
+            .build_text_summary_compaction_preview(
+                messages,
+                summary_text="Unsafe summary.",
+                tail_messages=1,
+                summarized_prefix_end=4,
+            )
+        )
+
+        self.assertEqual(compacted, original)
+        self.assertFalse(
+            report["compaction_applied"]
+        )
+        self.assertEqual(
+            report["protected_tail_start"],
+            3,
+        )
+        self.assertEqual(
+            report["reason"],
+            "summary_boundary_crosses_protected_tail",
+        )
+
+    def test_invalid_explicit_boundaries_fail_closed(
+        self,
+    ):
+        messages = [
+            {
+                "role": "system",
+                "content": "system",
+            },
+            {
+                "role": "user",
+                "content": "old " + ("A" * 300),
+            },
+            {
+                "role": "assistant",
+                "content": "old " + ("B" * 300),
+            },
+            {
+                "role": "user",
+                "content": "current question",
+            },
+        ]
+        original = copy.deepcopy(messages)
+
+        cases = [
+            (True, "invalid_summary_boundary"),
+            (1, "summary_boundary_before_history"),
+            (99, "summary_boundary_out_of_range"),
+        ]
+
+        for boundary, expected_reason in cases:
+            with self.subTest(boundary=boundary):
+                compacted, report = (
+                    context_window
+                    .build_text_summary_compaction_preview(
+                        messages,
+                        summary_text="Summary.",
+                        tail_messages=1,
+                        summarized_prefix_end=boundary,
+                    )
+                )
+
+                self.assertEqual(compacted, original)
+                self.assertFalse(
+                    report["compaction_applied"]
+                )
+                self.assertEqual(
+                    report["reason"],
+                    expected_reason,
+                )
 
     def test_empty_or_oversized_summary_fails_closed(
         self,
