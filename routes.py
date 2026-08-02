@@ -2,6 +2,7 @@
 import json
 import os
 import re
+import time
 import httpx
 import logging
 import asyncio
@@ -524,6 +525,93 @@ def _json_preview(value, limit: int = 800) -> str:
     return text
 
 
+
+
+def _first_present_metric(source: dict, names: tuple[str, ...]):
+    """Return the first non-null metric from backend aliases."""
+    if not isinstance(source, dict):
+        return None
+
+    for name in names:
+        value = source.get(name)
+
+        if value is not None and not isinstance(value, bool):
+            return value
+
+    return None
+
+
+def _summarize_main_backend_usage(usage) -> dict:
+    """Normalize content-free OpenAI and llama.cpp usage metrics."""
+    if not isinstance(usage, dict):
+        return {}
+
+    aliases = (
+        (
+            "input_tokens",
+            ("input_tokens", "prompt_tokens", "prompt_n"),
+        ),
+        (
+            "cached_tokens",
+            ("cached_tokens", "cache_n"),
+        ),
+        (
+            "output_tokens",
+            (
+                "output_tokens",
+                "completion_tokens",
+                "predicted_n",
+            ),
+        ),
+        (
+            "total_tokens",
+            ("total_tokens",),
+        ),
+        (
+            "prompt_ms",
+            ("prompt_ms",),
+        ),
+        (
+            "generation_ms",
+            ("generation_ms", "predicted_ms"),
+        ),
+        (
+            "prompt_tokens_per_second",
+            (
+                "prompt_tokens_per_second",
+                "prompt_per_second",
+            ),
+        ),
+        (
+            "generation_tokens_per_second",
+            (
+                "generation_tokens_per_second",
+                "predicted_per_second",
+            ),
+        ),
+    )
+
+    summary = {}
+
+    for target, names in aliases:
+        value = _first_present_metric(usage, names)
+
+        if value is not None:
+            summary[target] = value
+
+    if "total_tokens" not in summary:
+        input_tokens = summary.get("input_tokens")
+        output_tokens = summary.get("output_tokens")
+
+        if (
+            isinstance(input_tokens, (int, float))
+            and isinstance(output_tokens, (int, float))
+        ):
+            summary["total_tokens"] = (
+                input_tokens + output_tokens
+            )
+
+    return summary
 
 def _apply_generation_passthrough(body: dict, payload: dict) -> list[str]:
     """Copy safe generation controls from incoming OpenAI-style request."""
@@ -3261,6 +3349,128 @@ def _stream_main_chat_response(
             2000,
         )
 
+        telemetry_started_at = time.monotonic()
+        backend_headers_at = None
+        first_backend_event_at = None
+        first_backend_output_at = None
+        first_reasoning_at = None
+        first_answer_at = None
+        backend_finished_at = None
+        gate_wait_started_at = None
+        gate_released_at = None
+        backend_status = None
+        backend_usage = {}
+        telemetry_outcome = "completed"
+        telemetry_logged = False
+
+        def elapsed_ms(mark) -> float | None:
+            if mark is None:
+                return None
+
+            return round(
+                (mark - telemetry_started_at) * 1000.0,
+                1,
+            )
+
+        def log_main_backend_telemetry(outcome: str) -> None:
+            nonlocal telemetry_logged
+
+            if telemetry_logged:
+                return
+
+            telemetry_logged = True
+            now = time.monotonic()
+
+            usage = (
+                backend_usage
+                if backend_usage
+                else completion_base.get("usage")
+            )
+            usage_summary = _summarize_main_backend_usage(
+                usage
+            )
+            usage_keys = (
+                sorted(str(key) for key in usage)
+                if isinstance(usage, dict)
+                else []
+            )
+
+            backend_end = backend_finished_at or now
+            gate_wait_ms = None
+
+            if gate_wait_started_at is not None:
+                gate_end = gate_released_at or now
+                gate_wait_ms = round(
+                    (
+                        gate_end
+                        - gate_wait_started_at
+                    )
+                    * 1000.0,
+                    1,
+                )
+
+            logger.info(
+                "[MAIN_BACKEND_TELEMETRY] "
+                "outcome=%s phase=%s speculative=%s "
+                "thinking=%s status=%s messages=%s "
+                "max_tokens=%s headers_ms=%s "
+                "first_event_ms=%s "
+                "first_backend_output_ms=%s "
+                "first_reasoning_ms=%s "
+                "first_answer_ms=%s "
+                "backend_ms=%s gate_wait_ms=%s "
+                "stream_total_ms=%s input_tokens=%s "
+                "cached_tokens=%s output_tokens=%s "
+                "total_tokens=%s prompt_ms=%s "
+                "generation_ms=%s prompt_tps=%s "
+                "generation_tps=%s usage_keys=%s",
+                outcome,
+                stream_phase,
+                completion_gate is not None,
+                thinking_enabled,
+                backend_status,
+                len(payload.get("messages") or []),
+                payload.get("max_tokens"),
+                elapsed_ms(backend_headers_at),
+                elapsed_ms(first_backend_event_at),
+                elapsed_ms(first_backend_output_at),
+                elapsed_ms(first_reasoning_at),
+                elapsed_ms(first_answer_at),
+                round(
+                    (
+                        backend_end
+                        - telemetry_started_at
+                    )
+                    * 1000.0,
+                    1,
+                ),
+                gate_wait_ms,
+                round(
+                    (
+                        now
+                        - telemetry_started_at
+                    )
+                    * 1000.0,
+                    1,
+                ),
+                usage_summary.get("input_tokens"),
+                usage_summary.get("cached_tokens"),
+                usage_summary.get("output_tokens"),
+                usage_summary.get("total_tokens"),
+                usage_summary.get("prompt_ms"),
+                usage_summary.get("generation_ms"),
+                usage_summary.get(
+                    "prompt_tokens_per_second"
+                ),
+                usage_summary.get(
+                    "generation_tokens_per_second"
+                ),
+                _json_preview(
+                    usage_keys,
+                    limit=400,
+                ),
+            )
+
         try:
             async with httpx.AsyncClient(
                 timeout=timeout_seconds
@@ -3270,6 +3480,8 @@ def _stream_main_chat_response(
                     chat_url,
                     json=payload,
                 ) as response:
+                    backend_status = response.status_code
+                    backend_headers_at = time.monotonic()
                     content_type = response.headers.get(
                         "content-type",
                         "",
@@ -3306,6 +3518,16 @@ def _stream_main_chat_response(
                                 )
                                 continue
 
+                            event_at = time.monotonic()
+
+                            if first_backend_event_at is None:
+                                first_backend_event_at = event_at
+
+                            obj_usage = obj.get("usage")
+
+                            if isinstance(obj_usage, dict):
+                                backend_usage = dict(obj_usage)
+
                             completion_base = obj
                             choice0 = (
                                 obj.get("choices") or [{}]
@@ -3316,6 +3538,31 @@ def _stream_main_chat_response(
                                 "reasoning_content"
                             )
                             content_piece = delta.get("content")
+
+                            if (
+                                first_backend_output_at is None
+                                and (
+                                    (
+                                        isinstance(
+                                            reasoning_piece,
+                                            str,
+                                        )
+                                        and bool(
+                                            reasoning_piece
+                                        )
+                                    )
+                                    or (
+                                        isinstance(
+                                            content_piece,
+                                            str,
+                                        )
+                                        and bool(
+                                            content_piece
+                                        )
+                                    )
+                                )
+                            ):
+                                first_backend_output_at = event_at
 
                             if (
                                 continuation_mode
@@ -3343,6 +3590,9 @@ def _stream_main_chat_response(
                                 isinstance(reasoning_piece, str)
                                 and reasoning_piece
                             ):
+                                if first_reasoning_at is None:
+                                    first_reasoning_at = event_at
+
                                 reasoning_text += reasoning_piece
 
                                 if (
@@ -3559,6 +3809,9 @@ def _stream_main_chat_response(
                                         emit_piece = ""
 
                                 if emit_piece:
+                                    if first_answer_at is None:
+                                        first_answer_at = event_at
+
                                     content_streamed = True
 
                                     safe_obj = dict(obj)
@@ -3609,6 +3862,23 @@ def _stream_main_chat_response(
                         response_json = json.loads(
                             await response.aread()
                         )
+                        event_at = time.monotonic()
+
+                        if first_backend_event_at is None:
+                            first_backend_event_at = event_at
+
+                        response_usage = response_json.get(
+                            "usage"
+                        )
+
+                        if isinstance(
+                            response_usage,
+                            dict,
+                        ):
+                            backend_usage = dict(
+                                response_usage
+                            )
+
                         completion_base = response_json
 
                         choice0 = (
@@ -3625,6 +3895,22 @@ def _stream_main_chat_response(
                             )
                             or ""
                         )
+                        raw_content = str(
+                            message.get("content")
+                            or ""
+                        )
+
+                        if (
+                            first_backend_output_at is None
+                            and (reasoning or raw_content)
+                        ):
+                            first_backend_output_at = event_at
+
+                        if (
+                            reasoning
+                            and first_reasoning_at is None
+                        ):
+                            first_reasoning_at = event_at
 
                         if reasoning:
                             reasoning_event = {
@@ -3673,14 +3959,17 @@ def _stream_main_chat_response(
 
                         assistant_reply = (
                             content_normalizer.feed(
-                                str(
-                                    message.get("content")
-                                    or ""
-                                )
+                                raw_content
                             )
                             + content_normalizer.finish()
                         )
                         content_normalizer_finished = True
+
+                        if (
+                            assistant_reply
+                            and first_answer_at is None
+                        ):
+                            first_answer_at = event_at
 
                         finish_reason = str(
                             choice0.get("finish_reason")
@@ -3708,7 +3997,10 @@ def _stream_main_chat_response(
                                 "blocked=True"
                             )
 
+                    backend_finished_at = time.monotonic()
+
         except asyncio.CancelledError:
+            log_main_backend_telemetry("cancelled")
             logger.info(
                 "[LIVE_STREAM] client_disconnected "
                 "backend_stream_cancelled=True"
@@ -3716,6 +4008,8 @@ def _stream_main_chat_response(
             raise
 
         except Exception as exc:
+            backend_finished_at = time.monotonic()
+            telemetry_outcome = "stream_exception"
             logger.error(
                 "[LIVE_STREAM] stream_failed error=%s",
                 exc,
@@ -3738,6 +4032,12 @@ def _stream_main_chat_response(
             content_normalizer_finished = True
 
             if normalized_tail:
+                if first_answer_at is None:
+                    first_answer_at = (
+                        backend_finished_at
+                        or time.monotonic()
+                    )
+
                 assistant_reply += normalized_tail
 
         client_reply = assistant_reply
@@ -3899,13 +4199,21 @@ def _stream_main_chat_response(
                 "[LIVE_STREAM] completion_gate_waiting=True"
             )
 
+            gate_wait_started_at = time.monotonic()
+
             try:
                 await completion_gate.wait()
             except asyncio.CancelledError:
+                log_main_backend_telemetry(
+                    "cancelled_gate"
+                )
                 logger.info(
-                    "[LIVE_STREAM] completion_gate_cancelled=True"
+                    "[LIVE_STREAM] "
+                    "completion_gate_cancelled=True"
                 )
                 raise
+
+            gate_released_at = time.monotonic()
 
             logger.info(
                 "[LIVE_STREAM] completion_gate_released=True"
@@ -3931,6 +4239,10 @@ def _stream_main_chat_response(
                 "detected": True,
                 "reason": "empty_final_content",
             }
+
+        log_main_backend_telemetry(
+            telemetry_outcome
+        )
 
         logger.info(
             "[LIVE_STREAM] completed "
