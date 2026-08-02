@@ -29,6 +29,12 @@ from context_window import (
     build_context_window_report,
     build_historical_media_compaction_preview,
     build_historical_tool_protocol_compaction_preview,
+    build_text_summary_compaction_preview,
+    find_matching_text_summary_checkpoint,
+)
+from text_summary_checkpoint_store import (
+    load_text_summary_checkpoints,
+    mark_text_summary_checkpoint_used,
 )
 from model_adapters import resolve_model_adapter
 from planner_router import (
@@ -78,7 +84,7 @@ logger.addFilter(_RequestIdLogFilter())
 
 router = APIRouter()
 BASE_BACKEND = settings.LLM_BACKEND_URL
-ROUTES_TOOLS_PROBE_VERSION = "planner-tool-routing-2026-07-30-v12"
+ROUTES_TOOLS_PROBE_VERSION = "text-summary-checkpoint-reuse-2026-08-02-v13"
 
 
 # -----------------------------------------------------------------------------
@@ -1264,6 +1270,186 @@ def _maybe_log_context_window_report(
             exc,
             exc_info=True,
         )
+
+
+async def _maybe_apply_text_summary_checkpoint(
+    messages: list,
+    *,
+    route_label: str,
+) -> list:
+    """Apply the longest safe stored summary checkpoint when enabled.
+
+    The feature is disabled by default. Database, validation, telemetry, and
+    compaction failures preserve the original messages.
+    """
+
+    if not _env_bool(
+        "KVEN2_TEXT_SUMMARY_COMPACTION_ENABLED",
+        False,
+    ):
+        return messages
+
+    try:
+        tail_messages = _env_int(
+            "KVEN2_CONTEXT_WINDOW_TAIL_MESSAGES",
+            12,
+            1,
+            200,
+        )
+        load_limit = _env_int(
+            "KVEN2_TEXT_SUMMARY_CHECKPOINT_LOAD_LIMIT",
+            64,
+            1,
+            4096,
+        )
+
+        _, boundary_report = (
+            build_text_summary_compaction_preview(
+                messages,
+                summary_text="",
+                tail_messages=tail_messages,
+            )
+        )
+        system_prefix_messages = int(
+            boundary_report.get(
+                "system_prefix_messages",
+                0,
+            )
+            or 0
+        )
+        safe_summary_boundary_end = int(
+            boundary_report.get(
+                "safe_summary_boundary_end",
+                system_prefix_messages,
+            )
+            or system_prefix_messages
+        )
+        max_summarized_message_count = max(
+            0,
+            safe_summary_boundary_end
+            - system_prefix_messages,
+        )
+
+        if max_summarized_message_count < 1:
+            logger.info(
+                "[TEXT_SUMMARY_COMPACTION] "
+                "route_label=%s status=no_safe_history",
+                route_label,
+            )
+            return messages
+
+        checkpoints = await load_text_summary_checkpoints(
+            max_summarized_message_count=(
+                max_summarized_message_count
+            ),
+            limit=load_limit,
+        )
+        checkpoint, match_report = (
+            find_matching_text_summary_checkpoint(
+                messages,
+                checkpoints,
+            )
+        )
+
+        if checkpoint is None:
+            logger.info(
+                "[TEXT_SUMMARY_COMPACTION] %s",
+                json.dumps(
+                    {
+                        "route_label": str(
+                            route_label or "unknown"
+                        ),
+                        "status": "no_matching_checkpoint",
+                        **match_report,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+            )
+            return messages
+
+        summarized_prefix_end = match_report.get(
+            "selected_summarized_prefix_end"
+        )
+        compacted_messages, compaction_report = (
+            build_text_summary_compaction_preview(
+                messages,
+                summary_text=checkpoint["summary_text"],
+                tail_messages=tail_messages,
+                summarized_prefix_end=(
+                    summarized_prefix_end
+                ),
+            )
+        )
+
+        logger.info(
+            "[TEXT_SUMMARY_COMPACTION] %s",
+            json.dumps(
+                {
+                    "route_label": str(
+                        route_label or "unknown"
+                    ),
+                    "status": (
+                        "applied"
+                        if compaction_report.get(
+                            "compaction_applied"
+                        )
+                        else "not_applied"
+                    ),
+                    "checkpoint_match": match_report,
+                    "compaction": compaction_report,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+        )
+
+        if not compaction_report.get(
+            "compaction_applied"
+        ):
+            return messages
+
+        try:
+            marked_used = (
+                await mark_text_summary_checkpoint_used(
+                    checkpoint["checkpoint_id"]
+                )
+            )
+            if not marked_used:
+                logger.warning(
+                    "[TEXT_SUMMARY_COMPACTION] "
+                    "checkpoint_mark_used_failed "
+                    "route_label=%s",
+                    route_label,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "[TEXT_SUMMARY_COMPACTION] "
+                "checkpoint_mark_used_failed "
+                "route_label=%s error_type=%s error=%s",
+                route_label,
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
+
+        return compacted_messages
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "[TEXT_SUMMARY_COMPACTION] failed "
+            "route_label=%s error_type=%s error=%s",
+            route_label,
+            type(exc).__name__,
+            exc,
+            exc_info=True,
+        )
+        return messages
 
 
 def _maybe_compact_historical_media(
@@ -5111,6 +5297,12 @@ async def handle_chat(request: Request):
             _maybe_log_context_window_report(
                 enriched_messages,
                 route_label=context_route_label,
+            )
+            enriched_messages = (
+                await _maybe_apply_text_summary_checkpoint(
+                    enriched_messages,
+                    route_label=context_route_label,
+                )
             )
             enriched_messages = _maybe_compact_historical_media(
                 enriched_messages,
