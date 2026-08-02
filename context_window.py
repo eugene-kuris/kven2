@@ -727,3 +727,246 @@ def build_context_window_report(
         ),
         "configured_tail_messages": safe_tail_messages,
     }
+
+CONTEXT_BUDGET_REPORT_VERSION = (
+    "kven2-context-budget-v1"
+)
+
+
+def estimate_tokens_from_chars(
+    char_count: int,
+    *,
+    chars_per_token: float = 4.0,
+) -> int:
+    """
+    Return a deterministic conservative token estimate.
+
+    This estimator is intentionally tokenizer-independent.
+    It is suitable for dry-run budgeting and telemetry, not
+    exact backend token accounting.
+    """
+    import math
+
+    try:
+        safe_chars = max(0, int(char_count))
+    except (TypeError, ValueError):
+        safe_chars = 0
+
+    try:
+        safe_ratio = float(chars_per_token)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "chars_per_token must be a positive number"
+        ) from exc
+
+    if safe_ratio <= 0:
+        raise ValueError(
+            "chars_per_token must be greater than zero"
+        )
+
+    if safe_chars == 0:
+        return 0
+
+    return int(
+        math.ceil(safe_chars / safe_ratio)
+    )
+
+
+def build_context_budget_report(
+    messages: list,
+    *,
+    tail_messages: int = 12,
+    context_tokens: int = 49152,
+    reserved_completion_tokens: int = 8192,
+    summary_target_tokens: int = 2048,
+    chars_per_token: float = 4.0,
+) -> dict:
+    """
+    Build a deterministic content-free context budget report.
+
+    The supplied messages are never changed. The report
+    estimates whether the current prompt fits, how much old
+    history is available for compaction, and whether a bounded
+    summary could fit beside the protected prompt sections.
+    """
+    try:
+        safe_context_tokens = max(
+            1,
+            int(context_tokens),
+        )
+    except (TypeError, ValueError):
+        safe_context_tokens = 49152
+
+    try:
+        safe_completion_reserve = max(
+            0,
+            int(reserved_completion_tokens),
+        )
+    except (TypeError, ValueError):
+        safe_completion_reserve = 8192
+
+    safe_completion_reserve = min(
+        safe_completion_reserve,
+        max(0, safe_context_tokens - 1),
+    )
+
+    try:
+        safe_summary_target = max(
+            0,
+            int(summary_target_tokens),
+        )
+    except (TypeError, ValueError):
+        safe_summary_target = 2048
+
+    base_report = build_context_window_report(
+        messages,
+        tail_messages=tail_messages,
+    )
+
+    system_tokens = estimate_tokens_from_chars(
+        base_report.get(
+            "system_prefix_json_chars",
+            0,
+        ),
+        chars_per_token=chars_per_token,
+    )
+    older_tokens = estimate_tokens_from_chars(
+        base_report.get(
+            "older_candidate_json_chars",
+            0,
+        ),
+        chars_per_token=chars_per_token,
+    )
+    tail_tokens = estimate_tokens_from_chars(
+        base_report.get(
+            "verbatim_tail_json_chars",
+            0,
+        ),
+        chars_per_token=chars_per_token,
+    )
+    older_tool_tokens = estimate_tokens_from_chars(
+        base_report.get(
+            "older_tool_protocol_json_chars",
+            0,
+        ),
+        chars_per_token=chars_per_token,
+    )
+
+    estimated_tokens_before = (
+        system_tokens
+        + older_tokens
+        + tail_tokens
+    )
+    fixed_tokens = (
+        system_tokens
+        + tail_tokens
+    )
+    prompt_token_budget = max(
+        1,
+        safe_context_tokens
+        - safe_completion_reserve,
+    )
+    available_summary_tokens = max(
+        0,
+        prompt_token_budget
+        - fixed_tokens,
+    )
+
+    effective_summary_tokens = min(
+        safe_summary_target,
+        older_tokens,
+        available_summary_tokens,
+    )
+
+    if older_tokens:
+        estimated_tokens_after_summary = (
+            fixed_tokens
+            + effective_summary_tokens
+        )
+    else:
+        estimated_tokens_after_summary = (
+            fixed_tokens
+        )
+
+    required_reduction_tokens = max(
+        0,
+        estimated_tokens_before
+        - prompt_token_budget,
+    )
+    predicted_reduction_tokens = max(
+        0,
+        estimated_tokens_before
+        - estimated_tokens_after_summary,
+    )
+
+    result = dict(base_report)
+    result.update(
+        {
+            "budget_report_version": (
+                CONTEXT_BUDGET_REPORT_VERSION
+            ),
+            "chars_per_token": float(
+                chars_per_token
+            ),
+            "context_token_budget": (
+                safe_context_tokens
+            ),
+            "reserved_completion_tokens": (
+                safe_completion_reserve
+            ),
+            "prompt_token_budget": (
+                prompt_token_budget
+            ),
+            "configured_summary_target_tokens": (
+                safe_summary_target
+            ),
+            "effective_summary_target_tokens": (
+                effective_summary_tokens
+            ),
+            "estimated_system_prefix_tokens": (
+                system_tokens
+            ),
+            "estimated_older_candidate_tokens": (
+                older_tokens
+            ),
+            "estimated_older_tool_protocol_tokens": (
+                older_tool_tokens
+            ),
+            "estimated_older_non_tool_tokens": max(
+                0,
+                older_tokens
+                - older_tool_tokens,
+            ),
+            "estimated_verbatim_tail_tokens": (
+                tail_tokens
+            ),
+            "estimated_fixed_prompt_tokens": (
+                fixed_tokens
+            ),
+            "estimated_prompt_tokens_before": (
+                estimated_tokens_before
+            ),
+            "estimated_prompt_tokens_after_summary": (
+                estimated_tokens_after_summary
+            ),
+            "required_reduction_tokens": (
+                required_reduction_tokens
+            ),
+            "predicted_reduction_tokens": (
+                predicted_reduction_tokens
+            ),
+            "over_budget_before": (
+                estimated_tokens_before
+                > prompt_token_budget
+            ),
+            "fits_after_summary": (
+                estimated_tokens_after_summary
+                <= prompt_token_budget
+            ),
+            "compaction_candidate_available": (
+                older_tokens > 0
+            ),
+        }
+    )
+
+    return result

@@ -506,5 +506,227 @@ class ContextWindowReportTests(unittest.TestCase):
         )
 
 
+class ContextBudgetReportTests(unittest.TestCase):
+    def test_token_estimator_rounds_up(self):
+        self.assertEqual(
+            context_window.estimate_tokens_from_chars(
+                0,
+            ),
+            0,
+        )
+        self.assertEqual(
+            context_window.estimate_tokens_from_chars(
+                1,
+            ),
+            1,
+        )
+        self.assertEqual(
+            context_window.estimate_tokens_from_chars(
+                8,
+            ),
+            2,
+        )
+        self.assertEqual(
+            context_window.estimate_tokens_from_chars(
+                9,
+            ),
+            3,
+        )
+
+    def test_short_history_fits_without_compaction(self):
+        messages = [
+            {
+                "role": "system",
+                "content": "system",
+            },
+            {
+                "role": "user",
+                "content": "question",
+            },
+        ]
+
+        report = (
+            context_window
+            .build_context_budget_report(
+                messages,
+                tail_messages=12,
+                context_tokens=1024,
+                reserved_completion_tokens=256,
+                summary_target_tokens=128,
+            )
+        )
+
+        self.assertFalse(
+            report["over_budget_before"]
+        )
+        self.assertTrue(
+            report["fits_after_summary"]
+        )
+        self.assertFalse(
+            report[
+                "compaction_candidate_available"
+            ]
+        )
+        self.assertEqual(
+            report[
+                "effective_summary_target_tokens"
+            ],
+            0,
+        )
+
+    def test_long_history_reports_bounded_summary(self):
+        messages = [
+            {
+                "role": "system",
+                "content": "system policy",
+            },
+        ]
+
+        for index in range(12):
+            messages.append(
+                {
+                    "role": (
+                        "user"
+                        if index % 2 == 0
+                        else "assistant"
+                    ),
+                    "content": (
+                        f"historical-{index}-"
+                        + ("X" * 120)
+                    ),
+                }
+            )
+
+        messages.append(
+            {
+                "role": "user",
+                "content": "current request",
+            }
+        )
+
+        report = (
+            context_window
+            .build_context_budget_report(
+                messages,
+                tail_messages=2,
+                context_tokens=180,
+                reserved_completion_tokens=40,
+                summary_target_tokens=30,
+                chars_per_token=2.0,
+            )
+        )
+
+        self.assertTrue(
+            report["over_budget_before"]
+        )
+        self.assertTrue(
+            report[
+                "compaction_candidate_available"
+            ]
+        )
+        self.assertGreater(
+            report[
+                "required_reduction_tokens"
+            ],
+            0,
+        )
+        self.assertLessEqual(
+            report[
+                "effective_summary_target_tokens"
+            ],
+            30,
+        )
+        self.assertEqual(
+            report[
+                "estimated_prompt_tokens_after_summary"
+            ],
+            (
+                report[
+                    "estimated_fixed_prompt_tokens"
+                ]
+                + report[
+                    "effective_summary_target_tokens"
+                ]
+            ),
+        )
+
+    def test_report_is_content_free_and_non_mutating(self):
+        import copy
+        import json
+
+        marker = "PRIVATE_CONTEXT_MARKER_92A7"
+        messages = [
+            {
+                "role": "system",
+                "content": "system",
+            },
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": (
+                                '{"path":"/tmp/example"}'
+                            ),
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": marker,
+            },
+            {
+                "role": "assistant",
+                "content": "historical answer",
+            },
+            {
+                "role": "user",
+                "content": "latest request",
+            },
+        ]
+        original = copy.deepcopy(messages)
+
+        report = (
+            context_window
+            .build_context_budget_report(
+                messages,
+                tail_messages=2,
+                context_tokens=256,
+                reserved_completion_tokens=64,
+                summary_target_tokens=32,
+            )
+        )
+
+        self.assertEqual(messages, original)
+        self.assertNotIn(
+            marker,
+            json.dumps(
+                report,
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+        )
+        self.assertGreater(
+            report[
+                "estimated_older_tool_protocol_tokens"
+            ],
+            0,
+        )
+        self.assertGreaterEqual(
+            report[
+                "estimated_older_candidate_tokens"
+            ],
+            report[
+                "estimated_older_tool_protocol_tokens"
+            ],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
