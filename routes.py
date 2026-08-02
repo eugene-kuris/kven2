@@ -4897,11 +4897,8 @@ async def handle_chat(request: Request):
                     tool_loop_exposed_enabled_tool_names(body),
                 )
 
-            # PHASE 2: Семантическая память
-            semantic_memories = await get_semantic_context(limit=5)
-            if semantic_memories:
-                sys_block += f"\n--- SEMANTIC MEMORY (Learned Knowledge) ---\n{semantic_memories}\n"
-                logger.debug(f"[ROUTE] Semantic context added. Length: {len(semantic_memories)} chars")
+            # Durable memory is injected only through query-aware retrieval.
+            # Query-independent top-importance rows are intentionally excluded.
 
             # PHASE 3: Проект
             current_project_id = active_state.get('current_project_id', 1)
