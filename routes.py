@@ -5,6 +5,7 @@ import re
 import time
 import httpx
 import logging
+import math
 import asyncio
 import uuid
 from contextvars import ContextVar
@@ -148,6 +149,104 @@ def _env_bool(name: str, default: bool) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     return bool(default)
+
+
+def _estimate_text_tokens(
+    text: str,
+    *,
+    chars_per_token: float,
+) -> int:
+    """Estimate token use with the same bounded character ratio as context telemetry."""
+    if not isinstance(text, str) or not text:
+        return 0
+
+    ratio = max(1.0, float(chars_per_token))
+    return int(math.ceil(len(text) / ratio))
+
+
+def _append_bounded_vector_context(
+    core_context: str,
+    vector_text: str,
+) -> tuple[str, dict]:
+    """
+    Preserve mandatory system context and budget only vector retrieval.
+
+    The previous global character slice could remove tool availability, project
+    state, and retrieval headings after a larger versioned profile was added.
+    """
+    core = core_context if isinstance(core_context, str) else str(core_context or "")
+    retrieval = vector_text if isinstance(vector_text, str) else str(vector_text or "")
+
+    max_tokens = _env_int(
+        "KVEN2_SYSTEM_CONTEXT_MAX_TOKENS",
+        8192,
+        256,
+        65536,
+    )
+    chars_per_token = _env_float(
+        "KVEN2_SYSTEM_CONTEXT_CHARS_PER_TOKEN",
+        4.0,
+        1.0,
+        16.0,
+    )
+    max_chars = int(max_tokens * chars_per_token)
+
+    prefix = "\nVECTOR RETRIEVAL CONTEXT:\n"
+    suffix = "\n"
+    marker = "\n[TRUNCATED: VECTOR RETRIEVAL CONTEXT BUDGET]"
+
+    meta = {
+        "max_tokens": max_tokens,
+        "chars_per_token": chars_per_token,
+        "max_chars": max_chars,
+        "core_chars": len(core),
+        "core_estimated_tokens": _estimate_text_tokens(
+            core,
+            chars_per_token=chars_per_token,
+        ),
+        "retrieval_chars": len(retrieval),
+        "retrieval_estimated_tokens": _estimate_text_tokens(
+            retrieval,
+            chars_per_token=chars_per_token,
+        ),
+        "retrieval_included_chars": 0,
+        "retrieval_truncated": False,
+        "retrieval_omitted": False,
+        "core_over_budget": len(core) > max_chars,
+    }
+
+    if not retrieval:
+        final = core
+        meta["status"] = "core_only"
+    else:
+        available = max_chars - len(core) - len(prefix) - len(suffix)
+
+        if available <= 0:
+            final = core
+            meta["status"] = "retrieval_omitted_core_budget"
+            meta["retrieval_omitted"] = True
+        elif len(retrieval) <= available:
+            final = core + prefix + retrieval + suffix
+            meta["status"] = "retrieval_full"
+            meta["retrieval_included_chars"] = len(retrieval)
+        elif available <= len(marker):
+            final = core
+            meta["status"] = "retrieval_omitted_marker_budget"
+            meta["retrieval_omitted"] = True
+        else:
+            kept = retrieval[: available - len(marker)].rstrip()
+            bounded_retrieval = kept + marker
+            final = core + prefix + bounded_retrieval + suffix
+            meta["status"] = "retrieval_truncated"
+            meta["retrieval_included_chars"] = len(kept)
+            meta["retrieval_truncated"] = True
+
+    meta["final_chars"] = len(final)
+    meta["final_estimated_tokens"] = _estimate_text_tokens(
+        final,
+        chars_per_token=chars_per_token,
+    )
+    return final, meta
 
 
 async def _resolve_main_chat_thinking(
@@ -5258,23 +5357,41 @@ async def handle_chat(request: Request):
             # payloads while preserving the real user request on continuation passes.
             retrieval_messages = write_path_messages
             user_query = _last_user_text(retrieval_messages)
+            vector_text = ""
 
             if user_query:
                 vector_context = await retrieve_context(user_query)
                 if vector_context:
-                    # Безопасное преобразование: извлекаем content из словарей или приводим к str
+                    # Safely normalize retrieval rows without changing their order.
                     if isinstance(vector_context, list):
                         if len(vector_context) > 0 and isinstance(vector_context[0], dict):
-                            vector_text = "\n".join([item.get("content", str(item)) for item in vector_context])
+                            vector_text = "\n".join(
+                                item.get("content", str(item))
+                                for item in vector_context
+                            )
                         else:
-                            vector_text = "\n".join(str(item) for item in vector_context)
+                            vector_text = "\n".join(
+                                str(item)
+                                for item in vector_context
+                            )
                     else:
                         vector_text = str(vector_context)
-                    sys_block += f"\nVECTOR RETRIEVAL CONTEXT:\n{vector_text}\n"
 
-            if len(sys_block) > 6400:
-                sys_block = sys_block[:5800] + "\n[TRUNCATED: SYSTEM BLOCK LIMIT]"
-                logger.warning("[ROUTE] ⚠️ System block truncated. Original length > 6400 chars")
+            sys_block, system_context_budget = (
+                _append_bounded_vector_context(
+                    sys_block,
+                    vector_text,
+                )
+            )
+            logger.info(
+                "[SYSTEM_CONTEXT_BUDGET] %s",
+                json.dumps(
+                    system_context_budget,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+            )
 
             enriched_messages, system_merge_meta = _merge_kven_system_context(messages, sys_block)
             logger.info(
