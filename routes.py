@@ -21,7 +21,10 @@ from sqlite import (
 )
 from retrieval import retrieve_context  # <-- ФАЗА 4: Векторный ретрив
 # ИСПРАВЛЕНО: Импорт обновлен на новое имя файла kven2_profile
-from kven2_profile import load_agent_profile
+from kven2_profile import (
+    build_agent_profile_prompt,
+    load_agent_profile,
+)
 from write_path import process_episodic, strip_reasoning
 from config import settings
 from context_window import (
@@ -5206,15 +5209,7 @@ async def handle_chat(request: Request):
                 "[ROUTE] Profile loaded. Current time is resolved by tool only when needed."
             )
 
-            sys_block = ""
-            if profile:
-                sys_block += f"name: {profile.get('agent_name', 'Kven II')}\n"
-                sys_block += "role: You are my friend.\n\n"
-                sys_block += f"You are {profile.get('agent_name', 'Kven II')}.\n"
-                sys_block += f"Agent Role: {profile.get('agent_role', '')}\n"
-                sys_block += f"Project History: {profile.get('project_history', '')}\n"
-                sys_block += f"Owner: {profile.get('owner', '')}\n"
-                sys_block += f"Mission: {profile.get('mission', '')}\n\n"
+            sys_block = build_agent_profile_prompt(profile)
 
             sys_block += (
                 "CURRENT DATE AND TIME POLICY:\n"
