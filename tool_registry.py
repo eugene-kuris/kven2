@@ -1,3 +1,5 @@
+from copy import deepcopy
+
 TOOL_REQUEST_KEYS = (
     "tools",
     "tool_choice",
@@ -93,3 +95,38 @@ KVEN_TOOL_REGISTRY = {
     },
 
 }
+
+
+def export_openai_tools() -> list[dict]:
+    """Export enabled Kven tools in OpenAI function format."""
+    tools = []
+
+    for name, definition in KVEN_TOOL_REGISTRY.items():
+        if not definition.get("enabled", False):
+            continue
+
+        tools.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": str(
+                        definition.get(
+                            "description",
+                            "",
+                        )
+                    ),
+                    "parameters": deepcopy(
+                        definition.get(
+                            "parameters",
+                            {
+                                "type": "object",
+                                "properties": {},
+                            },
+                        )
+                    ),
+                },
+            }
+        )
+
+    return tools
