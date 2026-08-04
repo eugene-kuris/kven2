@@ -31,6 +31,7 @@ ARGUMENTS_MAX_TOKENS = 192
 THINKING_MAX_TOKENS = 8
 MAX_CONTEXT_CHARS = 6000
 MAX_SELECTION_CONTEXT_CHARS = 1200
+MAX_TOOL_DESCRIPTION_CHARS = 240
 
 
 class PlannerRouterError(RuntimeError):
@@ -137,14 +138,55 @@ def _normalize_tools(
 
 
 
+def _tool_accepts_only_empty_arguments(tool: dict) -> bool:
+    """Return True only for a strict empty-object argument schema."""
+
+    if not isinstance(tool, dict):
+        return False
+
+    parameters = tool.get("parameters")
+
+    if not isinstance(parameters, dict):
+        return False
+
+    properties = parameters.get("properties")
+    required = parameters.get("required")
+
+    return (
+        parameters.get("type") == "object"
+        and isinstance(properties, dict)
+        and not properties
+        and isinstance(required, list)
+        and not required
+        and parameters.get("additionalProperties") is False
+    )
+
+
 def _compact_tool_catalog(tools_by_name: dict[str, dict]) -> list[dict]:
     catalog: list[dict] = []
 
     for name in sorted(tools_by_name):
+        tool = tools_by_name[name]
+        description = " ".join(
+            str(
+                tool.get("description")
+                or ""
+            ).split()
+        )
+
+        if len(description) > MAX_TOOL_DESCRIPTION_CHARS:
+            description = (
+                description[
+                    : MAX_TOOL_DESCRIPTION_CHARS - 3
+                ].rstrip()
+                + "..."
+            )
+
         catalog.append(
             {
                 "id": len(catalog),
                 "name": name,
+                "description": description,
             }
         )
 
@@ -571,15 +613,26 @@ def _selection_prompt(
 ) -> str:
     selection_context = context[-MAX_SELECTION_CONTEXT_CHARS:]
     tool_lines = "\n".join(
-        f"{item['id']} {item['name']}"
+        (
+            f"{item['id']} {item['name']}: "
+            f"{item.get('description') or 'No description provided.'}"
+        )
         for item in catalog
     )
 
     return (
         "Route the latest user request; do not solve it.\n"
         "Return exactly one line: FAST, THINK, or TOOL <numeric_id>.\n"
-        "Use TOOL only for current, external, or private data; URL or "
-        "file content; or an external action.\n"
+        "Use TOOL only when the answer requires information or an "
+        "action that is not already available in the conversation.\n"
+        "Choose the most direct source: a current-time tool for the "
+        "real current date, time, timezone, or relative dates anchored "
+        "to now; a file tool for a known local path; a URL fetch tool "
+        "for an explicit URL; and web search for public information "
+        "that requires discovery or freshness.\n"
+        "Do not use a tool when the required facts or content are "
+        "already supplied. Do not choose web search when an explicit "
+        "URL can be fetched directly.\n"
         "Use FAST for greetings, acknowledgements, translation, "
         "paraphrasing, direct extraction, or trivial arithmetic.\n"
         "Use THINK for diagnosis, configuration, code, security, "
@@ -687,19 +740,28 @@ async def route_tool_request(
 
         selected_tool = tools_by_name[selected_name]
 
-        generated_arguments, arguments_meta = (
-            await _post_planner_tool_call(
-                _arguments_prompt(context),
-                selected_tool,
-                max_tokens=ARGUMENTS_MAX_TOKENS,
-                timeout_seconds=timeout_seconds,
+        if _tool_accepts_only_empty_arguments(
+            selected_tool
+        ):
+            arguments = {}
+            arguments_meta = {
+                "skipped": True,
+                "reason": "strict_empty_object_schema",
+            }
+        else:
+            generated_arguments, arguments_meta = (
+                await _post_planner_tool_call(
+                    _arguments_prompt(context),
+                    selected_tool,
+                    max_tokens=ARGUMENTS_MAX_TOKENS,
+                    timeout_seconds=timeout_seconds,
+                )
             )
-        )
 
-        arguments = _validate_arguments(
-            selected_tool,
-            generated_arguments,
-        )
+            arguments = _validate_arguments(
+                selected_tool,
+                generated_arguments,
+            )
 
         tool_call = {
             "id": f"call_planner_{uuid.uuid4().hex[:20]}",

@@ -20,7 +20,11 @@ KVEN_TOOL_REGISTRY = {
         "risk": "safe_readonly",
         "sandbox_method": "GET",
         "sandbox_path": "/time",
-        "description": "Return current server time from the sandbox service.",
+        "description": (
+            "Return the real current server date, time, timezone, and "
+            "weekday for answers that depend on the current temporal "
+            "state."
+        ),
         "parameters": {
             "type": "object",
             "properties": {},

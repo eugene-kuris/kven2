@@ -192,7 +192,13 @@ class PlannerRouterTests(unittest.IsolatedAsyncioTestCase):
     def test_selection_prompt_keeps_dynamic_context_last(self):
         prompt = planner_router._selection_prompt(
             "DYNAMIC-CONTEXT",
-            [{"id": 0, "name": "stable_tool"}],
+            [
+                {
+                    "id": 0,
+                    "name": "stable_tool",
+                    "description": "Stable description.",
+                }
+            ],
         )
 
         self.assertLess(
@@ -203,7 +209,34 @@ class PlannerRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("FAST", prompt)
         self.assertIn("THINK", prompt)
         self.assertIn("TOOL <numeric_id>", prompt)
-        self.assertIn("0 stable_tool", prompt)
+        self.assertIn(
+            "0 stable_tool: Stable description.",
+            prompt,
+        )
+        self.assertIn(
+            "information or an action that is not already available",
+            prompt,
+        )
+        self.assertIn(
+            "Choose the most direct source",
+            prompt,
+        )
+        self.assertIn(
+            "a file tool for a known local path",
+            prompt,
+        )
+        self.assertIn(
+            "a URL fetch tool for an explicit URL",
+            prompt,
+        )
+        self.assertIn(
+            "web search for public information",
+            prompt,
+        )
+        self.assertIn(
+            "Do not choose web search when an explicit URL",
+            prompt,
+        )
 
         catalog = planner_router._compact_tool_catalog(
             planner_router._normalize_tools(TOOLS)
@@ -211,10 +244,41 @@ class PlannerRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(catalog[1]["id"], 1)
         self.assertEqual(
             set(catalog[1]),
-            {"id", "name"},
+            {
+                "id",
+                "name",
+                "description",
+            },
+        )
+        self.assertEqual(
+            catalog[1]["description"],
+            "Search current information on the web.",
         )
         self.assertNotIn("argument_names", prompt)
-        self.assertNotIn('"description"', prompt)
+
+    def test_get_time_description_explains_temporal_anchor(
+        self,
+    ):
+        from tool_registry import export_openai_tools
+
+        tools = export_openai_tools()
+
+        descriptions = {
+            item["function"]["name"]:
+                item["function"]["description"]
+            for item in tools
+        }
+
+        description = descriptions["get_time"]
+
+        self.assertIn(
+            "current server date, time, timezone, and weekday",
+            description,
+        )
+        self.assertIn(
+            "current temporal state",
+            description,
+        )
 
     def test_selection_prompt_limits_dynamic_context(self):
         context = "OLD-" + ("x" * 5000) + "-LATEST"
@@ -389,6 +453,54 @@ class PlannerRouterTests(unittest.IsolatedAsyncioTestCase):
                 "search_web",
             )
 
+
+    async def test_parameterless_explicit_tool_skips_arguments(self):
+        parameterless_tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_time",
+                    "description": "Return current time.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "required": [],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ]
+
+        with patch.object(
+            planner_router,
+            "_post_planner_tool_call",
+            AsyncMock(),
+        ) as mocked:
+            result = await planner_router.route_tool_request(
+                [
+                    {
+                        "role": "user",
+                        "content": "What time is it?",
+                    }
+                ],
+                parameterless_tools,
+                explicit_tool_name="get_time",
+            )
+
+        self.assertEqual(result["decision"], "TOOL")
+        self.assertEqual(mocked.await_count, 0)
+        self.assertEqual(
+            result["tool_call"]["function"]["name"],
+            "get_time",
+        )
+        self.assertEqual(
+            result["tool_call"]["function"]["arguments"],
+            "{}",
+        )
+        self.assertEqual(
+            result["meta"]["arguments"]["reason"],
+            "strict_empty_object_schema",
+        )
 
     async def test_explicit_tool_skips_selection(self):
         mocked = AsyncMock(
