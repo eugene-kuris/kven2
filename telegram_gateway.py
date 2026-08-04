@@ -345,6 +345,12 @@ def configure_logging(level: str) -> None:
             "%(name)s %(message)s"
         ),
     )
+    logging.getLogger("httpx").setLevel(
+        logging.WARNING
+    )
+    logging.getLogger("httpcore").setLevel(
+        logging.WARNING
+    )
 
 
 async def run_telegram_gateway(

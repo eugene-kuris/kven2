@@ -398,6 +398,50 @@ class TelegramGatewaySignalTests(
         self.assertTrue(stop_event.is_set())
 
 
+class TelegramGatewayLoggingTests(
+    unittest.TestCase
+):
+    def test_configure_logging_suppresses_http_clients(
+        self,
+    ) -> None:
+        import logging
+        from unittest.mock import patch
+
+        from telegram_gateway import configure_logging
+
+        httpx_logger = logging.getLogger("httpx")
+        httpcore_logger = logging.getLogger("httpcore")
+
+        previous_httpx_level = httpx_logger.level
+        previous_httpcore_level = httpcore_logger.level
+
+        try:
+            with patch(
+                "telegram_gateway.logging.basicConfig"
+            ) as basic_config:
+                configure_logging("INFO")
+
+            self.assertEqual(
+                basic_config.call_args.kwargs["level"],
+                logging.INFO,
+            )
+            self.assertEqual(
+                httpx_logger.level,
+                logging.WARNING,
+            )
+            self.assertEqual(
+                httpcore_logger.level,
+                logging.WARNING,
+            )
+        finally:
+            httpx_logger.setLevel(
+                previous_httpx_level
+            )
+            httpcore_logger.setLevel(
+                previous_httpcore_level
+            )
+
+
 class TelegramGatewayRunTests(
     unittest.IsolatedAsyncioTestCase
 ):
