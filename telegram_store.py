@@ -34,6 +34,25 @@ class TelegramStore:
             self._get_next_update_offset_sync
         )
 
+    async def advance_update_offset(
+        self,
+        next_offset: int,
+    ) -> None:
+        if (
+            not isinstance(next_offset, int)
+            or isinstance(next_offset, bool)
+            or next_offset < 0
+        ):
+            raise ValueError(
+                "Telegram update offset must be "
+                "a non-negative integer"
+            )
+
+        await asyncio.to_thread(
+            self._advance_update_offset_sync,
+            next_offset,
+        )
+
     async def enqueue_text_update(
         self,
         *,
@@ -299,6 +318,24 @@ class TelegramStore:
             if row is not None
             else 0
         )
+
+    def _advance_update_offset_sync(
+        self,
+        next_offset: int,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+
+            try:
+                self._advance_offset_sync(
+                    connection,
+                    next_offset,
+                )
+                connection.execute("COMMIT")
+
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
 
     def _enqueue_text_update_sync(
         self,

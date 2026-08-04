@@ -276,6 +276,25 @@ class TelegramStoreTests(unittest.IsolatedAsyncioTestCase):
             await self.store.claim_next_job()
         )
 
+    async def test_explicit_offset_for_ignored_updates_never_regresses(
+        self,
+    ):
+        self.assertEqual(
+            await self.store.get_next_update_offset(),
+            0,
+        )
+
+        await self.store.advance_update_offset(51)
+        await self.store.advance_update_offset(40)
+
+        self.assertEqual(
+            await self.store.get_next_update_offset(),
+            51,
+        )
+
+        with self.assertRaises(ValueError):
+            await self.store.advance_update_offset(-1)
+
 
 if __name__ == "__main__":
     unittest.main()
