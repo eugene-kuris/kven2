@@ -6,6 +6,7 @@ from telegram_store import (
     TelegramDelivery,
     TelegramJob,
 )
+from telegram_updates import ingest_telegram_update
 
 
 class GenerationStore(Protocol):
@@ -114,3 +115,91 @@ async def run_delivery_once(
     )
 
     return True
+
+
+class PollingStore(Protocol):
+    async def get_next_update_offset(
+        self,
+    ) -> int:
+        ...
+
+
+class TelegramPollingClient(Protocol):
+    async def get_updates(
+        self,
+        *,
+        offset: int,
+        timeout: int = 50,
+    ) -> list[dict[str, Any]]:
+        ...
+
+
+class UpdateIngestor(Protocol):
+    async def __call__(
+        self,
+        store: Any,
+        update: dict[str, Any],
+        *,
+        allowed_user_id: int,
+    ) -> bool:
+        ...
+
+
+async def run_polling_once(
+    store: PollingStore,
+    telegram_bot: TelegramPollingClient,
+    *,
+    allowed_user_id: int,
+    timeout: int = 50,
+    update_ingestor: UpdateIngestor = (
+        ingest_telegram_update
+    ),
+) -> int:
+    if (
+        not isinstance(allowed_user_id, int)
+        or isinstance(allowed_user_id, bool)
+        or allowed_user_id <= 0
+    ):
+        raise ValueError(
+            "Telegram allowed user ID must be "
+            "a positive integer"
+        )
+
+    if (
+        not isinstance(timeout, int)
+        or isinstance(timeout, bool)
+        or timeout <= 0
+    ):
+        raise ValueError(
+            "Telegram polling timeout must be "
+            "a positive integer"
+        )
+
+    offset = await store.get_next_update_offset()
+
+    updates = await telegram_bot.get_updates(
+        offset=offset,
+        timeout=timeout,
+    )
+
+    if not isinstance(updates, list):
+        raise TypeError(
+            "Telegram updates result must be a list"
+        )
+
+    processed = 0
+
+    for update in updates:
+        if not isinstance(update, dict):
+            raise TypeError(
+                "Telegram update must be an object"
+            )
+
+        await update_ingestor(
+            store,
+            update,
+            allowed_user_id=allowed_user_id,
+        )
+        processed += 1
+
+    return processed
