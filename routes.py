@@ -48,6 +48,13 @@ from planner_router import (
     classify_main_thinking as planner_classify_main_thinking,
     route_tool_request as planner_route_tool_request,
 )
+from tool_directives import (
+    ToolDirectiveError,
+    latest_user_message_text,
+    parse_tool_directive,
+    render_tools_help,
+    replace_latest_user_message_text,
+)
 from speculative_stream import SpeculativeStream
 from sandbox_client import execute_gateway_tool as sandbox_execute_gateway_tool
 from tool_loop import (
@@ -2529,6 +2536,218 @@ def _completion_response_for_client(completion: dict, stream_requested: bool) ->
     return JSONResponse(content=completion)
 
 
+def _direct_text_completion(
+    payload: dict,
+    content: str,
+) -> dict:
+    """Build one local OpenAI-compatible assistant response."""
+
+    return {
+        "id": f"chatcmpl-kven-local-{uuid.uuid4().hex[:20]}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": (
+            payload.get("model")
+            or settings.MAIN_MODEL
+        ),
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": content,
+                },
+                "finish_reason": "stop",
+            }
+        ],
+    }
+
+
+def _tool_directive_error_text(error: Exception) -> str:
+    return (
+        "Ошибка директивы инструмента: "
+        f"{error}. Используйте #tools для справки."
+    )
+
+
+def _prepare_explicit_tool_directive(
+    payload: dict,
+) -> dict:
+    """
+    Parse a leading user directive and prepare local help or forced routing.
+
+    The result kind is one of: none, help, error, tool.
+    """
+
+    messages = (
+        payload.get("messages", [])
+        if isinstance(payload, dict)
+        else []
+    )
+    text = latest_user_message_text(messages)
+
+    if not text:
+        return {
+            "kind": "none",
+            "payload": payload,
+        }
+
+    tools = payload.get("tools", [])
+    allowed_names = _allowed_native_tool_names(payload)
+
+    try:
+        directive = parse_tool_directive(
+            text,
+            tools,
+            allowed_names=allowed_names,
+        )
+    except ToolDirectiveError as exc:
+        return {
+            "kind": "error",
+            "payload": payload,
+            "content": _tool_directive_error_text(exc),
+        }
+
+    if directive is None:
+        return {
+            "kind": "none",
+            "payload": payload,
+        }
+
+    if directive.kind == "help":
+        try:
+            help_text = render_tools_help(
+                tools,
+                allowed_names=allowed_names,
+                tool_name=directive.tool_name,
+            )
+        except ToolDirectiveError as exc:
+            return {
+                "kind": "error",
+                "payload": payload,
+                "content": _tool_directive_error_text(exc),
+            }
+
+        return {
+            "kind": "help",
+            "payload": payload,
+            "content": help_text,
+        }
+
+    requested_name = str(
+        directive.tool_name or ""
+    ).strip()
+    existing_choice = payload.get("tool_choice")
+    existing_name = _explicit_native_tool_choice_name(
+        existing_choice
+    )
+    existing_mode = (
+        str(existing_choice).strip().lower()
+        if isinstance(existing_choice, str)
+        else ""
+    )
+
+    if existing_mode == "none":
+        return {
+            "kind": "error",
+            "payload": payload,
+            "content": _tool_directive_error_text(
+                ToolDirectiveError(
+                    f"#{requested_name} conflicts with "
+                    "API tool_choice=none"
+                )
+            ),
+        }
+
+    if existing_name and existing_name != requested_name:
+        return {
+            "kind": "error",
+            "payload": payload,
+            "content": _tool_directive_error_text(
+                ToolDirectiveError(
+                    f"#{requested_name} conflicts with "
+                    f"API tool_choice={existing_name}"
+                )
+            ),
+        }
+
+    remaining_text = directive.remaining_text
+
+    if not remaining_text:
+        if requested_name == "get_time":
+            remaining_text = "Назови текущую дату и время."
+        else:
+            return {
+                "kind": "error",
+                "payload": payload,
+                "content": _tool_directive_error_text(
+                    ToolDirectiveError(
+                        f"#{requested_name} requires a request "
+                        "after the directive"
+                    )
+                ),
+            }
+
+    prepared_payload = dict(payload)
+    prepared_payload["messages"] = (
+        replace_latest_user_message_text(
+            messages,
+            remaining_text,
+        )
+    )
+    prepared_payload["tool_choice"] = {
+        "type": "function",
+        "function": {
+            "name": requested_name,
+        },
+    }
+
+    return {
+        "kind": "tool",
+        "payload": prepared_payload,
+        "tool_name": requested_name,
+    }
+
+
+def _strip_completed_tool_directive(
+    payload: dict,
+) -> dict:
+    """Remove a previously handled #tool token from continuation context."""
+
+    messages = payload.get("messages", [])
+    text = latest_user_message_text(messages)
+
+    if not text:
+        return payload
+
+    try:
+        directive = parse_tool_directive(
+            text,
+            payload.get("tools", []),
+            allowed_names=_allowed_native_tool_names(payload),
+        )
+    except ToolDirectiveError:
+        return payload
+
+    if directive is None or directive.kind != "tool":
+        return payload
+
+    remaining_text = directive.remaining_text
+
+    if not remaining_text and directive.tool_name == "get_time":
+        remaining_text = "Назови текущую дату и время."
+
+    if not remaining_text:
+        return payload
+
+    stripped = dict(payload)
+    stripped["messages"] = replace_latest_user_message_text(
+        messages,
+        remaining_text,
+    )
+    return stripped
+
+
 async def _post_native_decision_json(
     payload: dict,
     chat_url: str,
@@ -3226,11 +3445,18 @@ async def _proxy_hybrid_native_openai_tool_protocol(
     # Tool results already exist: remove the tool catalogue and native protocol
     # history, then validate the final answer before exposing it to the client.
     if _messages_include_native_tool_continuation(messages):
-        final_payload = dict(payload)
+        continuation_payload = _strip_completed_tool_directive(
+            payload
+        )
+        continuation_messages = continuation_payload.get(
+            "messages",
+            messages,
+        )
+        final_payload = dict(continuation_payload)
         final_payload.pop("tools", None)
         final_payload.pop("tool_choice", None)
         final_payload["messages"] = _build_clean_tool_continuation_messages(
-            messages
+            continuation_messages
         )
 
         logger.info(
@@ -3247,6 +3473,43 @@ async def _proxy_hybrid_native_openai_tool_protocol(
             owui_rag_meta=owui_rag_meta,
             skip_write_path=skip_write_path,
             timeout_seconds=timeout_seconds,
+        )
+
+    directive_result = _prepare_explicit_tool_directive(
+        payload
+    )
+    directive_kind = directive_result["kind"]
+
+    if directive_kind in {"help", "error"}:
+        content = str(
+            directive_result.get("content") or ""
+        )
+
+        log_method = (
+            logger.warning
+            if directive_kind == "error"
+            else logger.info
+        )
+        log_method(
+            "[TOOL_DIRECTIVE] local_response kind=%s",
+            directive_kind,
+        )
+
+        completion = _direct_text_completion(
+            payload,
+            content,
+        )
+        return _completion_response_for_client(
+            completion,
+            stream_requested,
+        )
+
+    if directive_kind == "tool":
+        payload = directive_result["payload"]
+        messages = payload.get("messages", [])
+        logger.info(
+            "[TOOL_DIRECTIVE] forced_tool=%s",
+            directive_result.get("tool_name"),
         )
 
     allowed_names = _allowed_native_tool_names(payload)

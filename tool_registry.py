@@ -1,3 +1,5 @@
+from copy import deepcopy
+
 TOOL_REQUEST_KEYS = (
     "tools",
     "tool_choice",
@@ -18,7 +20,11 @@ KVEN_TOOL_REGISTRY = {
         "risk": "safe_readonly",
         "sandbox_method": "GET",
         "sandbox_path": "/time",
-        "description": "Return current server time from the sandbox service.",
+        "description": (
+            "Return the real current server date, time, timezone, and "
+            "weekday for answers that depend on the current temporal "
+            "state."
+        ),
         "parameters": {
             "type": "object",
             "properties": {},
@@ -93,3 +99,38 @@ KVEN_TOOL_REGISTRY = {
     },
 
 }
+
+
+def export_openai_tools() -> list[dict]:
+    """Export enabled Kven tools in OpenAI function format."""
+    tools = []
+
+    for name, definition in KVEN_TOOL_REGISTRY.items():
+        if not definition.get("enabled", False):
+            continue
+
+        tools.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": str(
+                        definition.get(
+                            "description",
+                            "",
+                        )
+                    ),
+                    "parameters": deepcopy(
+                        definition.get(
+                            "parameters",
+                            {
+                                "type": "object",
+                                "properties": {},
+                            },
+                        )
+                    ),
+                },
+            }
+        )
+
+    return tools

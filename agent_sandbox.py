@@ -4,7 +4,9 @@ import logging
 import os
 import re
 import subprocess
+from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from urllib.parse import parse_qs, unquote, urlparse
 
 import httpx
@@ -59,6 +61,55 @@ def _clip_text(text: str, limit: int) -> tuple[str, bool]:
 
 def _abs_path(path: str) -> str:
     return os.path.abspath(os.path.expanduser(path))
+
+
+def _system_timezone_name() -> str:
+    """Return the configured IANA timezone name when available."""
+
+    try:
+        resolved = os.path.realpath("/etc/localtime")
+        marker = "/usr/share/zoneinfo/"
+
+        if marker in resolved:
+            name = resolved.split(marker, 1)[1].strip()
+
+            if name:
+                return name
+    except OSError:
+        pass
+
+    try:
+        configured = Path("/etc/timezone").read_text(
+            encoding="utf-8"
+        ).strip()
+
+        if configured:
+            return configured
+    except OSError:
+        pass
+
+    env_name = str(os.environ.get("TZ") or "").strip()
+
+    if env_name:
+        return env_name
+
+    fallback = datetime.datetime.now(
+        datetime.timezone.utc
+    ).astimezone().tzinfo
+    return str(fallback or "")
+
+
+def _current_system_time() -> datetime.datetime:
+    """Return current time in the configured system timezone."""
+
+    timezone_name = _system_timezone_name()
+
+    try:
+        timezone = ZoneInfo(timezone_name)
+    except (ZoneInfoNotFoundError, ValueError):
+        timezone = datetime.timezone.utc
+
+    return datetime.datetime.now(timezone)
 
 
 _TAG_RE = re.compile(r"<[^>]+>")
@@ -206,12 +257,16 @@ def list_tools():
 
 @app.get("/time")
 def get_time():
-    """Return current system time."""
-    now = datetime.datetime.now().astimezone()
+    """Return current system time with an unambiguous timezone."""
+    now = _current_system_time()
     return {
         "time": now.strftime("%a %b %d %H:%M:%S %Z %Y"),
         "iso": now.isoformat(timespec="seconds"),
         "timestamp": int(now.timestamp()),
+        "timezone": _system_timezone_name(),
+        "timezone_abbreviation": now.tzname() or "",
+        "utc_offset": now.strftime("%z"),
+        "weekday": now.strftime("%A"),
     }
 
 
