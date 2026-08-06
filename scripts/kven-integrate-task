@@ -36,6 +36,9 @@ ACTIVE_STATES = {"BACKING_UP", "MIGRATING", "PRE_MERGE_TESTING", "MERGING", "POS
                  "DEPLOYING", "RESTARTING_SERVICES", "VERIFYING", "AWAITING_ACCEPTANCE",
                  "FINALIZING", "ROLLING_BACK", "INTERRUPTED", "INTERNAL_ERROR"}
 TERMINAL_STATES = {"ROLLED_BACK", "FINALIZED"}
+RUN_STATES = ACTIVE_STATES | TERMINAL_STATES | {
+    "CREATED", "AUTOMATED_CHECK_FAILED", "DEPLOYING", "ROLLBACK_FAILED",
+}
 
 
 class IntegrationError(RuntimeError):
@@ -693,9 +696,48 @@ def load_run(value: str) -> tuple[Path, dict]:
         state = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise IntegrationError(f"integration run manifest is malformed: {exc}") from exc
-    if not isinstance(state, dict) or not _is_string(state.get("run_id")) or not _is_string(state.get("repository")):
-        raise IntegrationError("integration run manifest is invalid")
-    return path.parent, state
+    return path.parent, validate_run_state(state)
+
+
+def validate_run_state(state: object) -> dict:
+    required = {
+        "schema_version", "run_id", "task_id", "status", "phase", "repository", "source_manifest",
+        "baseline_branch", "baseline_head", "origin_baseline_head", "feature_branch", "feature_head",
+        "contract", "service_manager", "service_timeout", "acceptance_checklist",
+        "expected_repository_state", "commands",
+    }
+    if not isinstance(state, dict):
+        raise IntegrationError("integration run manifest must be an object")
+    missing = sorted(required - state.keys())
+    if missing:
+        raise IntegrationError("integration run manifest missing fields: " + ", ".join(missing))
+    if state["schema_version"] != SCHEMA_VERSION or state["status"] not in RUN_STATES:
+        raise IntegrationError("integration run schema/status is invalid")
+    for field in ("run_id", "task_id", "phase", "repository", "source_manifest", "baseline_branch", "feature_branch"):
+        if not _is_string(state[field]):
+            raise IntegrationError(f"integration run field {field} is invalid")
+    if not Path(state["repository"]).is_absolute() or not Path(state["source_manifest"]).is_absolute():
+        raise IntegrationError("integration run paths must be absolute")
+    for field in ("baseline_head", "origin_baseline_head", "feature_head"):
+        if not isinstance(state[field], str) or not SHA_RE.fullmatch(state[field]):
+            raise IntegrationError(f"integration run field {field} is not a commit SHA")
+    if "staged_head" in state and (not isinstance(state["staged_head"], str) or not SHA_RE.fullmatch(state["staged_head"])):
+        raise IntegrationError("integration run staged_head is invalid")
+    if not isinstance(state["service_manager"], list) or not state["service_manager"] or not all(_is_string(x) for x in state["service_manager"]):
+        raise IntegrationError("integration run service_manager must be an argv array")
+    if not isinstance(state["service_timeout"], (int, float)) or isinstance(state["service_timeout"], bool) or state["service_timeout"] <= 0:
+        raise IntegrationError("integration run service_timeout is invalid")
+    if not isinstance(state["acceptance_checklist"], list) or not all(_is_string(x) for x in state["acceptance_checklist"]):
+        raise IntegrationError("integration run acceptance_checklist is invalid")
+    expected = _require_keys(state["expected_repository_state"], {"branch", "head", "index_tree", "status"}, "expected_repository_state")
+    if not all(isinstance(expected[x], str) for x in expected) or not SHA_RE.fullmatch(expected["head"]):
+        raise IntegrationError("integration run expected repository state is invalid")
+    if not isinstance(state["commands"], dict) or not all(_is_string(x) for x in state["commands"].values()):
+        raise IntegrationError("integration run commands are invalid")
+    validate_contract(state["contract"], {"baseline_head": state["baseline_head"], "feature_branch": state["feature_branch"]})
+    if state["status"] in {"AWAITING_ACCEPTANCE", "FINALIZING", "FINALIZED"} and "staged_head" not in state:
+        raise IntegrationError("staged integration state is missing staged_head")
+    return state
 
 
 def git_common_dir(repo: Path) -> Path:

@@ -379,6 +379,15 @@ class RepositoryFixture(unittest.TestCase):
         self.assertIn("synthetic exact refusal", summary)
         self.assertIn("Finalize after PASS", summary)
 
+    def test_persisted_run_state_types_are_strict(self):
+        self.assertEqual(self.stage_cli().returncode, 0)
+        run_dir = self.run_dir()
+        state = json.loads((run_dir / "integration-manifest.json").read_text())
+        state["service_manager"] = "unsafe shell string"
+        (run_dir / "integration-manifest.json").write_text(json.dumps(state), encoding="utf-8")
+        with self.assertRaisesRegex(integration.IntegrationError, "service_manager must be an argv array"):
+            integration.load_run(str(run_dir))
+
     def test_concurrent_active_stage_is_refused(self):
         marker = integration.git_common_dir(self.repo) / "kven-integration-active.json"
         integration.atomic_json(marker, {"run_id": "different-run", "run_dir": "/tmp/different", "repository": str(self.repo)}, mode=0o600)
