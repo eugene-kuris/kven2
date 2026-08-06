@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 import json
 import sqlite3
 import time
@@ -210,6 +211,15 @@ class TelegramStore:
             self._recover_incomplete_jobs_sync
         )
 
+    @contextmanager
+    def _connection(self):
+        connection = self._connect()
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(
             self.db_path,
@@ -228,7 +238,7 @@ class TelegramStore:
             exist_ok=True,
         )
 
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.execute(
                 "PRAGMA journal_mode = WAL"
             )
@@ -591,7 +601,7 @@ class TelegramStore:
         )
 
     def _get_next_update_offset_sync(self) -> int:
-        with self._connect() as connection:
+        with self._connection() as connection:
             row = connection.execute(
                 """
                 SELECT value
@@ -610,7 +620,7 @@ class TelegramStore:
         self,
         next_offset: int,
     ) -> None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
 
             try:
@@ -642,7 +652,7 @@ class TelegramStore:
             separators=(",", ":"),
         )
 
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
 
             try:
@@ -780,7 +790,7 @@ class TelegramStore:
     def _claim_next_job_sync(
         self,
     ) -> TelegramJob | None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
 
             try:
@@ -853,7 +863,7 @@ class TelegramStore:
     def _claim_next_delivery_sync(
         self,
     ) -> TelegramDelivery | None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
 
             try:
@@ -1083,7 +1093,7 @@ class TelegramStore:
         job_id: int,
         response_text: str,
     ) -> None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
 
             try:
@@ -1182,7 +1192,7 @@ class TelegramStore:
         chunk_id: int,
         telegram_message_id: int,
     ) -> bool:
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
 
             try:
@@ -1346,7 +1356,7 @@ class TelegramStore:
         job_id: int,
         telegram_message_id: int,
     ) -> None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             row = connection.execute(
                 """
                 SELECT id
@@ -1407,7 +1417,7 @@ class TelegramStore:
                 id
         """
 
-        with self._connect() as connection:
+        with self._connection() as connection:
             rows = connection.execute(
                 query,
                 parameters,
@@ -1432,7 +1442,7 @@ class TelegramStore:
     def _build_generation_context_sync(self, job: TelegramJob) -> list[dict[str, str]]:
         batch_ids = job.batch_update_ids or (job.update_id,)
         cutoff = max(batch_ids)
-        with self._connect() as connection:
+        with self._connection() as connection:
             rows = connection.execute(
                 """SELECT m.id, m.role, m.content, m.source_update_id,
                           m.telegram_message_id, m.created_at, m.telegram_date,
@@ -1513,7 +1523,7 @@ class TelegramStore:
     def _recover_incomplete_jobs_sync(
         self,
     ) -> int:
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
 
             try:

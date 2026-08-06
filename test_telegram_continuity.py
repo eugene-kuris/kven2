@@ -279,6 +279,74 @@ class TelegramContinuityTests(unittest.IsolatedAsyncioTestCase):
         })
         self.assertEqual(result["kind"], "none")
 
+    async def test_store_closes_every_sqlite_connection(self):
+        real_connect = sqlite3.connect
+        counts = {"opened": 0, "closed": 0}
+
+        class TrackingConnection(sqlite3.Connection):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self._tracking_closed = False
+                counts["opened"] += 1
+
+            def close(self):
+                if not self._tracking_closed:
+                    self._tracking_closed = True
+                    counts["closed"] += 1
+                return super().close()
+
+        def tracking_connect(*args, **kwargs):
+            kwargs["factory"] = TrackingConnection
+            return real_connect(*args, **kwargs)
+
+        tracked_path = Path(self.temporary.name) / "tracked.db"
+
+        with patch(
+            "telegram_store.sqlite3.connect",
+            side_effect=tracking_connect,
+        ):
+            store = TelegramStore(str(tracked_path))
+
+            await store.init()
+            await store.advance_update_offset(10)
+            self.assertEqual(
+                await store.get_next_update_offset(),
+                10,
+            )
+
+            accepted = await store.enqueue_text_update(
+                update_id=1000,
+                chat_id=200,
+                user_id=300,
+                message_id=1000,
+                text="connection lifecycle",
+                raw_update={"update_id": 1000},
+            )
+            self.assertTrue(accepted)
+
+            job = await store.claim_next_job()
+            self.assertIsNotNone(job)
+
+            await store.build_generation_context(job)
+            await store.save_response(job.id, "answer")
+
+            delivery = await store.claim_next_delivery()
+            self.assertIsNotNone(delivery)
+
+            await store.mark_delivery_chunk_delivered(
+                delivery.chunk_id,
+                2000,
+            )
+
+            await store.load_conversation(200)
+            await store.recover_incomplete_jobs()
+
+        self.assertGreater(counts["opened"], 0)
+        self.assertEqual(
+            counts["opened"],
+            counts["closed"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
