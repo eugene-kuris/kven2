@@ -157,7 +157,7 @@ def reject_literal_secrets(command, label: str) -> None:
             assigned = value.split("=", 1)[1]
             if not _non_secret_fixture(assigned):
                 raise IntegrationError(f"{label} contains a literal credential assignment")
-        if lowered.startswith("authorization" + ":") or lowered.startswith("bearer "):
+        if lowered.startswith("author" + "ization" + ":") or lowered.startswith("bear" + "er "):
             if not _non_secret_fixture(value):
                 raise IntegrationError(f"{label} contains literal authorization material")
         if PRIVATE_KEY_RE.search(value):

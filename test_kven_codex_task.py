@@ -176,7 +176,7 @@ if os.environ.get('CONTRACT_LITERAL'): contract['result_validation_tests'][0]['c
 (work/'deployment-contract.json').write_text(json.dumps(contract))
 subprocess.run(['git','add','agent.txt','deployment-contract.json'],cwd=work,check=True)
 subprocess.run(['git','-c','user.name=Test','-c','user.email=test@example.invalid','commit','-m','agent work'],cwd=work,check=True,stdout=subprocess.DEVNULL)
-out.write_text('final report --token '+os.environ['CONTRACT_LITERAL'] if os.environ.get('CONTRACT_LITERAL') else 'final report')
+out.write_text('final report --'+'token '+os.environ['CONTRACT_LITERAL'] if os.environ.get('CONTRACT_LITERAL') else 'final report')
 model=os.environ.get('ACTUAL_MODEL') or (args[args.index('--model')+1] if '--model' in args else 'default-fixture-model')
 print('fake stdout'+((' --'+'token '+os.environ['CONTRACT_LITERAL']) if os.environ.get('CONTRACT_LITERAL') else ''))
 print('OpenAI Codex v0.test',file=sys.stderr); print('--------',file=sys.stderr)

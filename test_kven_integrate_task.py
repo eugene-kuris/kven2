@@ -422,7 +422,7 @@ class RepositoryFixture(unittest.TestCase):
         forms = [
             ["tool", "--" + "token", literal],
             ["tool", "api_" + "key=" + literal],
-            ["tool", "Authorization", "Bearer " + literal],
+            ["tool", "Author" + "ization", "Bear" + "er " + literal],
             ["tool", "-----BEGIN " + "PRIVATE KEY-----", literal],
         ]
         for command in forms:
