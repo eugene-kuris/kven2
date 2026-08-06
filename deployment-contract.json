@@ -16,7 +16,8 @@
     "sqlite": []
   },
   "expected_baseline": "91ca8fb8ed1f6aa60c366d032995e03ca9acce54",
-  "feature_branch": "codex/work-kven-ops-002a-20260806T113432Z-990766",
+  "fatal_log_checks": [],
+  "feature_branch": "codex/work-kven-ops-002a-r1-20260806T120508Z-996725",
   "migration_checks": [],
   "post_merge_tests": [
     {
@@ -30,12 +31,24 @@
       "timeout": 600
     }
   ],
+  "result_validation_tests": [
+    {
+      "command": ["/opt/kven2/venv/bin/python", "-m", "unittest", "-v", "test_kven_codex_task", "test_kven_integrate_task"],
+      "name": "focused-runner-and-integration-tests",
+      "timeout": 900
+    },
+    {
+      "command": ["/opt/kven2/venv/bin/python", "-m", "unittest", "discover", "-v"],
+      "name": "full-repository-suite",
+      "timeout": 1800
+    }
+  ],
   "readiness_checks": [],
   "rollback": {
     "restore_backups": true,
     "restore_git": true,
     "verify_readiness": true
   },
-  "schema_version": "1.0",
+  "schema_version": "2.0",
   "services": []
 }

@@ -36,7 +36,7 @@ Before creating anything, the runner requires Codex, successful ChatGPT authenti
 
 Packages are created below `/home/eugene/kven-codex-results/<task>-<timestamp>-<pid>/`. Directories use mode `0755` and regular files use `0644`. A package includes:
 
-- `result-manifest.json`, the canonical machine-readable result (schema `1.0`);
+- `result-manifest.json`, the canonical machine-readable result (schema `2.0`);
 - `result-summary.md`, the canonical human entry point and next command;
 
 - original and effective prompts, task ID, timestamps, duration, and summary;
@@ -47,7 +47,7 @@ Packages are created below `/home/eugene/kven-codex-results/<task>-<timestamp>-<
 
 The package deliberately excludes authentication files, private `.env` contents, tokens, credentials, databases, and private runtime logs. Interrupted and failed runs preserve whatever evidence was produced.
 
-When a committed `deployment-contract.json` is present, the runner embeds its parsed value in the manifest. A malformed contract is recorded as an error rather than interpreted from the final natural-language response. Test execution remains an explicit machine field; a task is not integration-eligible until required test records are present and passing.
+When a committed `deployment-contract.json` is present, the runner embeds its parsed value in the manifest. A malformed contract is recorded as an error rather than interpreted from the final natural-language response. The contract must declare non-empty `result_validation_tests`. The runner itself executes them after Codex and records exact redacted argv, timestamps, duration, exit code, pass/fail, bounded output, and a full redacted artifact. Empty or failed evidence forces a failed final status.
 
 Post-Codex integration is described in `KVEN_INTEGRATION_WORKFLOW.md`. Begin with the exact command printed in `result-summary.md`.
 

@@ -26,6 +26,11 @@ SECRET_PATTERN = re.compile(
     r"(?i)(?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret)"
     r"\s*[:=]\s*['\"]?(?!example|placeholder|redacted|none)[A-Za-z0-9_./+\-=]{12,}"
 )
+EVIDENCE_SECRET_PATTERN = re.compile(
+    r"(?i)(password|secret|token|api[_-]?key)(\s*[:=]\s*|=)([^\s]+)"
+)
+SCHEMA_VERSION = "2.0"
+OUTPUT_LIMIT = 4000
 SERVICES = (
     "agent-sandbox.service",
     "kven2-main.service",
@@ -113,12 +118,88 @@ def _json_result(path: Path, value: Any):
 
 
 def _changed_files(worktree: Path, baseline: str) -> list[str]:
-    return git(worktree, "diff", "--name-only", baseline, check=False).stdout.splitlines()
+    return git(worktree, "diff", "--name-only", f"{baseline}..HEAD", check=False).stdout.splitlines()
 
 
 def _commits(worktree: Path, baseline: str) -> list[dict[str, str]]:
-    rows = git(worktree, "log", "--format=%H%x09%s", f"{baseline}..HEAD", check=False).stdout.splitlines()
+    rows = git(worktree, "log", "--reverse", "--format=%H%x09%s", f"{baseline}..HEAD", check=False).stdout.splitlines()
     return [{"sha": row.split("\t", 1)[0], "subject": row.split("\t", 1)[1]} for row in rows if "\t" in row]
+
+
+def redact_evidence(value: str) -> str:
+    return EVIDENCE_SECRET_PATTERN.sub(lambda match: f"{match.group(1)}{match.group(2)}[REDACTED]", value)
+
+
+def redact_argv(command: list[str]) -> list[str]:
+    redacted = []
+    hide_next = False
+    for value in command:
+        text = str(value)
+        if hide_next:
+            redacted.append("[REDACTED]")
+            hide_next = False
+        elif text.lower() in {"--password", "--secret", "--token", "--api-key", "--api_key"}:
+            redacted.append(text)
+            hide_next = True
+        else:
+            redacted.append(redact_evidence(text))
+    return redacted
+
+
+def validation_commands(contract: object) -> list[dict]:
+    if not isinstance(contract, dict):
+        raise RunnerError("deployment contract is missing or malformed")
+    commands = contract.get("result_validation_tests")
+    if not isinstance(commands, list) or not commands:
+        raise RunnerError("deployment contract requires non-empty result_validation_tests")
+    normalized = []
+    for index, item in enumerate(commands):
+        if not isinstance(item, dict) or set(item) - {"command", "timeout", "name"}:
+            raise RunnerError(f"result_validation_tests[{index}] is malformed")
+        command = item.get("command")
+        if not isinstance(command, list) or not command or not all(isinstance(x, str) and x for x in command):
+            raise RunnerError(f"result_validation_tests[{index}].command must be a non-empty argv array")
+        timeout = item.get("timeout", 1800)
+        if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout < 1 or timeout > 7200:
+            raise RunnerError(f"result_validation_tests[{index}].timeout is invalid")
+        name = item.get("name", f"validation-{index + 1}")
+        if not isinstance(name, str) or not name:
+            raise RunnerError(f"result_validation_tests[{index}].name is invalid")
+        normalized.append({"command": command, "timeout": timeout, "name": name})
+    return normalized
+
+
+def run_validation_tests(contract: object, worktree: Path, result_dir: Path) -> list[dict]:
+    records = []
+    artifact_dir = result_dir / "test-artifacts"
+    artifact_dir.mkdir(mode=0o755)
+    for index, item in enumerate(validation_commands(contract)):
+        started = dt.datetime.now(dt.timezone.utc)
+        monotonic = time.monotonic()
+        try:
+            completed = subprocess.run(
+                item["command"], cwd=worktree, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=item["timeout"],
+            )
+            output = redact_evidence(completed.stdout + completed.stderr)
+            code = completed.returncode
+        except subprocess.TimeoutExpired as exc:
+            stdout = exc.stdout.decode() if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+            stderr = exc.stderr.decode() if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+            output = redact_evidence(stdout + stderr + f"\nTimed out after {item['timeout']} seconds.\n")
+            code = 124
+        finished = dt.datetime.now(dt.timezone.utc)
+        artifact = artifact_dir / f"{index + 1:02d}-{sanitize_task_id(item['name'])}.log"
+        write_result(artifact, output)
+        bounded_output = output if len(output) <= OUTPUT_LIMIT else output[:OUTPUT_LIMIT] + f"\n... truncated ({len(output) - OUTPUT_LIMIT} characters in artifact)\n"
+        records.append({
+            "name": item["name"], "command": redact_argv(item["command"]),
+            "started_at": started.isoformat(), "finished_at": finished.isoformat(),
+            "duration_seconds": round(time.monotonic() - monotonic, 3), "exit_code": code,
+            "passed": code == 0, "bounded_output": bounded_output,
+            "output_artifact": str(artifact),
+        })
+    return records
 
 
 def make_result_manifest(*, task_id: str, started: dt.datetime, finished: dt.datetime,
@@ -126,21 +207,15 @@ def make_result_manifest(*, task_id: str, started: dt.datetime, finished: dt.dat
                          summary: str, repository: Path, baseline: str,
                          origin_main: str, branch: str, worktree: Path,
                          result_dir: Path, network_allowed: bool,
-                         diff_check: int, secret_scan: dict) -> dict:
+                         diff_check: int, secret_scan: dict, tests: list[dict],
+                         contract: object, contract_error: str | None) -> dict:
     feature_head = git(worktree, "rev-parse", "HEAD", check=False).stdout.strip()
     changed = _changed_files(worktree, baseline)
-    contract_path = worktree / "deployment-contract.json"
-    contract = None
-    contract_error = None
-    if contract_path.is_file():
-        try:
-            contract = json.loads(contract_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            contract_error = str(exc)
     clean = not git(worktree, "status", "--porcelain", check=False).stdout
-    final_status = "PASS" if exit_code == 0 and clean and diff_check == 0 and not secret_scan["matches"] else "FAIL"
+    tests_passed = bool(tests) and all(test.get("passed") is True for test in tests)
+    final_status = "PASS" if exit_code == 0 and clean and diff_check == 0 and not secret_scan["matches"] and tests_passed else "FAIL"
     return {
-        "schema_version": "1.0",
+        "schema_version": SCHEMA_VERSION,
         "task_id": task_id,
         "started_at": started.isoformat(),
         "finished_at": finished.isoformat(),
@@ -159,7 +234,7 @@ def make_result_manifest(*, task_id: str, started: dt.datetime, finished: dt.dat
         "worktree_path": str(worktree),
         "commits_created": _commits(worktree, baseline),
         "changed_files": changed,
-        "tests": [],
+        "tests": tests,
         "git_diff_check": {"exit_code": diff_check, "passed": diff_check == 0},
         "secret_scan": {"passed": not secret_scan["matches"], **secret_scan},
         "network_use": {"allowed": network_allowed, "used": None},
@@ -176,11 +251,12 @@ def make_result_summary(manifest: dict) -> str:
     eligible = (
         manifest["final_codex_status"] == "PASS"
         and manifest["deployment_contract"] is not None
-        and all(test.get("passed") for test in manifest["tests"])
+        and bool(manifest["tests"])
+        and all(test.get("passed") is True for test in manifest["tests"])
     )
     commits = "\n".join(f"- `{item['sha']}` {item['subject']}" for item in manifest["commits_created"]) or "- None"
     changed = "\n".join(f"- `{item}`" for item in manifest["changed_files"]) or "- None"
-    next_command = f"scripts/kven-integrate-task inspect {manifest['result_package_path']}"
+    next_command = f"scripts/kven-integrate-task inspect {manifest['result_package_path']} --repository /opt/kven2"
     return f"""# Codex result: {manifest['task_id']}
 
 Status: **{manifest['final_codex_status']}**
@@ -275,6 +351,9 @@ def main(argv=None, stdin=None) -> int:
     raw_task_id = None
     integrity_code = 1
     secret_scan = {"files_scanned": [], "matches": []}
+    validation_tests = []
+    deployment_contract = None
+    deployment_contract_error = None
     try:
         task = read_task(args.task_file, stdin)
         raw_task_id = task_id_from(task, args.task_file)
@@ -341,6 +420,25 @@ def main(argv=None, stdin=None) -> int:
         integrity = git(worktree, "diff", "--check", baseline, check=False)
         integrity_code = integrity.returncode
         secret_scan = obvious_secret_scan(worktree, baseline)
+        contract_path = worktree / "deployment-contract.json"
+        if contract_path.is_file():
+            try:
+                deployment_contract = json.loads(contract_path.read_text(encoding="utf-8"))
+                validation_tests = run_validation_tests(deployment_contract, worktree, result_dir)
+            except (OSError, json.JSONDecodeError, RunnerError) as exc:
+                deployment_contract_error = str(exc)
+        else:
+            deployment_contract_error = "deployment-contract.json is missing"
+        # Validation commands are part of the untrusted feature result. Recompute
+        # all Git and content checks after they finish so they cannot hide a
+        # dirty worktree or changed evidence boundary.
+        final_state = git(worktree, "status", "--short", "--branch", check=False)
+        commits = git(worktree, "log", "--oneline", f"{baseline}..HEAD", check=False)
+        names = git(worktree, "diff", "--name-status", baseline, check=False)
+        diffstat = git(worktree, "diff", "--stat", baseline, check=False)
+        integrity = git(worktree, "diff", "--check", baseline, check=False)
+        integrity_code = integrity.returncode
+        secret_scan = obvious_secret_scan(worktree, baseline)
         write_result(result_dir / "final-git-state.txt", final_state.stdout + final_state.stderr)
         write_result(result_dir / "commits.txt", commits.stdout + commits.stderr)
         write_result(result_dir / "changed-files.txt", names.stdout + names.stderr)
@@ -353,6 +451,12 @@ def main(argv=None, stdin=None) -> int:
             post_errors.append(f"diff-check={integrity.returncode}")
         if secret_scan["matches"]:
             post_errors.append(f"secret-matches={len(secret_scan['matches'])}")
+        if not validation_tests:
+            post_errors.append("required-test-evidence-empty")
+        elif not all(test["passed"] for test in validation_tests):
+            post_errors.append("validation-tests-failed")
+        if deployment_contract_error:
+            post_errors.append("deployment-contract-invalid")
         if final_state.returncode or final_state.stdout.splitlines()[1:]:
             post_errors.append("feature-worktree-not-clean")
         if not commits.stdout.strip():
@@ -393,6 +497,8 @@ def main(argv=None, stdin=None) -> int:
                         origin_main=origin_main, branch=branch, worktree=worktree,
                         result_dir=result_dir, network_allowed=args.allow_network,
                         diff_check=integrity_code, secret_scan=secret_scan,
+                        tests=validation_tests, contract=deployment_contract,
+                        contract_error=deployment_contract_error,
                     )
                     _json_result(result_dir / "result-manifest.json", manifest)
                     write_result(result_dir / "result-summary.md", make_result_summary(manifest))
