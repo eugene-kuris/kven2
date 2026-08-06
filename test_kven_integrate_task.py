@@ -211,6 +211,10 @@ class RepositoryFixture(unittest.TestCase):
         changed_scope["readiness_checks"] = [{"command": [sys.executable, "-c", "pass"]}]
         changed_scope["fatal_log_checks"] = [{"command": [sys.executable, "-c", "pass"]}]
         changed_scope["backups"]["configuration"] = [{"path": "/tmp/fixture", "services": []}]
+        changed_scope["migration_checks"] = [{
+            "database": "/tmp/fixture.sqlite", "command": [sys.executable, "-c", "pass"],
+            "application_smoke_command": [sys.executable, "-c", "pass"],
+        }]
         mutations.append(changed_scope)
         for candidate in mutations:
             with self.subTest(keys=sorted(candidate)):
@@ -731,6 +735,22 @@ class RepositoryFixture(unittest.TestCase):
         (run_dir / "integration-manifest.json").write_text(json.dumps(state), encoding="utf-8")
         with self.assertRaisesRegex(integration.IntegrationError, "service_manager must be an argv array"):
             integration.load_run(str(run_dir))
+
+    def test_persisted_contract_mutation_is_refused_before_finalize_and_rollback(self):
+        self.assertEqual(self.stage_cli().returncode, 0)
+        run_dir = self.run_dir()
+        original = json.loads((run_dir / "integration-manifest.json").read_text())
+        mutated = copy.deepcopy(original)
+        mutated["contract"]["acceptance_checklist"] = ["Package-only mutation"]
+        mutated["deployment_contract_sha256"] = integration.canonical_contract_sha256(
+            integration.validate_contract(mutated["contract"], mutated)
+        )
+        args = type("Args", (), {"repository": str(self.repo), "accept": "PASS", "notes": ""})()
+        with integration.repository_lock(self.repo) as marker:
+            with self.assertRaisesRegex(integration.IntegrationError, "differs from exact committed contract"):
+                integration.finalize_run(run_dir, copy.deepcopy(mutated), args, marker)
+            with self.assertRaisesRegex(integration.IntegrationError, "differs from exact committed contract"):
+                integration.rollback_state(run_dir, copy.deepcopy(mutated), "fixture", marker=marker)
 
     def test_concurrent_active_stage_is_refused(self):
         marker = integration.git_common_dir(self.repo) / "kven-integration-active.json"

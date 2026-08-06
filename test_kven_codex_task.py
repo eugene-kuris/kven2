@@ -176,6 +176,7 @@ if os.environ.get('CONTRACT_LITERAL'): contract['result_validation_tests'][0]['c
 (work/'deployment-contract.json').write_text(json.dumps(contract))
 subprocess.run(['git','add','agent.txt','deployment-contract.json'],cwd=work,check=True)
 subprocess.run(['git','-c','user.name=Test','-c','user.email=test@example.invalid','commit','-m','agent work'],cwd=work,check=True,stdout=subprocess.DEVNULL)
+if os.environ.get('DIRTY_CONTRACT_AFTER_COMMIT'): (work/'deployment-contract.json').write_text(json.dumps(contract)+' ')
 out.write_text('final report --'+'token '+os.environ['CONTRACT_LITERAL'] if os.environ.get('CONTRACT_LITERAL') else 'final report')
 model=os.environ.get('ACTUAL_MODEL') or (args[args.index('--model')+1] if '--model' in args else 'default-fixture-model')
 print('fake stdout'+((' --'+'token '+os.environ['CONTRACT_LITERAL']) if os.environ.get('CONTRACT_LITERAL') else ''))
@@ -240,6 +241,16 @@ raise SystemExit(int(os.environ.get('FAKE_CODEX_EXIT','0')))
         self.assertEqual(len(list(self.worktrees.glob("demo-*"))), 1)
         prompt = next(self.worktrees.glob("demo-*")) / "agent.txt"
         self.assertIn("Network access is prohibited", prompt.read_text(encoding="utf-8"))
+
+    def test_runner_refuses_worktree_contract_different_from_committed_blob(self):
+        env = self.env.copy()
+        env["DIRTY_CONTRACT_AFTER_COMMIT"] = "1"
+        result = self.invoke(env=env)
+        self.assertNotEqual(result.returncode, 0)
+        package = next(self.results.glob("demo-*"))
+        manifest = json.loads((package / "result-manifest.json").read_text())
+        self.assertEqual(manifest["final_codex_status"], "FAIL")
+        self.assertIn("differs from the exact committed blob", manifest["deployment_contract_error"])
 
     def test_dirty_main_rejected(self):
         (self.repo / "dirty.txt").write_text("dirty", encoding="utf-8")
