@@ -17,12 +17,17 @@ import sys
 import time
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from kven_evidence_security import redact as redact_evidence  # noqa: E402
+from kven_evidence_security import scan_git_range, scan_tree  # noqa: E402
+
 DEFAULT_REPOSITORY = Path("/opt/kven2")
 DEFAULT_RESULT_ROOT = Path("/home/eugene/kven-codex-results")
 DEFAULT_WORKTREE_ROOT = Path("/opt/kven2-worktrees")
 ENV_REPOSITORY = "KVEN_CODEX_TEST_REPOSITORY"
 ENV_RESULT_ROOT = "KVEN_CODEX_TEST_RESULT_ROOT"
 ENV_WORKTREE_ROOT = "KVEN_CODEX_TEST_WORKTREE_ROOT"
+ENV_SCREEN_LOG = "KVEN_DURABLE_SCREEN_LOG"
 SECRET_PATTERN = re.compile(
     r"(?i)(?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret)"
     r"\s*[:=]\s*['\"]?(?!example|placeholder|redacted|none)[A-Za-z0-9_./+\-=]{12,}"
@@ -153,16 +158,30 @@ def file_sha256(path: Path) -> str:
 
 
 def parse_runtime_metadata(stdout: str, stderr: str) -> dict[str, Any]:
-    stream = stdout + "\n" + stderr
-    model = re.search(r"(?im)^model:\s*([^\s]+)\s*$", stream)
-    reasoning = re.search(r"(?im)^reasoning effort:\s*([^\s]+)\s*$", stream)
-    tokens = re.search(r"(?im)^tokens? used:\s*([0-9][0-9,]*)\s*$", stream)
-    if not tokens:
-        tokens = re.search(r"(?im)^tokens? used\s*\n\s*([0-9][0-9,]*)\s*$", stream)
+    """Parse only the delimited stderr startup header and terminal usage record."""
+    lines = stderr.splitlines()
+    if not lines or not lines[0].startswith("OpenAI Codex v"):
+        raise RunnerError("Codex startup header is missing")
+    separators = [index for index, line in enumerate(lines) if line == "--------"]
+    if len(separators) < 2 or separators[0] != 1 or separators[1] <= separators[0] + 1:
+        raise RunnerError("Codex startup header delimiters are missing")
+    header = lines[separators[0] + 1:separators[1]]
+
+    def unique_field(label: str, required: bool = True) -> str | None:
+        values = [line.split(":", 1)[1].strip() for line in header if line.startswith(label + ":")]
+        if not values and required:
+            raise RunnerError(f"Codex startup header field {label} is missing")
+        if len(values) != 1 or (values and not values[0]):
+            raise RunnerError(f"Codex startup header field {label} is duplicated or conflicting")
+        return values[0] if values else None
+
+    terminal = re.search(r"(?:^|\n)tokens used\r?\n([0-9][0-9,]*)\r?\n?\Z", stderr)
     return {
-        "actual_model": model.group(1) if model else None,
-        "actual_reasoning_effort": reasoning.group(1) if reasoning else None,
-        "token_usage": int(tokens.group(1).replace(",", "")) if tokens else None,
+        "actual_model": unique_field("model"),
+        "actual_provider": unique_field("provider"),
+        "actual_reasoning_effort": unique_field("reasoning effort"),
+        "session_id": unique_field("session id"),
+        "token_usage": int(terminal.group(1).replace(",", "")) if terminal else None,
     }
 
 
@@ -211,13 +230,6 @@ def validate_contract_secret_safety(contract: object) -> None:
     walk(contract)
 
 
-def redact_evidence(value: str) -> str:
-    value = EVIDENCE_PRIVATE_KEY_PATTERN.sub("[REDACTED PRIVATE KEY]", value)
-    value = EVIDENCE_OPTION_PATTERN.sub(lambda match: f"{match.group(1)}[REDACTED]", value)
-    value = EVIDENCE_BEARER_PATTERN.sub(lambda match: f"{match.group(1)}[REDACTED]", value)
-    return EVIDENCE_SECRET_PATTERN.sub(lambda match: f"{match.group(1)}{match.group(2)}[REDACTED]", value)
-
-
 def redact_argv(command: list[str]) -> list[str]:
     redacted = []
     hide_next = False
@@ -256,6 +268,79 @@ def validation_commands(contract: object) -> list[dict]:
             raise RunnerError(f"result_validation_tests[{index}].name is invalid")
         normalized.append({"command": command, "timeout": timeout, "name": name})
     return normalized
+
+
+def canonical_contract(contract: object) -> tuple[dict, str]:
+    """Strictly normalize schema 2.0 and hash compact sorted UTF-8 JSON."""
+    if not isinstance(contract, dict):
+        raise RunnerError("deployment contract must be an object")
+    required = {
+        "schema_version", "expected_baseline", "feature_branch", "allowed_paths", "services",
+        "backups", "migration_checks", "result_validation_tests", "pre_merge_tests",
+        "post_merge_tests", "readiness_checks", "fatal_log_checks", "acceptance_checklist", "rollback",
+    }
+    if set(contract) - required - {"deployment_steps"} or required - set(contract):
+        raise RunnerError("deployment contract fields do not match schema 2.0")
+    if contract["schema_version"] != SCHEMA_VERSION:
+        raise RunnerError("unsupported deployment contract schema")
+    if not isinstance(contract["expected_baseline"], str) or not re.fullmatch(r"[0-9a-f]{40}", contract["expected_baseline"]):
+        raise RunnerError("deployment contract baseline is malformed")
+    if not isinstance(contract["feature_branch"], str) or not contract["feature_branch"]:
+        raise RunnerError("deployment contract feature branch is malformed")
+    if not all(isinstance(contract[field], list) for field in (
+        "allowed_paths", "services", "migration_checks", "result_validation_tests", "pre_merge_tests",
+        "post_merge_tests", "readiness_checks", "fatal_log_checks", "acceptance_checklist",
+    )):
+        raise RunnerError("deployment contract array field is malformed")
+    if not isinstance(contract["backups"], dict) or set(contract["backups"]) != {"sqlite", "configuration"}:
+        raise RunnerError("deployment contract backups are malformed")
+    if (not contract["allowed_paths"] or not all(
+        isinstance(value, str) and value and not Path(value).is_absolute() for value in contract["allowed_paths"]
+    )):
+        raise RunnerError("deployment contract allowed paths are malformed")
+    if len(contract["services"]) != len(set(contract["services"])) or not all(value in SERVICES for value in contract["services"]):
+        raise RunnerError("deployment contract services are malformed")
+    for kind in ("sqlite", "configuration"):
+        if not isinstance(contract["backups"][kind], list):
+            raise RunnerError("deployment contract backup list is malformed")
+        for item in contract["backups"][kind]:
+            if (not isinstance(item, dict) or set(item) != {"path", "services"}
+                    or not isinstance(item["path"], str) or not Path(item["path"]).is_absolute()
+                    or not isinstance(item["services"], list)
+                    or not all(service in contract["services"] for service in item["services"])):
+                raise RunnerError("deployment contract backup item is malformed")
+    if not contract["acceptance_checklist"] or not all(isinstance(value, str) and value for value in contract["acceptance_checklist"]):
+        raise RunnerError("deployment contract acceptance checklist is malformed")
+    for check in contract["migration_checks"]:
+        if not isinstance(check, dict) or not {"database", "command", "application_smoke_command"} <= set(check):
+            raise RunnerError("deployment contract migration check is malformed")
+        if not isinstance(check["database"], str) or not Path(check["database"]).is_absolute():
+            raise RunnerError("deployment contract migration database is malformed")
+        for key in ("command", "application_smoke_command"):
+            if not isinstance(check[key], list) or not check[key] or not all(isinstance(value, str) and value for value in check[key]):
+                raise RunnerError("deployment contract migration command is malformed")
+    if not isinstance(contract["rollback"], dict) or set(contract["rollback"]) != {"restore_git", "restore_backups", "verify_readiness"}:
+        raise RunnerError("deployment contract rollback policy is malformed")
+    if not all(value is True for value in contract["rollback"].values()):
+        raise RunnerError("deployment contract rollback safety is disabled")
+    normalized = json.loads(json.dumps(contract))
+    for field in ("result_validation_tests", "pre_merge_tests", "post_merge_tests", "readiness_checks", "fatal_log_checks", "deployment_steps"):
+        items = normalized.get(field, [])
+        if not isinstance(items, list) or (field in {"result_validation_tests", "pre_merge_tests", "post_merge_tests"} and not items):
+            raise RunnerError(f"deployment contract {field} is malformed")
+        for index, item in enumerate(items):
+            if not isinstance(item, dict) or set(item) - {"command", "timeout", "name"}:
+                raise RunnerError(f"deployment contract {field}[{index}] is malformed")
+            command = item.get("command")
+            if not isinstance(command, list) or not command or not all(isinstance(value, str) and value for value in command):
+                raise RunnerError(f"deployment contract {field}[{index}].command is malformed")
+            item.setdefault("timeout", 300)
+            item.setdefault("name", f"{field}-{index + 1}")
+            if type(item["timeout"]) is not int or not 1 <= item["timeout"] <= 7200 or not isinstance(item["name"], str) or not item["name"]:
+                raise RunnerError(f"deployment contract {field}[{index}] metadata is malformed")
+    validate_contract_secret_safety(normalized)
+    encoded = json.dumps(normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return normalized, hashlib.sha256(encoded).hexdigest()
 
 
 def run_validation_tests(contract: object, worktree: Path, result_dir: Path) -> list[dict]:
@@ -305,18 +390,22 @@ def run_validation_tests(contract: object, worktree: Path, result_dir: Path) -> 
 
 def make_result_manifest(*, task_id: str, started: dt.datetime, finished: dt.datetime,
                          duration: float, requested_model: str | None, actual_model: str | None,
-                         reasoning_effort: str | None, token_usage: int | None, exit_code: int,
+                         actual_provider: str | None, reasoning_effort: str | None,
+                         session_id: str | None, token_usage: int | None, exit_code: int,
                          summary: str, repository: Path, baseline: str,
                          origin_main: str, branch: str, worktree: Path,
                          result_dir: Path, network_allowed: bool,
                          diff_check: int, secret_scan: dict, tests: list[dict],
                          contract: object, contract_error: str | None,
+                         contract_sha256: str | None, evidence_secret_scan: dict,
                          feature_head: str) -> dict:
     changed = git(worktree, "diff", "--name-only", f"{baseline}..{feature_head}", check=False).stdout.splitlines()
     clean = repository_state(worktree)["status"] == "" and repository_state(worktree)["head"] == feature_head
     tests_passed = bool(tests) and all(test.get("passed") is True for test in tests)
     model_matches = actual_model is not None and (requested_model is None or requested_model == actual_model)
     final_status = "PASS" if exit_code == 0 and clean and diff_check == 0 and not secret_scan["matches"] and tests_passed and model_matches and reasoning_effort is not None else "FAIL"
+    sty = os.environ.get("STY")
+    screen_name = sty.split(".", 1)[1] if sty and "." in sty else sty
     return {
         "schema_version": SCHEMA_VERSION,
         "task_id": task_id,
@@ -325,7 +414,9 @@ def make_result_manifest(*, task_id: str, started: dt.datetime, finished: dt.dat
         "codex_runtime_seconds": round(duration, 3),
         "requested_model": requested_model,
         "actual_runtime_model": actual_model,
+        "actual_runtime_provider": actual_provider,
         "actual_reasoning_effort": reasoning_effort,
+        "runtime_session_id": session_id,
         "codex_model": actual_model,
         "token_usage": token_usage,
         "exit_code": exit_code,
@@ -347,6 +438,7 @@ def make_result_manifest(*, task_id: str, started: dt.datetime, finished: dt.dat
         "tests": tests,
         "git_diff_check": {"exit_code": diff_check, "passed": diff_check == 0},
         "secret_scan": {"passed": not secret_scan["matches"], **secret_scan},
+        "evidence_secret_scan": evidence_secret_scan,
         "network_use": {
             "allowed": network_allowed,
             "used": None if network_allowed else False,
@@ -358,11 +450,22 @@ def make_result_manifest(*, task_id: str, started: dt.datetime, finished: dt.dat
             "description": "generated by the runner after Codex execution",
         },
         "deployment_contract": contract,
+        "deployment_contract_path": "deployment-contract.json",
+        "deployment_contract_sha256": contract_sha256,
         "deployment_contract_error": contract_error,
         "requested_deployment_services": (contract or {}).get("services", []),
         "requested_backup_targets": (contract or {}).get("backups", {}),
         "requested_migration_checks": (contract or {}).get("migration_checks", []),
         "result_package_path": str(result_dir),
+        "execution_methodology": {
+            "execution_session_manager": "GNU screen" if sty else None,
+            "screen_session_name": screen_name,
+            "reattach_command": f"screen -r {screen_name}" if screen_name else None,
+            "durable_screen_log": os.environ.get(ENV_SCREEN_LOG),
+            "runner_path": str(Path(__file__).resolve()),
+            "result_package_durable_path": str(result_dir),
+            "independent_of_initiating_ssh": True if sty else None,
+        },
     }
 
 
@@ -382,6 +485,8 @@ Status: **{manifest['final_codex_status']}**
 Eligible for integration: **{'yes' if eligible else 'no'}**
 Actual runtime model: **{manifest.get('actual_runtime_model') or 'unavailable'}**
 Actual reasoning effort: **{manifest.get('actual_reasoning_effort') or 'unavailable'}**
+Bound deployment contract: **{manifest.get('deployment_contract_path') or 'unavailable'}**
+Contract SHA-256: **{manifest.get('deployment_contract_sha256') or 'unavailable'}**
 
 ## Commits
 
@@ -408,22 +513,14 @@ Actual reasoning effort: **{manifest.get('actual_reasoning_effort') or 'unavaila
 
 
 def obvious_secret_scan(worktree: Path, baseline: str, feature_head: str | None = None) -> dict:
-    target = feature_head or "HEAD"
-    changed = git(worktree, "diff", "--name-only", f"{baseline}..{target}").stdout.splitlines()
-    changed = sorted(set(changed))
-    matches = []
-    for relative in changed:
-        path = worktree / relative
-        if not path.is_file() or path.is_symlink():
-            continue
-        try:
-            text = path.read_text(encoding="utf-8")
-        except (UnicodeDecodeError, OSError):
-            continue
-        for number, line in enumerate(text.splitlines(), 1):
-            if SECRET_PATTERN.search(line):
-                matches.append(f"{relative}:{number}")
-    return {"files_scanned": changed, "matches": matches}
+    try:
+        return scan_git_range(worktree, baseline, feature_head or "HEAD")
+    except RuntimeError as exc:
+        return {
+            "passed": False, "baseline": baseline, "feature_head": feature_head or "HEAD",
+            "files_scanned": [],
+            "matches": [{"file": "unknown", "line": None, "category": str(exc)}],
+        }
 
 
 def service_states() -> dict:
@@ -475,9 +572,14 @@ def main(argv=None, stdin=None) -> int:
     validation_tests = []
     deployment_contract = None
     deployment_contract_error = None
+    deployment_contract_sha256 = None
+    evidence_secret_scan = {"passed": True, "files_scanned": [], "matches": []}
     feature_head_before_validation = None
     validation_repository_state = None
-    runtime_metadata = {"actual_model": None, "actual_reasoning_effort": None, "token_usage": None}
+    runtime_metadata = {
+        "actual_model": None, "actual_provider": None, "actual_reasoning_effort": None,
+        "session_id": None, "token_usage": None,
+    }
     try:
         task = read_task(args.task_file, stdin)
         raw_task_id = task_id_from(task, args.task_file)
@@ -549,14 +651,23 @@ def main(argv=None, stdin=None) -> int:
         integrity_code = integrity.returncode
         secret_scan = obvious_secret_scan(worktree, baseline, feature_head_before_validation)
         contract_path = worktree / "deployment-contract.json"
-        if contract_path.is_file():
+        if contract_path.is_file() and not contract_path.is_symlink():
             try:
-                candidate_contract = json.loads(contract_path.read_text(encoding="utf-8"))
-                validate_contract_secret_safety(candidate_contract)
-                validation_tests = run_validation_tests(candidate_contract, worktree, result_dir)
-                deployment_contract = candidate_contract
+                worktree_blob = contract_path.read_bytes()
+                committed = git(
+                    worktree, "show", f"{feature_head_before_validation}:deployment-contract.json",
+                    check=False,
+                )
+                if committed.returncode or committed.stdout.encode("utf-8") != worktree_blob:
+                    raise RunnerError("deployment contract differs from the exact committed blob")
+                candidate_contract = json.loads(worktree_blob.decode("utf-8"))
+                deployment_contract, deployment_contract_sha256 = canonical_contract(candidate_contract)
+                if deployment_contract["expected_baseline"] != baseline or deployment_contract["feature_branch"] != branch:
+                    raise RunnerError("deployment contract baseline or feature branch is incorrect")
+                validation_tests = run_validation_tests(deployment_contract, worktree, result_dir)
             except (OSError, json.JSONDecodeError, RunnerError) as exc:
                 deployment_contract = None
+                deployment_contract_sha256 = None
                 deployment_contract_error = redact_evidence(str(exc))
         else:
             deployment_contract_error = "deployment-contract.json is missing"
@@ -633,7 +744,9 @@ def main(argv=None, stdin=None) -> int:
                         task_id=raw_task_id, started=started, finished=finished,
                         duration=duration, requested_model=args.model,
                         actual_model=runtime_metadata["actual_model"],
+                        actual_provider=runtime_metadata["actual_provider"],
                         reasoning_effort=runtime_metadata["actual_reasoning_effort"],
+                        session_id=runtime_metadata["session_id"],
                         token_usage=runtime_metadata["token_usage"], exit_code=exit_code,
                         summary=summary, repository=repository, baseline=baseline,
                         origin_main=origin_main, branch=branch, worktree=worktree,
@@ -641,10 +754,23 @@ def main(argv=None, stdin=None) -> int:
                         diff_check=integrity_code, secret_scan=secret_scan,
                         tests=validation_tests, contract=deployment_contract,
                         contract_error=deployment_contract_error,
+                        contract_sha256=deployment_contract_sha256,
+                        evidence_secret_scan=evidence_secret_scan,
                         feature_head=feature_head_before_validation or git(worktree, "rev-parse", "HEAD", check=False).stdout.strip(),
                     )
                     _json_result(result_dir / "result-manifest.json", manifest)
                     write_result(result_dir / "result-summary.md", make_result_summary(manifest))
+                    evidence_secret_scan = scan_tree(result_dir)
+                    manifest["evidence_secret_scan"] = evidence_secret_scan
+                    if not evidence_secret_scan["passed"]:
+                        manifest["final_codex_status"] = "FAIL"
+                    _json_result(result_dir / "result-manifest.json", manifest)
+                    write_result(result_dir / "result-summary.md", make_result_summary(manifest))
+                    evidence_secret_scan = scan_tree(result_dir)
+                    if not evidence_secret_scan["passed"]:
+                        manifest["evidence_secret_scan"] = evidence_secret_scan
+                        manifest["final_codex_status"] = "FAIL"
+                        _json_result(result_dir / "result-manifest.json", manifest)
             except OSError as exc:
                 print(f"error: result-package failure: {exc}", file=sys.stderr)
                 exit_code = 1

@@ -96,27 +96,32 @@ class RepositoryFixture(unittest.TestCase):
         self.base = cmd("git", "-C", str(self.repo), "rev-parse", "HEAD").stdout.strip()
         cmd("git", "-C", str(self.repo), "worktree", "add", "-b", "feature", str(self.feature_worktree), self.base)
         (self.feature_worktree / "feature.txt").write_text("feature\n", encoding="utf-8")
-        cmd("git", "-C", str(self.feature_worktree), "add", "feature.txt")
-        cmd("git", "-C", str(self.feature_worktree), "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "feature")
-        self.feature = cmd("git", "-C", str(self.feature_worktree), "rev-parse", "HEAD").stdout.strip()
-        self.package = self.root / "package"
-        (self.package / "test-artifacts").mkdir(parents=True)
-        (self.package / "test-artifacts" / "synthetic.log").write_bytes(b"")
         check = {"name": "synthetic", "command": [sys.executable, "-c", "pass"], "timeout": 30}
         self.contract = {
             "schema_version": "2.0", "expected_baseline": self.base, "feature_branch": "feature",
-            "allowed_paths": ["feature.txt"], "services": [],
+            "allowed_paths": ["deployment-contract.json", "feature.txt"], "services": [],
             "backups": {"sqlite": [], "configuration": []}, "migration_checks": [],
             "result_validation_tests": [copy.deepcopy(check)], "pre_merge_tests": [copy.deepcopy(check)],
             "post_merge_tests": [copy.deepcopy(check)], "readiness_checks": [], "fatal_log_checks": [],
             "acceptance_checklist": ["Observe synthetic behavior"],
             "rollback": {"restore_git": True, "restore_backups": True, "verify_readiness": True},
         }
+        (self.feature_worktree / "deployment-contract.json").write_text(json.dumps(self.contract), encoding="utf-8")
+        cmd("git", "-C", str(self.feature_worktree), "add", "feature.txt", "deployment-contract.json")
+        cmd("git", "-C", str(self.feature_worktree), "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "feature")
+        self.feature = cmd("git", "-C", str(self.feature_worktree), "rev-parse", "HEAD").stdout.strip()
+        self.package = self.root / "package"
+        (self.package / "test-artifacts").mkdir(parents=True)
+        (self.package / "test-artifacts" / "synthetic.log").write_bytes(b"")
+        contract_hash = integration.canonical_contract_sha256(integration.validate_contract(self.contract, {
+            "baseline_head": self.base, "feature_branch": "feature",
+        }))
         self.manifest = {
             "schema_version": "2.0", "task_id": "TEST", "started_at": "2026-01-01T00:00:00+00:00",
             "finished_at": "2026-01-01T00:00:01+00:00", "codex_runtime_seconds": 1.0,
             "requested_model": None, "actual_runtime_model": "fixture-model",
-            "actual_reasoning_effort": "high", "token_usage": None,
+            "actual_runtime_provider": "fixture-provider", "actual_reasoning_effort": "high",
+            "runtime_session_id": "fixture-session", "token_usage": None,
             "network_use": {"allowed": False, "used": False, "observation": "network prohibited"},
             "evidence_provenance": {"method": "bootstrap_postprocessing", "runner_contained_manifest_features": False, "description": "fixture"},
             "exit_code": 0, "final_codex_status": "PASS", "repository_path": str(self.repo),
@@ -124,9 +129,11 @@ class RepositoryFixture(unittest.TestCase):
             "feature_branch": "feature", "feature_head": self.feature,
             "worktree_path": str(self.feature_worktree),
             "commits_created": [{"sha": self.feature, "subject": "feature"}],
-            "changed_files": ["feature.txt"], "tests": [record()],
+            "changed_files": ["deployment-contract.json", "feature.txt"], "tests": [record()],
             "git_diff_check": {"passed": True}, "secret_scan": {"passed": True},
-            "deployment_contract": self.contract,
+            "evidence_secret_scan": {"passed": True},
+            "deployment_contract": self.contract, "deployment_contract_path": "deployment-contract.json",
+            "deployment_contract_sha256": contract_hash,
         }
         self.path = self.package / "result-manifest.json"
         self.results = self.root / "results"
@@ -139,11 +146,42 @@ class RepositoryFixture(unittest.TestCase):
     def write(self):
         self.path.write_text(json.dumps(self.manifest), encoding="utf-8")
 
+    def bind_contract(self):
+        """Amend the synthetic feature so executable contract changes are authoritative."""
+        (self.feature_worktree / "deployment-contract.json").write_text(json.dumps(self.contract), encoding="utf-8")
+        cmd("git", "-C", str(self.feature_worktree), "add", "deployment-contract.json")
+        result = cmd(
+            "git", "-C", str(self.feature_worktree), "-c", "user.name=Test",
+            "-c", "user.email=test@example.invalid", "commit", "--amend", "--no-edit",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.feature = cmd("git", "-C", str(self.feature_worktree), "rev-parse", "HEAD").stdout.strip()
+        self.manifest["feature_head"] = self.feature
+        self.manifest["commits_created"] = [{"sha": self.feature, "subject": "feature"}]
+        self.manifest["changed_files"] = integration.git_changed_files(self.repo, self.base, self.feature)
+        normalized = integration.validate_contract(self.contract, self.manifest)
+        self.manifest["deployment_contract_sha256"] = integration.canonical_contract_sha256(normalized)
+        self.write()
+
+    def amend_feature_content(self, content: bytes):
+        (self.feature_worktree / "feature.txt").write_bytes(content)
+        cmd("git", "-C", str(self.feature_worktree), "add", "feature.txt")
+        result = cmd(
+            "git", "-C", str(self.feature_worktree), "-c", "user.name=Test",
+            "-c", "user.email=test@example.invalid", "commit", "--amend", "--no-edit",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.feature = cmd("git", "-C", str(self.feature_worktree), "rev-parse", "HEAD").stdout.strip()
+        self.manifest["feature_head"] = self.feature
+        self.manifest["commits_created"] = [{"sha": self.feature, "subject": "feature"}]
+        self.manifest["changed_files"] = integration.git_changed_files(self.repo, self.base, self.feature)
+        self.write()
+
     def inspect(self):
         return integration.inspect_manifest(self.manifest, manifest_path=self.path, expected_repository=self.repo)
 
     def stage_cli(self, *extra):
-        self.write()
+        self.bind_contract()
         return cmd(
             sys.executable, str(SCRIPT), "stage", str(self.path), "--repository", str(self.repo),
             "--result-root", str(self.results), "--backup-root", str(self.backups), *extra,
@@ -157,7 +195,79 @@ class RepositoryFixture(unittest.TestCase):
         self.assertEqual(loaded["task_id"], "TEST")
         report = self.inspect()
         self.assertTrue(report["eligible"])
-        self.assertEqual(report["actual_changed_files"], ["feature.txt"])
+        self.assertEqual(report["actual_changed_files"], ["deployment-contract.json", "feature.txt"])
+        self.assertEqual(report["deployment_contract_sha256"], self.manifest["deployment_contract_sha256"])
+
+    def test_package_only_contract_mutations_and_hash_mismatch_are_rejected(self):
+        mutations = []
+        injected = copy.deepcopy(self.contract)
+        injected["deployment_steps"] = [{"name": "injected", "command": [sys.executable, "-c", "pass"], "timeout": 30}]
+        mutations.append(injected)
+        changed_test = copy.deepcopy(self.contract)
+        changed_test["post_merge_tests"][0]["command"] = [sys.executable, "-c", "print('changed')"]
+        mutations.append(changed_test)
+        changed_scope = copy.deepcopy(self.contract)
+        changed_scope["services"] = ["kven2-main.service"]
+        changed_scope["readiness_checks"] = [{"command": [sys.executable, "-c", "pass"]}]
+        changed_scope["fatal_log_checks"] = [{"command": [sys.executable, "-c", "pass"]}]
+        changed_scope["backups"]["configuration"] = [{"path": "/tmp/fixture", "services": []}]
+        mutations.append(changed_scope)
+        for candidate in mutations:
+            with self.subTest(keys=sorted(candidate)):
+                self.manifest["deployment_contract"] = candidate
+                self.manifest["deployment_contract_sha256"] = integration.canonical_contract_sha256(
+                    integration.validate_contract(candidate, self.manifest)
+                )
+                with self.assertRaisesRegex(integration.IntegrationError, "differs from exact committed contract"):
+                    self.inspect()
+        self.manifest["deployment_contract"] = self.contract
+        self.manifest["deployment_contract_sha256"] = "0" * 64
+        with self.assertRaisesRegex(integration.IntegrationError, "SHA-256 binding mismatch"):
+            self.inspect()
+
+    def test_committed_contract_missing_and_malformed_are_rejected(self):
+        (self.feature_worktree / "deployment-contract.json").unlink()
+        cmd("git", "-C", str(self.feature_worktree), "add", "deployment-contract.json")
+        cmd("git", "-C", str(self.feature_worktree), "commit", "--amend", "--no-edit")
+        self.feature = cmd("git", "-C", str(self.feature_worktree), "rev-parse", "HEAD").stdout.strip()
+        self.manifest["feature_head"] = self.feature
+        self.manifest["commits_created"] = [{"sha": self.feature, "subject": "feature"}]
+        self.manifest["changed_files"] = integration.git_changed_files(self.repo, self.base, self.feature)
+        with self.assertRaisesRegex(integration.IntegrationError, "committed deployment contract is missing"):
+            self.inspect()
+
+        (self.feature_worktree / "deployment-contract.json").write_text("{", encoding="utf-8")
+        cmd("git", "-C", str(self.feature_worktree), "add", "deployment-contract.json")
+        cmd("git", "-C", str(self.feature_worktree), "commit", "--amend", "--no-edit")
+        self.feature = cmd("git", "-C", str(self.feature_worktree), "rev-parse", "HEAD").stdout.strip()
+        self.manifest["feature_head"] = self.feature
+        self.manifest["commits_created"] = [{"sha": self.feature, "subject": "feature"}]
+        self.manifest["changed_files"] = integration.git_changed_files(self.repo, self.base, self.feature)
+        with self.assertRaisesRegex(integration.IntegrationError, "committed deployment contract is malformed"):
+            self.inspect()
+
+    def test_exact_changed_content_scanner_rejects_all_credential_forms_without_values(self):
+        value = "runtime-" + "private-material-123"
+        forms = [
+            "tool --" + "token " + value,
+            "api_" + "key=" + value,
+            "Author" + "ization: " + value,
+            "Bear" + "er " + value,
+            "-----BEGIN " + "PRIVATE KEY-----",
+        ]
+        for form in forms:
+            with self.subTest(form=form.split()[0]):
+                self.amend_feature_content((form + "\n").encode())
+                with self.assertRaises(integration.IntegrationError) as raised:
+                    self.inspect()
+                self.assertIn("offline secret scan failed", str(raised.exception))
+                self.assertNotIn(value, str(raised.exception))
+
+    def test_changed_binary_is_rejected_as_unscannable(self):
+        value = ("runtime-" + "private-material-456").encode()
+        self.amend_feature_content(b"\x00" + ("--" + "token ").encode() + value)
+        with self.assertRaisesRegex(integration.IntegrationError, "changed_binary_unscannable"):
+            self.inspect()
 
     def test_missing_malformed_and_strict_type_rejection(self):
         with self.assertRaises(integration.IntegrationError):
@@ -228,6 +338,7 @@ class RepositoryFixture(unittest.TestCase):
         second_content = b"second\n"
         (self.package / "test-artifacts" / "second.log").write_bytes(second_content)
         self.contract["result_validation_tests"].append({"name": "second", "command": second_command, "timeout": 30})
+        self.bind_contract()
         second = record("second", command=second_command, artifact="test-artifacts/second.log", content=second_content)
         first = record()
         self.manifest["tests"] = [first]
@@ -275,8 +386,9 @@ class RepositoryFixture(unittest.TestCase):
         self.manifest["changed_files"] = []
         with self.assertRaisesRegex(integration.IntegrationError, "changed_files mismatch"):
             self.inspect()
-        self.manifest["changed_files"] = ["feature.txt"]
+        self.manifest["changed_files"] = ["deployment-contract.json", "feature.txt"]
         self.contract["allowed_paths"] = ["different.txt"]
+        self.bind_contract()
         with self.assertRaisesRegex(integration.IntegrationError, "outside contract"):
             self.inspect()
 
@@ -370,6 +482,7 @@ class RepositoryFixture(unittest.TestCase):
         self.assertEqual(integration.repository_state(self.repo)["head"], self.base)
 
     def _stage_args(self, service_manager=None, timeout=1):
+        self.bind_contract()
         return type("Args", (), {
             "repository": str(self.repo), "result_root": str(self.results), "backup_root": str(self.backups),
             "service_manager": service_manager or ["true"], "service_timeout": timeout,
@@ -454,6 +567,58 @@ class RepositoryFixture(unittest.TestCase):
         first = cmd("git", "--git-dir", str(self.remote), "rev-parse", "main").stdout.strip()
         self.assertEqual(cmd(*command).returncode, 0)
         self.assertEqual(cmd("git", "--git-dir", str(self.remote), "rev-parse", "main").stdout.strip(), first)
+
+    def interrupted_finalize_fixture(self):
+        self.assertEqual(self.stage_cli().returncode, 0)
+        run_dir = self.run_dir()
+        state = json.loads((run_dir / "integration-manifest.json").read_text())
+        integration.persist(run_dir, state, "FINALIZING", "FINALIZING")
+        pushed = cmd("git", "-C", str(self.repo), "push", "origin", f"{state['staged_head']}:refs/heads/main")
+        self.assertEqual(pushed.returncode, 0, pushed.stderr)
+        return run_dir, state
+
+    def test_interrupted_finalize_dirty_tracked_requires_recovery(self):
+        run_dir, state = self.interrupted_finalize_fixture()
+        (self.repo / "base.txt").write_text("operator drift\n", encoding="utf-8")
+        args = type("Args", (), {"repository": str(self.repo), "accept": "PASS", "notes": ""})()
+        with integration.repository_lock(self.repo) as marker:
+            with self.assertRaisesRegex(integration.IntegrationError, "recovery is required"):
+                integration.finalize_run(run_dir, state, args, marker)
+        persisted = json.loads((run_dir / "integration-manifest.json").read_text())
+        self.assertEqual(persisted["status"], "FINALIZE_RECOVERY_REQUIRED")
+        self.assertEqual((self.repo / "base.txt").read_text(), "operator drift\n")
+
+    def test_interrupted_finalize_untracked_requires_recovery(self):
+        run_dir, state = self.interrupted_finalize_fixture()
+        untracked = self.repo / "operator-untracked.txt"
+        untracked.write_text("preserve\n", encoding="utf-8")
+        args = type("Args", (), {"repository": str(self.repo), "accept": "PASS", "notes": ""})()
+        with integration.repository_lock(self.repo) as marker:
+            with self.assertRaisesRegex(integration.IntegrationError, "recovery is required"):
+                integration.finalize_run(run_dir, state, args, marker)
+        self.assertTrue(untracked.is_file())
+        self.assertEqual(json.loads((run_dir / "integration-manifest.json").read_text())["status"], "FINALIZE_RECOVERY_REQUIRED")
+
+    def test_interrupted_finalize_exact_clean_reconciliation_finalizes(self):
+        run_dir, state = self.interrupted_finalize_fixture()
+        args = type("Args", (), {"repository": str(self.repo), "accept": "PASS", "notes": ""})()
+        with integration.repository_lock(self.repo) as marker:
+            result = integration.finalize_run(run_dir, state, args, marker)
+        self.assertEqual(result["status"], "FINALIZED")
+
+    def test_already_finalized_drift_is_non_mutating_error(self):
+        self.assertEqual(self.stage_cli().returncode, 0)
+        run_dir = self.run_dir()
+        command = [sys.executable, str(SCRIPT), "finalize", str(run_dir), "--accept", "PASS", "--repository", str(self.repo)]
+        self.assertEqual(cmd(*command).returncode, 0)
+        pushed = cmd("git", "--git-dir", str(self.remote), "rev-parse", "main").stdout.strip()
+        untracked = self.repo / "post-finalize-drift.txt"
+        untracked.write_text("preserve\n", encoding="utf-8")
+        result = cmd(*command)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("repository changed", result.stderr)
+        self.assertEqual(cmd("git", "--git-dir", str(self.remote), "rev-parse", "main").stdout.strip(), pushed)
+        self.assertTrue(untracked.is_file())
 
     def test_finalize_refuses_unexpected_git_change(self):
         self.assertEqual(self.stage_cli().returncode, 0)
@@ -656,9 +821,46 @@ class BackupMigrationTests(unittest.TestCase):
         Path(result["backup"]).write_text("tampered\n", encoding="utf-8")
         with self.assertRaisesRegex(integration.IntegrationError, "checksum/size mismatch"):
             integration.restore_backups([result], service_manager=["true"])
+
+    def test_declared_direct_and_parent_symlinks_are_rejected_before_backup(self):
+        real_config = self.root / "real.conf"
+        real_config.write_text("fixture\n", encoding="utf-8")
+        direct_config = self.root / "declared.conf"
+        direct_config.symlink_to(real_config)
+        contract = {"backups": {"sqlite": [], "configuration": [{"path": str(direct_config), "services": []}]}}
+        with self.assertRaisesRegex(integration.IntegrationError, "symlink"):
+            integration.create_backups(contract, self.root / "protected-config")
+
+        real_database = self.root / "real.sqlite"
+        sqlite3.connect(real_database).close()
+        direct_database = self.root / "declared.sqlite"
+        direct_database.symlink_to(real_database)
+        contract = {"backups": {"sqlite": [{"path": str(direct_database), "services": []}], "configuration": []}}
+        with self.assertRaisesRegex(integration.IntegrationError, "symlink"):
+            integration.create_backups(contract, self.root / "protected-database")
+
+        real_parent = self.root / "real-parent"
+        real_parent.mkdir()
+        nested = real_parent / "nested.conf"
+        nested.write_text("fixture\n", encoding="utf-8")
+        linked_parent = self.root / "linked-parent"
+        linked_parent.symlink_to(real_parent, target_is_directory=True)
+        contract = {"backups": {"sqlite": [], "configuration": [{"path": str(linked_parent / "nested.conf"), "services": []}]}}
+        with self.assertRaisesRegex(integration.IntegrationError, "symlink"):
+            integration.create_backups(contract, self.root / "protected-parent")
+
+    def test_restore_rejects_inode_identity_substitution(self):
+        source = self.root / "identity.conf"
+        source.write_text("original\n", encoding="utf-8")
+        record_value = integration.config_backup(source, self.root / "protected" / "identity.conf")
+        replacement = self.root / "replacement.conf"
+        replacement.write_text("replacement\n", encoding="utf-8")
+        os.replace(replacement, source)
+        with self.assertRaisesRegex(integration.IntegrationError, "identity changed"):
+            integration.restore_backups([record_value], service_manager=["true"])
         result = integration.config_backup(source, self.root / "protected" / "config2")
         source.unlink(); source.symlink_to(self.root / "other")
-        with self.assertRaisesRegex(integration.IntegrationError, "not a regular file"):
+        with self.assertRaisesRegex(integration.IntegrationError, "symlink"):
             integration.restore_backups([result], service_manager=["true"])
 
     def migration_fixture(self):
@@ -744,7 +946,9 @@ if action=='start':
  if item.get('start_fail'): item['state']='failed'; path.write_text(json.dumps(data)); raise SystemExit(6)
  item['state']='active'
 if action=='stop': item['state']='inactive'
-if action=='show': print(item.get('restarts',0))
+if action=='show':
+ if item.get('show_fail'): raise SystemExit(9)
+ print(item.get('restart_output',item.get('restarts',0)))
 if action=='status': print(item['state'])
 path.write_text(json.dumps(data))
 """, encoding="utf-8")
@@ -790,6 +994,54 @@ path.write_text(json.dumps(data))
         self.set_service("active", loop=True)
         with self.assertRaisesRegex(integration.IntegrationError, "rapid restart loop"):
             integration.restart_declared_service(self.manager, "kven2-main.service", timeout=1)
+
+    def test_restart_count_unavailable_malformed_and_negative_are_refused(self):
+        cases = ({"show_fail": True}, {"restart_output": "malformed"}, {"restart_output": -1})
+        for behavior in cases:
+            with self.subTest(behavior=behavior):
+                self.set_service("active", **behavior)
+                with self.assertRaisesRegex(integration.IntegrationError, "restart count"):
+                    integration.restart_count(self.manager, "kven2-main.service")
+
+    def test_pre_stage_restart_count_unavailable_has_zero_live_mutation(self):
+        self.set_service("active", show_fail=True)
+        self.service_contract()
+        before = integration.repository_state(self.repo)
+        _, state = self.stage_service()
+        self.assertEqual(state["status"], "AUTOMATED_CHECK_FAILED")
+        self.assertEqual(integration.repository_state(self.repo), before)
+        data = json.loads(self.service_state_file.read_text())["kven2-main.service"]
+        self.assertEqual(data["state"], "active")
+        self.assertEqual(data["restarts"], 0)
+
+    def test_post_restart_count_unavailable_triggers_rollback(self):
+        self.set_service("active")
+        self.service_contract()
+        real_restart_count = integration.restart_count
+        calls = 0
+
+        def unavailable_after_snapshot(manager, service, timeout=10):
+            nonlocal calls
+            calls += 1
+            if calls >= 3:
+                raise integration.IntegrationError("restart count unavailable for fixture")
+            return real_restart_count(manager, service, timeout=timeout)
+
+        self.bind_contract()
+        with mock.patch.object(integration, "restart_count", side_effect=unavailable_after_snapshot):
+            _, state = integration.stage(self.path, self.manifest, self._stage_args(self.manager, 1))
+        self.assertEqual(state["status"], "ROLLED_BACK")
+        self.assertEqual(integration.repository_state(self.repo)["head"], self.base)
+
+    def test_finalize_restart_count_unavailable_prevents_finalized(self):
+        self.service_contract()
+        run_dir, state = self.stage_service()
+        args = type("Args", (), {"repository": str(self.repo), "accept": "PASS", "notes": ""})()
+        with mock.patch.object(integration, "restart_count", side_effect=integration.IntegrationError("restart count unavailable")):
+            with integration.repository_lock(self.repo) as marker:
+                with self.assertRaisesRegex(integration.IntegrationError, "restart count unavailable"):
+                    integration.finalize_run(run_dir, state, args, marker)
+        self.assertNotEqual(state["status"], "FINALIZED")
 
     def test_systemd_rc3_preserves_exact_failed_and_transitional_states(self):
         for state in ("failed", "activating", "deactivating", "reloading", "unknown"):
@@ -895,9 +1147,37 @@ path.write_text(json.dumps(data))
         state = json.loads((run_dir / "integration-manifest.json").read_text())
         state["contract"]["readiness_checks"][0]["command"] = [sys.executable, "-c", "raise SystemExit(2)"]
         with integration.repository_lock(self.repo) as marker:
-            with self.assertRaisesRegex(integration.IntegrationError, "finalize-readiness command failed"):
+            with self.assertRaisesRegex(integration.IntegrationError, "differs from exact committed contract"):
                 integration.finalize_run(run_dir, state, args, marker)
         self.assertEqual(cmd("git", "--git-dir", str(self.remote), "rev-parse", "main").stdout.strip(), self.base)
+
+    def test_interrupted_finalize_service_and_restart_drift_require_recovery(self):
+        for drift in ("state", "restart"):
+            with self.subTest(drift=drift):
+                marker_path = integration.git_common_dir(self.repo) / "kven-integration-active.json"
+                marker_path.unlink(missing_ok=True)
+                if self.results.exists():
+                    shutil_rmtree(self.results)
+                if integration.repository_state(self.repo)["head"] != self.base:
+                    cmd("git", "-C", str(self.repo), "reset", "--hard", self.base)
+                cmd("git", "--git-dir", str(self.remote), "update-ref", "refs/heads/main", self.base)
+                cmd("git", "-C", str(self.repo), "update-ref", "refs/remotes/origin/main", self.base)
+                self.set_service("active")
+                self.service_contract()
+                run_dir, state = self.stage_service()
+                integration.persist(run_dir, state, "FINALIZING", "FINALIZING")
+                cmd("git", "-C", str(self.repo), "push", "origin", f"{state['staged_head']}:refs/heads/main")
+                data = json.loads(self.service_state_file.read_text())
+                if drift == "state":
+                    data["kven2-main.service"]["state"] = "inactive"
+                else:
+                    data["kven2-main.service"]["restarts"] += 1
+                self.service_state_file.write_text(json.dumps(data), encoding="utf-8")
+                args = type("Args", (), {"repository": str(self.repo), "accept": "PASS", "notes": ""})()
+                with integration.repository_lock(self.repo) as marker:
+                    with self.assertRaisesRegex(integration.IntegrationError, "recovery is required"):
+                        integration.finalize_run(run_dir, state, args, marker)
+                self.assertEqual(json.loads((run_dir / "integration-manifest.json").read_text())["status"], "FINALIZE_RECOVERY_REQUIRED")
 
     def test_rollback_restores_fixture_database_and_configuration(self):
         database = self.root / "live.sqlite"

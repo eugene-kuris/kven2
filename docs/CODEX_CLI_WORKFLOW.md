@@ -1,5 +1,22 @@
 # Codex CLI Task Workflow
 
+## Durable execution is the default
+
+Run long Codex and operational tasks in a named GNU screen session so execution
+survives the initiating SSH connection. Create a logged session with:
+
+```bash
+screen -L -Logfile /home/eugene/TASK-screen.log -S task-name
+```
+
+Detach with `Ctrl-a d`, list sessions with `screen -ls`, and reattach with
+`screen -r task-name`. The durable log is an operational evidence artifact and
+must use a stable absolute path. When the command finishes, screen normally
+removes the finished session; `screen -ls` will no longer list it, while the log
+remains available. Result metadata must record the manager, session name,
+reattach command, durable log, durable runner/result paths, and whether execution
+was independent of the initiating SSH connection.
+
 ## Purpose and trust boundary
 
 `scripts/kven-codex-task` turns an approved task prompt into an isolated, durable Codex CLI run. It verifies a clean local `main`, creates a unique feature branch and linked worktree, runs Codex there, and preserves both the work and an inspection package. The runner trusts the installed Codex CLI and the existing repository, but it does not grant access to secrets or protected runtime data.

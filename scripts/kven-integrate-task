@@ -20,6 +20,10 @@ import sys
 import time
 import uuid
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from kven_evidence_security import redact as security_redact  # noqa: E402
+from kven_evidence_security import scan_git_range, scan_tree  # noqa: E402
+
 SCHEMA_VERSION = "2.0"
 DEFAULT_REPOSITORY = Path("/opt/kven2")
 DEFAULT_RESULT_ROOT = Path("/home/eugene/kven-integration-results")
@@ -51,7 +55,7 @@ BEARER_RE = re.compile(r"(?i)(\bBearer\s+)([^\s]+)")
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 ACTIVE_STATES = {"BACKING_UP", "MIGRATING", "PRE_MERGE_TESTING", "MERGING", "POST_MERGE_TESTING",
                  "DEPLOYING", "RESTARTING_SERVICES", "VERIFYING", "AWAITING_ACCEPTANCE",
-                 "FINALIZING", "ROLLING_BACK", "INTERRUPTED", "INTERNAL_ERROR"}
+                 "FINALIZING", "FINALIZE_RECOVERY_REQUIRED", "ROLLING_BACK", "INTERRUPTED", "INTERNAL_ERROR"}
 TERMINAL_STATES = {"ROLLED_BACK", "FINALIZED"}
 RUN_STATES = ACTIVE_STATES | TERMINAL_STATES | {
     "CREATED", "AUTOMATED_CHECK_FAILED", "DEPLOYING", "ROLLBACK_FAILED",
@@ -104,10 +108,7 @@ def write_artifact(path: Path, text: str, *, mode=0o644) -> None:
 
 
 def redact(text: str) -> str:
-    text = PRIVATE_KEY_BLOCK_RE.sub("[REDACTED PRIVATE KEY]", text)
-    text = OPTION_VALUE_RE.sub(lambda match: f"{match.group(1)}[REDACTED]", text)
-    text = BEARER_RE.sub(lambda match: f"{match.group(1)}[REDACTED]", text)
-    return SECRET_RE.sub(lambda match: f"{match.group(1)}{match.group(2)}[REDACTED]", text)
+    return security_redact(text)
 
 
 def redact_argv(command) -> list[str]:
@@ -224,6 +225,7 @@ def validate_contract(contract: object, manifest: dict) -> dict:
         "post_merge_tests", "readiness_checks", "fatal_log_checks", "acceptance_checklist", "rollback",
     }
     contract = _require_keys(contract, required, "deployment contract", {"deployment_steps"})
+    contract = json.loads(json.dumps(contract))
     if contract["schema_version"] != SCHEMA_VERSION:
         raise IntegrationError("unsupported deployment contract schema")
     if contract["expected_baseline"] != manifest["baseline_head"]:
@@ -284,18 +286,51 @@ def validate_contract(contract: object, manifest: dict) -> dict:
     return contract
 
 
+def canonical_contract_sha256(contract: dict) -> str:
+    """Hash normalized compact, key-sorted, UTF-8 JSON with no trailing newline."""
+    encoded = json.dumps(contract, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def committed_contract(repo: Path, feature_head: str, manifest: dict) -> tuple[dict, str]:
+    path = manifest.get("deployment_contract_path")
+    if path != "deployment-contract.json":
+        raise IntegrationError("deployment contract path must be deployment-contract.json")
+    result = git(repo, "show", f"{feature_head}:{path}")
+    if result.returncode:
+        raise IntegrationError("committed deployment contract is missing")
+    try:
+        raw = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise IntegrationError("committed deployment contract is malformed") from exc
+    normalized = validate_contract(raw, manifest)
+    return normalized, canonical_contract_sha256(normalized)
+
+
+def verify_contract_binding(repo: Path, manifest: dict) -> tuple[dict, str]:
+    normalized, digest = committed_contract(repo, manifest["feature_head"], manifest)
+    recorded = validate_contract(manifest["deployment_contract"], manifest)
+    if recorded != normalized:
+        raise IntegrationError("manifest deployment contract differs from exact committed contract")
+    if manifest.get("deployment_contract_sha256") != digest:
+        raise IntegrationError("deployment contract SHA-256 binding mismatch")
+    return normalized, digest
+
+
 def validate_manifest_types(data: object) -> dict:
     required = {
         "schema_version", "task_id", "started_at", "finished_at", "codex_runtime_seconds",
         "exit_code", "final_codex_status", "repository_path", "baseline_branch", "baseline_head",
         "origin_main_head", "feature_branch", "feature_head", "worktree_path", "commits_created",
         "changed_files", "tests", "git_diff_check", "secret_scan", "deployment_contract",
-        "requested_model", "actual_runtime_model", "actual_reasoning_effort", "token_usage", "network_use",
+        "deployment_contract_path", "deployment_contract_sha256", "evidence_secret_scan",
+        "requested_model", "actual_runtime_model", "actual_runtime_provider", "actual_reasoning_effort",
+        "runtime_session_id", "token_usage", "network_use",
     }
     data = _require_keys(data, required, "result manifest", {
         "codex_model", "summary", "deployment_contract_error",
         "requested_deployment_services", "requested_backup_targets", "requested_migration_checks",
-        "result_package_path", "evidence_provenance",
+        "result_package_path", "evidence_provenance", "execution_methodology",
     })
     if data["schema_version"] != SCHEMA_VERSION:
         raise IntegrationError(f"unsupported result manifest schema: {data['schema_version']}")
@@ -314,8 +349,10 @@ def validate_manifest_types(data: object) -> dict:
         raise IntegrationError("result status fields are invalid")
     if data["requested_model"] is not None and not _is_string(data["requested_model"]):
         raise IntegrationError("requested_model must be null or a non-empty string")
-    if not _is_string(data["actual_runtime_model"]) or not _is_string(data["actual_reasoning_effort"]):
-        raise IntegrationError("actual runtime model/reasoning evidence is required")
+    if not all(_is_string(data[field]) for field in (
+        "actual_runtime_model", "actual_runtime_provider", "actual_reasoning_effort", "runtime_session_id",
+    )):
+        raise IntegrationError("actual runtime startup metadata is required")
     if data["requested_model"] is not None and data["requested_model"] != data["actual_runtime_model"]:
         raise IntegrationError("requested and actual runtime model conflict")
     if data["token_usage"] is not None and (type(data["token_usage"]) is not int or data["token_usage"] < 0):
@@ -364,7 +401,11 @@ def validate_manifest_types(data: object) -> dict:
             raise IntegrationError(f"tests[{index}].artifact_size is invalid")
         if not isinstance(test["duration_seconds"], (int, float)) or isinstance(test["duration_seconds"], bool):
             raise IntegrationError(f"tests[{index}].duration_seconds is invalid")
-    for field in ("git_diff_check", "secret_scan"):
+    if data["deployment_contract_path"] != "deployment-contract.json":
+        raise IntegrationError("deployment_contract_path is invalid")
+    if not isinstance(data["deployment_contract_sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", data["deployment_contract_sha256"]):
+        raise IntegrationError("deployment_contract_sha256 is invalid")
+    for field in ("git_diff_check", "secret_scan", "evidence_secret_scan"):
         if not isinstance(data[field], dict) or type(data[field].get("passed")) is not bool:
             raise IntegrationError(f"{field} result is invalid")
     validate_contract(data["deployment_contract"], data)
@@ -397,14 +438,10 @@ def git_changed_files(repo: Path, baseline: str, feature_head: str) -> list[str]
 
 
 def offline_secret_scan(repo: Path, baseline: str, feature_head: str) -> dict:
-    result = git(repo, "diff", "--no-ext-diff", "--unified=0", f"{baseline}..{feature_head}")
-    if result.returncode:
-        raise IntegrationError("offline secret scan could not read exact changed content")
-    matches = []
-    for number, line in enumerate(result.stdout.splitlines(), 1):
-        if line.startswith("+") and not line.startswith("+++") and SECRET_RE.search(line[1:]):
-            matches.append(f"diff-line:{number}")
-    return {"passed": not matches, "matches": matches}
+    try:
+        return scan_git_range(repo, baseline, feature_head)
+    except RuntimeError as exc:
+        raise IntegrationError("offline secret scan could not read exact changed content") from exc
 
 
 def repository_state(repo: Path) -> dict:
@@ -459,7 +496,6 @@ def _verify_test_evidence(manifest: dict, manifest_path: Path) -> None:
 
 def inspect_manifest(manifest: dict, *, manifest_path: Path, expected_repository: Path = DEFAULT_REPOSITORY) -> dict:
     validate_manifest_types(manifest)
-    _verify_test_evidence(manifest, manifest_path)
     repo = Path(manifest["repository_path"]).resolve()
     expected = expected_repository.resolve()
     if repo != expected:
@@ -475,7 +511,6 @@ def inspect_manifest(manifest: dict, *, manifest_path: Path, expected_repository
     failed = [x["name"] for x in manifest["tests"] if not x["passed"] or x["exit_code"] != 0]
     if failed:
         raise IntegrationError("required tests failed: " + ", ".join(failed))
-    contract = validate_contract(manifest["deployment_contract"], manifest)
     main_state = repository_state(repo)
     if main_state["branch"] != manifest["baseline_branch"]:
         raise IntegrationError(f"baseline worktree must be on {manifest['baseline_branch']}")
@@ -491,6 +526,11 @@ def inspect_manifest(manifest: dict, *, manifest_path: Path, expected_repository
         raise IntegrationError("feature branch is missing")
     if feature.stdout.strip() != manifest["feature_head"]:
         raise IntegrationError("feature HEAD mismatch")
+    contract, contract_digest = verify_contract_binding(repo, manifest)
+    _verify_test_evidence({**manifest, "deployment_contract": contract}, manifest_path)
+    evidence_scan = scan_tree(manifest_path.resolve().parent)
+    if not evidence_scan["passed"] or not manifest["evidence_secret_scan"]["passed"]:
+        raise IntegrationError("user-readable result evidence secret scan failed")
     if git(repo, "merge-base", "--is-ancestor", manifest["baseline_head"], manifest["feature_head"]).returncode:
         raise IntegrationError("feature branch is not based on accepted baseline")
     commits = require_git(repo, "rev-list", "--reverse", f"{manifest['baseline_head']}..{manifest['feature_head']}").splitlines()
@@ -507,13 +547,17 @@ def inspect_manifest(manifest: dict, *, manifest_path: Path, expected_repository
         raise IntegrationError("independent git diff --check failed: " + bounded(diff_check.stdout + diff_check.stderr))
     secret_scan = offline_secret_scan(repo, manifest["baseline_head"], manifest["feature_head"])
     if not secret_scan["passed"]:
-        raise IntegrationError("independent offline secret scan failed: " + ", ".join(secret_scan["matches"]))
+        locations = [f"{item['file']}:{item['line'] or '-'}:{item['category']}" for item in secret_scan["matches"]]
+        raise IntegrationError("independent offline secret scan failed: " + ", ".join(locations))
     feature_state = verify_feature_worktree(manifest)
     return {
         "eligible": True, "repository": str(repo), "head": main_state["head"],
         "feature_head": manifest["feature_head"], "actual_changed_files": actual,
         "diff_check": "passed", "secret_scan": secret_scan, "main_state": main_state,
         "feature_state": feature_state, "contract": contract,
+        "deployment_contract_path": manifest["deployment_contract_path"],
+        "deployment_contract_sha256": contract_digest,
+        "evidence_secret_scan": evidence_scan,
     }
 
 
@@ -544,10 +588,35 @@ def sqlite_integrity(path: Path) -> str:
         connection.close()
 
 
+def validate_declared_regular_file(path: Path, *, label: str, expected: dict | None = None) -> dict:
+    """Validate an absolute lexical path without following any symlink component."""
+    if not path.is_absolute() or ".." in path.parts:
+        raise IntegrationError(f"{label} must be a lexical absolute path")
+    current = Path(path.anchor)
+    for component in path.parts[1:]:
+        current = current / component
+        try:
+            metadata = current.lstat()
+        except OSError as exc:
+            raise IntegrationError(f"{label} path component is unavailable: {current}") from exc
+        if stat.S_ISLNK(metadata.st_mode):
+            raise IntegrationError(f"{label} path contains a symlink: {current}")
+    if not stat.S_ISREG(metadata.st_mode):
+        raise IntegrationError(f"{label} is not a regular file: {path}")
+    identity = {
+        "declared_source": str(path),
+        "canonical_source": str(path.resolve(strict=True)),
+        "source_device": metadata.st_dev,
+        "source_inode": metadata.st_ino,
+    }
+    if expected is not None and identity != {key: expected[key] for key in identity}:
+        raise IntegrationError(f"{label} identity changed since backup")
+    return identity
+
+
 def sqlite_backup(source: Path, destination: Path, *, services=None) -> dict:
-    if not source.is_file() or source.is_symlink():
-        raise IntegrationError(f"SQLite source is not a regular file: {source}")
-    metadata = source.stat()
+    identity = validate_declared_regular_file(source, label="SQLite source")
+    metadata = source.lstat()
     destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     source_connection = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
     target_connection = sqlite3.connect(destination)
@@ -560,8 +629,9 @@ def sqlite_backup(source: Path, destination: Path, *, services=None) -> dict:
         target_connection.close()
         source_connection.close()
     destination.chmod(0o600)
+    validate_declared_regular_file(source, label="SQLite source", expected=identity)
     return {
-        "kind": "sqlite", "source": str(source.resolve()), "backup": str(destination),
+        "kind": "sqlite", "source": str(source), **identity, "backup": str(destination),
         "services": list(services or []), "size": destination.stat().st_size,
         "sha256": sha256(destination), "integrity_check": "ok",
         "mode": stat.S_IMODE(metadata.st_mode), "uid": metadata.st_uid, "gid": metadata.st_gid,
@@ -569,14 +639,14 @@ def sqlite_backup(source: Path, destination: Path, *, services=None) -> dict:
 
 
 def config_backup(source: Path, destination: Path, *, services=None) -> dict:
-    if not source.is_file() or source.is_symlink():
-        raise IntegrationError(f"configuration source is not a regular file: {source}")
-    metadata = source.stat()
+    identity = validate_declared_regular_file(source, label="configuration source")
+    metadata = source.lstat()
     destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     shutil.copy2(source, destination, follow_symlinks=False)
     destination.chmod(0o600)
+    validate_declared_regular_file(source, label="configuration source", expected=identity)
     return {
-        "kind": "configuration", "source": str(source.resolve()), "backup": str(destination),
+        "kind": "configuration", "source": str(source), **identity, "backup": str(destination),
         "services": list(services or []), "mode": stat.S_IMODE(metadata.st_mode),
         "uid": metadata.st_uid, "gid": metadata.st_gid, "size": destination.stat().st_size,
         "sha256": sha256(destination),
@@ -587,8 +657,9 @@ def create_backups(contract: dict, backup_dir: Path) -> list[dict]:
     records = []
     for kind in ("sqlite", "configuration"):
         for item in contract["backups"][kind]:
-            source = Path(item["path"]).resolve()
-            unique = hashlib.sha256(str(source).encode()).hexdigest()[:12]
+            source = Path(item["path"])
+            identity = validate_declared_regular_file(source, label=f"declared {kind} backup source")
+            unique = hashlib.sha256(identity["declared_source"].encode()).hexdigest()[:12]
             destination = backup_dir / kind / f"{unique}-{source.name}.backup"
             if kind == "sqlite":
                 records.append(sqlite_backup(source, destination, services=item["services"]))
@@ -640,12 +711,17 @@ def wait_service_state(manager: list[str], service: str, intended: str, *, timeo
     raise IntegrationError(f"service state timeout for {service}: expected {intended}, found {last}")
 
 
-def restart_count(manager: list[str], service: str, *, timeout=10) -> int | None:
+def restart_count(manager: list[str], service: str, *, timeout=10) -> int:
     result = run((*manager, "show", service, "--property=NRestarts", "--value"), timeout=timeout)
+    if result.returncode:
+        raise IntegrationError(f"restart count unavailable for {service}")
     try:
-        return int(result.stdout.strip()) if result.returncode == 0 else None
+        value = int(result.stdout.strip())
     except ValueError:
-        return None
+        raise IntegrationError(f"restart count malformed for {service}") from None
+    if value < 0:
+        raise IntegrationError(f"restart count negative for {service}")
+    return value
 
 
 def restart_declared_service(manager: list[str], service: str, *, timeout=60, max_restart_delta=3) -> dict:
@@ -653,7 +729,7 @@ def restart_declared_service(manager: list[str], service: str, *, timeout=60, ma
     service_action(manager, "restart", service, timeout=timeout)
     wait_service_state(manager, service, "active", timeout=timeout)
     after = restart_count(manager, service)
-    if before is not None and after is not None and after - before > max_restart_delta:
+    if after - before > max_restart_delta:
         raise IntegrationError(f"rapid restart loop detected for {service}: {before}->{after}")
     return {"service": service, "restarts_before": before, "restarts_after": after, "state": "active"}
 
@@ -677,9 +753,8 @@ def restore_backups(records: list[dict], *, service_manager=None, service_timeou
     results = []
     for record in records:
         backup = verify_backup(record)
-        source = Path(record["source"])
-        if source.is_symlink() or not source.is_file():
-            raise IntegrationError(f"restore target is not a regular file: {source}")
+        source = Path(record["declared_source"])
+        validate_declared_regular_file(source, label="restore target", expected=record)
         temporary = source.with_name(source.name + f".kven-restore-{os.getpid()}")
         shutil.copy2(backup, temporary, follow_symlinks=False)
         _restore_metadata(temporary, record)
@@ -707,15 +782,15 @@ def restore_backups(records: list[dict], *, service_manager=None, service_timeou
     return results
 
 
-def validate_migrations(contract: dict, backups: list[dict], run_dir: Path) -> list[dict]:
+def validate_migrations(contract: dict, backups: list[dict], run_dir: Path, *, protected_work_dir: Path | None = None) -> list[dict]:
     results = []
     available = {x["source"]: x for x in backups if x["kind"] == "sqlite"}
     for index, check in enumerate(contract["migration_checks"]):
-        source = str(Path(check["database"]).resolve())
+        source = str(Path(check["database"]))
         if source not in available:
             raise IntegrationError(f"migration database was not backed up: {source}")
         protected = verify_backup(available[source])
-        disposable = run_dir / "migration-copies" / f"{index}.sqlite"
+        disposable = (protected_work_dir or (run_dir / "migration-copies")) / f"{index}.sqlite"
         disposable.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(protected, disposable)
         env = os.environ.copy()
@@ -801,6 +876,8 @@ Status: **{state['status']}**
 Run ID: `{state['run_id']}`
 Phase: `{state.get('phase', 'unknown')}`
 Failure/refusal: {failures}
+Bound contract: `{state.get('deployment_contract_path', 'unavailable')}`
+Contract SHA-256: `{state.get('deployment_contract_sha256', 'unavailable')}`
 
 ## Acceptance
 
@@ -828,6 +905,12 @@ def persist(run_dir: Path, state: dict, phase: str, status: str | None = None) -
         state["status"] = status
     atomic_json(run_dir / "integration-manifest.json", state)
     summary(run_dir, state)
+    evidence = scan_tree(run_dir)
+    if not evidence["passed"]:
+        locations = ", ".join(
+            f"{item['file']}:{item['line'] or '-'}:{item['category']}" for item in evidence["matches"]
+        )
+        raise IntegrationError("user-readable integration evidence secret scan failed: " + locations)
 
 
 def load_run(value: str) -> tuple[Path, dict]:
@@ -847,7 +930,8 @@ def validate_run_state(state: object) -> dict:
     required = {
         "schema_version", "run_id", "task_id", "status", "phase", "repository", "source_manifest",
         "baseline_branch", "baseline_head", "origin_baseline_head", "feature_branch", "feature_head",
-        "contract", "service_manager", "service_timeout", "acceptance_checklist",
+        "contract", "deployment_contract_path", "deployment_contract_sha256",
+        "service_manager", "service_timeout", "acceptance_checklist",
         "expected_repository_state", "commands",
     }
     if not isinstance(state, dict):
@@ -867,6 +951,10 @@ def validate_run_state(state: object) -> dict:
             raise IntegrationError(f"integration run field {field} is not a commit SHA")
     if "staged_head" in state and (not isinstance(state["staged_head"], str) or not SHA_RE.fullmatch(state["staged_head"])):
         raise IntegrationError("integration run staged_head is invalid")
+    if state["deployment_contract_path"] != "deployment-contract.json" or not re.fullmatch(
+        r"[0-9a-f]{64}", state["deployment_contract_sha256"]
+    ):
+        raise IntegrationError("integration run contract binding is invalid")
     if not isinstance(state["service_manager"], list) or not state["service_manager"] or not all(_is_string(x) for x in state["service_manager"]):
         raise IntegrationError("integration run service_manager must be an argv array")
     if not isinstance(state["service_timeout"], (int, float)) or isinstance(state["service_timeout"], bool) or state["service_timeout"] <= 0:
@@ -878,10 +966,24 @@ def validate_run_state(state: object) -> dict:
         raise IntegrationError("integration run expected repository state is invalid")
     if not isinstance(state["commands"], dict) or not all(_is_string(x) for x in state["commands"].values()):
         raise IntegrationError("integration run commands are invalid")
-    validate_contract(state["contract"], {"baseline_head": state["baseline_head"], "feature_branch": state["feature_branch"]})
+    normalized = validate_contract(state["contract"], {"baseline_head": state["baseline_head"], "feature_branch": state["feature_branch"]})
+    if canonical_contract_sha256(normalized) != state["deployment_contract_sha256"]:
+        raise IntegrationError("persisted integration contract was mutated")
     if state["status"] in {"AWAITING_ACCEPTANCE", "FINALIZING", "FINALIZED"} and "staged_head" not in state:
         raise IntegrationError("staged integration state is missing staged_head")
     return state
+
+
+def verify_run_contract_binding(state: dict) -> tuple[dict, str]:
+    manifest = {
+        "baseline_head": state["baseline_head"],
+        "feature_branch": state["feature_branch"],
+        "feature_head": state["feature_head"],
+        "deployment_contract_path": state["deployment_contract_path"],
+        "deployment_contract_sha256": state["deployment_contract_sha256"],
+        "deployment_contract": state["contract"],
+    }
+    return verify_contract_binding(Path(state["repository"]), manifest)
 
 
 def git_common_dir(repo: Path) -> Path:
@@ -949,6 +1051,9 @@ def restore_service_states(state: dict, run_dir: Path, contract: dict, args) -> 
 
 
 def rollback_state(run_dir: Path, state: dict, reason: str, *, marker: Path | None = None) -> dict:
+    verify_run_contract_binding(state)
+    if state.get("status") == "FINALIZE_RECOVERY_REQUIRED":
+        raise IntegrationError("ordinary rollback is refused after a completed push; recovery is required")
     if state.get("status") in {"ROLLED_BACK", "FINALIZED"}:
         if state["status"] == "ROLLED_BACK":
             return state
@@ -1012,6 +1117,8 @@ def stage(manifest_path: Path, manifest: dict, args) -> tuple[Path, dict]:
             "baseline_branch": manifest["baseline_branch"], "baseline_head": manifest["baseline_head"],
             "origin_baseline_head": manifest["origin_main_head"], "feature_branch": manifest["feature_branch"],
             "feature_head": manifest["feature_head"], "contract": contract,
+            "deployment_contract_path": preflight["deployment_contract_path"],
+            "deployment_contract_sha256": preflight["deployment_contract_sha256"],
             "service_manager": args.service_manager, "service_timeout": args.service_timeout,
             "acceptance_checklist": contract["acceptance_checklist"],
             "expected_repository_state": preflight["main_state"],
@@ -1037,7 +1144,9 @@ def stage(manifest_path: Path, manifest: dict, args) -> tuple[Path, dict]:
             state["backups"] = create_backups(contract, backup_dir)
             atomic_json(run_dir / "backup-manifest.json", state["backups"])
             persist(run_dir, state, "MIGRATING", "MIGRATING")
-            state["migration_validation"] = validate_migrations(contract, state["backups"], run_dir)
+            state["migration_validation"] = validate_migrations(
+                contract, state["backups"], run_dir, protected_work_dir=backup_dir / "migration-copies",
+            )
             atomic_json(run_dir / "migration-validation.json", state["migration_validation"])
             persist(run_dir, state, "PRE_MERGE_TESTING", "PRE_MERGE_TESTING")
             state["pre_merge_tests"] = run_checks(
@@ -1049,6 +1158,9 @@ def stage(manifest_path: Path, manifest: dict, args) -> tuple[Path, dict]:
             immediate = inspect_manifest(manifest, manifest_path=manifest_path, expected_repository=repo)
             if immediate["main_state"] != state["expected_repository_state"]:
                 raise IntegrationError("repository changed between initial and immediate pre-mutation preflight")
+            if (immediate["deployment_contract_sha256"] != state["deployment_contract_sha256"]
+                    or immediate["contract"] != state["contract"]):
+                raise IntegrationError("deployment contract binding changed before mutation")
             persist(run_dir, state, "MERGING", "MERGING")
             state["live_mutation_started"] = True
             merge = git(repo, "merge", "--no-ff", "--no-edit", manifest["feature_head"])
@@ -1141,6 +1253,7 @@ def stage(manifest_path: Path, manifest: dict, args) -> tuple[Path, dict]:
 
 def verify_staged_state(run_dir: Path, state: dict) -> None:
     repo = Path(state["repository"])
+    verify_run_contract_binding(state)
     require_repository_state(repo, state["expected_repository_state"], "finalize pre-check")
     if state["expected_repository_state"]["head"] != state.get("staged_head"):
         raise IntegrationError("recorded staged repository HEAD is inconsistent")
@@ -1166,11 +1279,45 @@ def verify_staged_state(run_dir: Path, state: dict) -> None:
     )
 
 
+def reconcile_interrupted_finalize(run_dir: Path, state: dict) -> None:
+    """Reconcile a completed push without rewriting remote history."""
+    repo = Path(state["repository"])
+    verify_run_contract_binding(state)
+    require_repository_state(repo, state["expected_repository_state"], "interrupted finalize reconciliation")
+    if state["expected_repository_state"]["head"] != state["staged_head"]:
+        raise IntegrationError("recorded staged repository HEAD is inconsistent")
+    require_service_snapshot(
+        state["service_manager"], state.get("expected_service_snapshot", {}), state["service_timeout"],
+        "interrupted finalize reconciliation pre-check",
+    )
+    state["reconciliation_readiness"] = run_checks(
+        state["contract"]["readiness_checks"], run_dir, "reconciliation-readiness", cwd=repo,
+        expected_repository_state=state["expected_repository_state"],
+    )
+    state["reconciliation_fatal_logs"] = run_checks(
+        state["contract"]["fatal_log_checks"], run_dir, "reconciliation-fatal-logs", cwd=repo,
+        expected_repository_state=state["expected_repository_state"],
+    )
+    require_repository_state(repo, state["expected_repository_state"], "interrupted finalize reconciliation post-check")
+    require_service_snapshot(
+        state["service_manager"], state.get("expected_service_snapshot", {}), state["service_timeout"],
+        "interrupted finalize reconciliation post-check",
+    )
+    if require_git(repo, "rev-parse", "refs/remotes/origin/main") != state["staged_head"]:
+        raise IntegrationError("origin/main changed during interrupted finalize reconciliation")
+
+
 def finalize_run(run_dir: Path, state: dict, args, marker: Path) -> dict:
     repo = Path(state["repository"])
     if repo.resolve() != Path(args.repository).resolve():
         raise IntegrationError("run repository differs from explicit repository boundary")
     if state["status"] == "FINALIZED":
+        verify_run_contract_binding(state)
+        require_repository_state(repo, state["expected_repository_state"], "already-finalized verification")
+        require_service_snapshot(
+            state["service_manager"], state.get("expected_service_snapshot", {}), state["service_timeout"],
+            "already-finalized verification",
+        )
         origin = require_git(repo, "rev-parse", "refs/remotes/origin/main")
         if origin != state["staged_head"]:
             raise IntegrationError("finalized run no longer matches origin/main")
@@ -1178,6 +1325,18 @@ def finalize_run(run_dir: Path, state: dict, args, marker: Path) -> dict:
     if state["status"] == "FINALIZING":
         origin = require_git(repo, "rev-parse", "refs/remotes/origin/main")
         if origin == state["staged_head"]:
+            claim_active(marker, run_dir, state)
+            try:
+                reconcile_interrupted_finalize(run_dir, state)
+            except Exception as exc:
+                state["reconciliation_failure"] = redact(str(exc))
+                state["recovery_evidence"] = {
+                    "origin_main": origin, "staged_head": state["staged_head"],
+                    "repository_state": repository_state(repo), "checked_at": now(),
+                }
+                persist(run_dir, state, "FINALIZE_RECOVERY_REQUIRED", "FINALIZE_RECOVERY_REQUIRED")
+                clear_active(marker, state)
+                raise IntegrationError("push completed but finalize reconciliation failed; recovery is required") from exc
             state.update({"status": "FINALIZED", "phase": "COMPLETE", "origin_main": origin, "finalized_at": now()})
             persist(run_dir, state, "COMPLETE", "FINALIZED")
             clear_active(marker, state)
@@ -1259,6 +1418,7 @@ def main(argv=None) -> int:
         run_dir, state = load_run(args.target)
         if Path(state["repository"]).resolve() != trusted_repo:
             raise IntegrationError("run repository differs from trusted repository boundary")
+        verify_run_contract_binding(state)
         if args.command == "status":
             print(json.dumps(state, indent=2, sort_keys=True))
             return 0

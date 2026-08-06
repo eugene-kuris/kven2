@@ -1,8 +1,18 @@
 # Kven II task integration workflow
 
+## Deployment authority
+
+For schema 2.0, `deployment-contract.json` at the exact feature commit is the
+only deployment authority. The runner and integration command normalize it,
+then hash compact key-sorted UTF-8 JSON (`separators=(",", ":")`, no trailing
+newline). Result and integration manifests record the path and SHA-256. Inspect,
+the immediate stage preflight, status, finalize, and rollback independently
+re-read the exact committed blob and refuse any package-only or persisted-state
+change.
+
 ## Trust boundary and lifecycle
 
-`scripts/kven-integrate-task` consumes a Codex `result-manifest.json` and an embedded deployment contract. It is deliberately local and project-specific. It does not infer backup, migration, or restart scope from changed files.
+`scripts/kven-integrate-task` consumes a Codex `result-manifest.json`, but uses the exact committed contract as authority. It is deliberately local and project-specific. It does not infer backup, migration, or restart scope from changed files.
 
 The lifecycle is `inspect` → `dry-run` → `stage` → `AWAITING_ACCEPTANCE` → `finalize`. A stage failure or rejected acceptance instead leads to `rollback`. Stage never pushes. Only finalize, after explicit `--accept PASS`, pushes local main and verifies the local `origin/main` ref.
 
