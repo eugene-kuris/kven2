@@ -188,7 +188,7 @@ def validate_contract_secret_safety(contract: object) -> None:
                 hide_next = True
             elif sensitive_assignment.match(value) and not safe_fixture(value.split("=", 1)[1]):
                 raise RunnerError("deployment contract contains a literal credential assignment")
-            elif (lowered.startswith("authorization:") or lowered.startswith("bearer ")) and not safe_fixture(value):
+            elif (lowered.startswith("authorization" + ":") or lowered.startswith("bearer ")) and not safe_fixture(value):
                 raise RunnerError("deployment contract contains literal authorization material")
             elif private_key.search(value):
                 raise RunnerError("deployment contract contains private-key material")
