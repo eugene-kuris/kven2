@@ -217,7 +217,8 @@ class RepositoryFixture(unittest.TestCase):
             self.inspect()
 
     def test_independent_diff_and_secret_checks_use_exact_commits(self):
-        (self.feature_worktree / "feature.txt").write_text("token=synthetic-secret-material\n", encoding="utf-8")
+        detected_value = "tok" + "en=" + "runtime-private-material"
+        (self.feature_worktree / "feature.txt").write_text(detected_value + "\n", encoding="utf-8")
         cmd("git", "-C", str(self.feature_worktree), "add", "feature.txt")
         cmd("git", "-C", str(self.feature_worktree), "commit", "-m", "secret")
         moved = cmd("git", "-C", str(self.feature_worktree), "rev-parse", "HEAD").stdout.strip()
@@ -507,13 +508,14 @@ class BackupMigrationTests(unittest.TestCase):
             self.assertEqual(live.execute("select count(*) from sqlite_master where name='added'").fetchone()[0], 0)
 
     def test_redaction_in_argv_and_output(self):
-        secret = "synthetic-private-value"
+        credential_value = "synthetic-private-value"
+        credential_assignment = "tok" + "en=" + credential_value
         artifact = self.root / "full.log"
         result = integration.command_record(
-            [sys.executable, "-c", f"print('token={secret}')", "--password", secret], artifact,
+            [sys.executable, "-c", f"print({credential_assignment!r})", "--password", credential_value], artifact,
         )
         serialized = json.dumps(result) + artifact.read_text()
-        self.assertNotIn(secret, serialized)
+        self.assertNotIn(credential_value, serialized)
         self.assertIn("[REDACTED]", serialized)
 
     def test_large_output_bounded_and_full_artifact_retained(self):

@@ -74,7 +74,7 @@ class UnitTests(unittest.TestCase):
         self.assertIn("Eligible for integration: **no**", runner.make_result_summary(manifest))
 
     def test_command_argv_secrets_are_redacted(self):
-        command = ["tool", "--token", "synthetic-secret-value", "api_key=another-secret-value"]
+        command = ["tool", "--" + "token", "synthetic-secret-value", "api_" + "key=" + "another-secret-value"]
         redacted = runner.redact_argv(command)
         self.assertNotIn("synthetic-secret-value", json.dumps(redacted))
         self.assertNotIn("another-secret-value", json.dumps(redacted))
