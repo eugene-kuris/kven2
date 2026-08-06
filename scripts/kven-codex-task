@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+"""Run one Codex task in an isolated Kven II linked worktree."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+DEFAULT_REPOSITORY = Path("/opt/kven2")
+DEFAULT_RESULT_ROOT = Path("/home/eugene/kven-codex-results")
+DEFAULT_WORKTREE_ROOT = Path("/opt/kven2-worktrees")
+ENV_REPOSITORY = "KVEN_CODEX_TEST_REPOSITORY"
+ENV_RESULT_ROOT = "KVEN_CODEX_TEST_RESULT_ROOT"
+ENV_WORKTREE_ROOT = "KVEN_CODEX_TEST_WORKTREE_ROOT"
+SECRET_PATTERN = re.compile(
+    r"(?i)(?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret)"
+    r"\s*[:=]\s*['\"]?(?!example|placeholder|redacted|none)[A-Za-z0-9_./+\-=]{12,}"
+)
+SERVICES = (
+    "agent-sandbox.service",
+    "kven2-main.service",
+    "kven2-telegram-gateway.service",
+    "kven-client-gateway.service",
+    "email-agent.service",
+)
+
+
+class RunnerError(RuntimeError):
+    """Expected validation or execution failure."""
+
+
+def task_id_from(text: str, filename: str | None) -> str:
+    for line in text.splitlines():
+        match = re.fullmatch(r"TASK ID:\s*(.+?)\s*", line)
+        if match:
+            return match.group(1)
+    if filename and filename != "-":
+        return Path(filename).stem
+    return "stdin-task"
+
+
+def sanitize_task_id(value: str) -> str:
+    value = re.sub(r"[^A-Za-z0-9]+", "-", value.strip()).strip("-").lower()
+    value = re.sub(r"-+", "-", value)[:64].rstrip("-")
+    return value or "task"
+
+
+def read_task(source: str, stdin=None) -> str:
+    if source == "-":
+        text = (stdin or sys.stdin).read()
+    else:
+        text = Path(source).read_text(encoding="utf-8")
+    if not text.strip():
+        raise RunnerError("task prompt is empty")
+    return text
+
+
+def run(command, *, cwd=None, input_text=None, check=True):
+    completed = subprocess.run(
+        [str(item) for item in command], cwd=cwd, input=input_text, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    if check and completed.returncode:
+        detail = completed.stderr.strip() or completed.stdout.strip()
+        raise RunnerError(f"command failed ({completed.returncode}): {' '.join(map(str, command))}: {detail}")
+    return completed
+
+
+def git(repository: Path, *args: str, check=True):
+    return run(("git", "-C", repository, *args), check=check)
+
+
+def make_codex_command(codex: str, worktree: Path, output_file: Path, model: str | None):
+    command = [codex, "--sandbox", "danger-full-access", "--ask-for-approval", "never"]
+    if model:
+        command.extend(("--model", model))
+    command.extend(("-C", str(worktree), "exec", "--output-last-message", str(output_file), "-"))
+    return command
+
+
+def execution_contract(task: str, allow_network: bool) -> str:
+    network = (
+        "Network access is permitted only where the supplied task explicitly requires it."
+        if allow_network else
+        "Network access is prohibited. Do not use any network-capable command or tool."
+    )
+    return f"""KVEN II CODEX EXECUTION CONTRACT
+{network}
+Inspect the supplied task and repository baseline before editing. Work only on the already-created feature branch and linked worktree. Test, correct, and commit coherent changes. Do not merge, push, deploy, or restart services unless the supplied task explicitly requires it. Protect /agent/data and secrets. Finish with a structured report containing status, branch, baseline, commits, changed files, tests, service status, protected-data status, secret check, remaining actions, and rollback.
+
+SUPPLIED TASK
+{task.rstrip()}
+"""
+
+
+def write_result(path: Path, content: str):
+    path.write_text(content, encoding="utf-8")
+    path.chmod(0o644)
+
+
+def obvious_secret_scan(worktree: Path, baseline: str) -> dict:
+    changed = git(worktree, "diff", "--name-only", baseline).stdout.splitlines()
+    matches = []
+    for relative in changed:
+        path = worktree / relative
+        if not path.is_file() or path.is_symlink():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        for number, line in enumerate(text.splitlines(), 1):
+            if SECRET_PATTERN.search(line):
+                matches.append(f"{relative}:{number}")
+    return {"files_scanned": changed, "matches": matches}
+
+
+def service_states() -> dict:
+    states = {}
+    systemctl = shutil.which("systemctl")
+    for service in SERVICES:
+        if not systemctl:
+            states[service] = "systemctl unavailable"
+            continue
+        result = run((systemctl, "is-active", service), check=False)
+        states[service] = result.stdout.strip() or result.stderr.strip() or f"exit {result.returncode}"
+    return states
+
+
+def agent_data_mount_metadata() -> list[str]:
+    """Read kernel mount metadata without traversing or reading protected data."""
+    try:
+        lines = Path("/proc/self/mountinfo").read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        return [f"unavailable: {exc}"]
+    return [line for line in lines if " /agent/data " in line] or ["no /agent/data mount entry"]
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("task_file", help="task prompt file, or - for stdin")
+    parser.add_argument("--model", help="model forwarded to Codex")
+    parser.add_argument("--allow-network", action="store_true", help="permit only task-required network use")
+    return parser.parse_args(argv)
+
+
+def main(argv=None, stdin=None) -> int:
+    args = parse_args(argv)
+    started = dt.datetime.now(dt.timezone.utc)
+    monotonic_start = time.monotonic()
+    repository = Path(os.environ.get(ENV_REPOSITORY, DEFAULT_REPOSITORY)).resolve()
+    result_root = Path(os.environ.get(ENV_RESULT_ROOT, DEFAULT_RESULT_ROOT)).resolve()
+    worktree_root = Path(os.environ.get(ENV_WORKTREE_ROOT, DEFAULT_WORKTREE_ROOT)).resolve()
+    result_dir = None
+    worktree = None
+    branch = None
+    exit_code = 1
+    summary = "runner failed before execution"
+    lock_handle = None
+    try:
+        task = read_task(args.task_file, stdin)
+        raw_task_id = task_id_from(task, args.task_file)
+        safe_id = sanitize_task_id(raw_task_id)
+        codex = shutil.which("codex")
+        if not codex:
+            raise RunnerError("codex executable was not found")
+        auth = run((codex, "login", "status"), check=False)
+        if auth.returncode:
+            raise RunnerError("codex login status failed")
+        branch_name = git(repository, "branch", "--show-current").stdout.strip()
+        if branch_name != "main":
+            raise RunnerError(f"repository must be on main, found {branch_name or 'detached HEAD'}")
+        if git(repository, "status", "--porcelain").stdout:
+            raise RunnerError("main worktree is dirty")
+        baseline = git(repository, "rev-parse", "HEAD").stdout.strip()
+        origin_main = git(repository, "rev-parse", "refs/remotes/origin/main").stdout.strip()
+        if baseline != origin_main:
+            raise RunnerError("main HEAD does not equal local origin/main")
+
+        result_root.mkdir(parents=True, exist_ok=True, mode=0o755)
+        result_root.chmod(0o755)
+        lock_handle = open(result_root / ".kven-codex-task.lock", "a+", encoding="utf-8")
+        os.chmod(lock_handle.name, 0o644)
+        try:
+            fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RunnerError("another runner is mutating the main repository") from exc
+
+        stamp = started.strftime("%Y%m%dT%H%M%SZ")
+        unique = f"{stamp}-{os.getpid()}"
+        branch = f"codex/{safe_id}-{unique}"
+        worktree = worktree_root / f"{safe_id}-{unique}"
+        result_dir = result_root / f"{safe_id}-{unique}"
+        worktree_root.mkdir(parents=True, exist_ok=True, mode=0o755)
+        result_dir.mkdir(parents=True, mode=0o755)
+        worktree_root.chmod(0o755)
+        result_dir.chmod(0o755)
+        effective = execution_contract(task, args.allow_network)
+        write_result(result_dir / "task.txt", task)
+        write_result(result_dir / "effective-prompt.txt", effective)
+        write_result(result_dir / "task-id.txt", raw_task_id + "\n")
+        write_result(result_dir / "started-at.txt", started.isoformat() + "\n")
+        write_result(result_dir / "codex-version.txt", run((codex, "--version")).stdout)
+        write_result(result_dir / "authentication-status.txt", (auth.stdout or auth.stderr).strip() + "\n")
+        write_result(result_dir / "main-baseline.txt", f"branch=main\nhead={baseline}\norigin/main={origin_main}\n")
+
+        git(repository, "worktree", "add", "-b", branch, worktree, baseline)
+        write_result(result_dir / "worktree.txt", f"branch={branch}\npath={worktree}\n")
+        final_message = result_dir / "final-response.txt"
+        final_message.touch(mode=0o644)
+        command = make_codex_command(codex, worktree, final_message, args.model)
+        completed = run(command, input_text=effective, check=False)
+        write_result(result_dir / "stdout.txt", completed.stdout)
+        write_result(result_dir / "stderr-progress.txt", completed.stderr)
+        exit_code = completed.returncode
+        if final_message.exists():
+            final_message.chmod(0o644)
+
+        final_state = git(worktree, "status", "--short", "--branch", check=False)
+        commits = git(worktree, "log", "--oneline", f"{baseline}..HEAD", check=False)
+        names = git(worktree, "diff", "--name-status", baseline, check=False)
+        diffstat = git(worktree, "diff", "--stat", baseline, check=False)
+        integrity = git(worktree, "diff", "--check", baseline, check=False)
+        secret_scan = obvious_secret_scan(worktree, baseline)
+        write_result(result_dir / "final-git-state.txt", final_state.stdout + final_state.stderr)
+        write_result(result_dir / "commits.txt", commits.stdout + commits.stderr)
+        write_result(result_dir / "changed-files.txt", names.stdout + names.stderr)
+        write_result(result_dir / "diff-summary.txt", diffstat.stdout + diffstat.stderr)
+        write_result(result_dir / "service-state.json", json.dumps(service_states(), indent=2, sort_keys=True) + "\n")
+        write_result(result_dir / "agent-data-mount.txt", "\n".join(agent_data_mount_metadata()) + "\n")
+        write_result(result_dir / "secret-scan.json", json.dumps(secret_scan, indent=2, sort_keys=True) + "\n")
+        post_errors = []
+        if integrity.returncode:
+            post_errors.append(f"diff-check={integrity.returncode}")
+        if secret_scan["matches"]:
+            post_errors.append(f"secret-matches={len(secret_scan['matches'])}")
+        if final_state.returncode or final_state.stdout.splitlines()[1:]:
+            post_errors.append("feature-worktree-not-clean")
+        if not commits.stdout.strip():
+            post_errors.append("no-feature-commit")
+        if git(worktree, "branch", "--show-current", check=False).stdout.strip() != branch:
+            post_errors.append("unexpected-feature-branch")
+        if git(repository, "rev-parse", "HEAD", check=False).stdout.strip() != baseline:
+            post_errors.append("main-head-changed")
+        if git(repository, "status", "--porcelain", check=False).stdout:
+            post_errors.append("main-worktree-not-clean")
+        if post_errors:
+            exit_code = exit_code or 1
+            summary = "post-run integrity checks failed: " + ", ".join(post_errors)
+        elif completed.returncode:
+            summary = f"Codex failed with exit code {completed.returncode}"
+        else:
+            summary = "Codex completed; linked worktree and branch preserved"
+    except (RunnerError, OSError) as exc:
+        summary = str(exc)
+        print(f"error: {exc}", file=sys.stderr)
+    except KeyboardInterrupt:
+        exit_code = 130
+        summary = "interrupted; available evidence was preserved"
+    finally:
+        finished = dt.datetime.now(dt.timezone.utc)
+        if result_dir is not None:
+            try:
+                write_result(result_dir / "finished-at.txt", finished.isoformat() + "\n")
+                write_result(result_dir / "duration-seconds.txt", f"{time.monotonic() - monotonic_start:.3f}\n")
+                write_result(result_dir / "exit-code.txt", f"{exit_code}\n")
+                write_result(result_dir / "summary.txt", summary + "\n")
+            except OSError as exc:
+                print(f"error: result-package failure: {exc}", file=sys.stderr)
+                exit_code = 1
+        if lock_handle:
+            lock_handle.close()
+    print(f"result directory: {result_dir or 'not created'}")
+    print(f"branch: {branch or 'not created'}")
+    print(f"worktree: {worktree or 'not created'}")
+    print(f"exit status: {exit_code}")
+    print(f"summary: {summary}")
+    return exit_code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

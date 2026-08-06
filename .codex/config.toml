@@ -1,0 +1,5 @@
+# Safe defaults for direct sessions. The task runner intentionally overrides
+# sandbox and approval settings for its isolated linked worktree.
+approval_policy = "never"
+sandbox_mode = "read-only"
+web_search = "disabled"
