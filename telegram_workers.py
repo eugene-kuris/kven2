@@ -46,7 +46,22 @@ async def run_generation_once(
     job = await store.claim_next_job()
 
     if job is None:
-        return False
+        claim = getattr(store, "claim_next_compaction", None)
+        if claim is None:
+            return False
+        compaction = await claim()
+        if compaction is None:
+            return False
+        try:
+            generator = getattr(kven_client, "generate_compaction", kven_client.generate_reply)
+            raw = await generator(compaction.messages)
+            await store.complete_compaction(
+                compaction.checkpoint_id, raw,
+                model_id=getattr(kven_client, "_model", None),
+            )
+        except Exception as exc:
+            await store.fail_compaction(compaction.checkpoint_id, exc)
+        return True
 
     context_builder = getattr(store, "build_generation_context", None)
     if context_builder is not None:

@@ -26,4 +26,8 @@ Startup idempotently adds stream, metadata, ready-time, and job-message associat
 
 Rollback requires stopping the gateway, preserving the post-migration database for investigation, restoring the complete pre-migration database/WAL/SHM backup, checking file ownership and permissions, deploying the prior code, and starting one gateway instance. SQLite cannot drop added columns safely in place, so do not attempt a reverse migration on production data.
 
-Known limitations: no edit/delete reconciliation, media understanding, groups, multiple interlocutors, semantic summaries, topic boundaries, or neighboring reply-episode expansion. Missing reply targets remain unresolved. Tail accounting uses the repository's deterministic conservative character estimator rather than a model-specific tokenizer, and the Telegram allocation is not a hard cap for the complete final model request.
+Optional evidence-preserving rolling context checkpoints are documented in
+`TELEGRAM_CONTEXT_COMPACTION.md`. They are disabled by default and remain
+subordinate to this exact transcript and its reply references.
+
+Known limitations: no edit/delete reconciliation, media understanding, groups, multiple interlocutors, topic boundaries, or neighboring reply-episode expansion. Missing reply targets remain unresolved. Tail accounting uses the repository's deterministic conservative character estimator rather than a model-specific tokenizer, and the Telegram allocation is not a hard cap for the complete final model request.
