@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import importlib.machinery
 import importlib.util
 import json
@@ -66,12 +67,13 @@ def cmd(*args, cwd=None, env=None):
     return subprocess.run(args, cwd=cwd, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
-def record(name="synthetic-test", passed=True):
+def record(name="synthetic", passed=True, command=None, artifact="test-artifacts/synthetic.log", content=b""):
     return {
-        "name": name, "command": [sys.executable, "-c", "pass"],
+        "name": name, "command": command or [sys.executable, "-c", "pass"],
         "started_at": "2026-01-01T00:00:00+00:00", "finished_at": "2026-01-01T00:00:01+00:00",
         "duration_seconds": 1.0, "exit_code": 0 if passed else 1, "passed": passed,
-        "bounded_output": "", "output_artifact": "/tmp/synthetic-test.log",
+        "bounded_output": content.decode(errors="replace"), "output_artifact": artifact,
+        "artifact_size": len(content), "artifact_sha256": hashlib.sha256(content).hexdigest(),
     }
 
 
@@ -97,6 +99,9 @@ class RepositoryFixture(unittest.TestCase):
         cmd("git", "-C", str(self.feature_worktree), "add", "feature.txt")
         cmd("git", "-C", str(self.feature_worktree), "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "feature")
         self.feature = cmd("git", "-C", str(self.feature_worktree), "rev-parse", "HEAD").stdout.strip()
+        self.package = self.root / "package"
+        (self.package / "test-artifacts").mkdir(parents=True)
+        (self.package / "test-artifacts" / "synthetic.log").write_bytes(b"")
         check = {"name": "synthetic", "command": [sys.executable, "-c", "pass"], "timeout": 30}
         self.contract = {
             "schema_version": "2.0", "expected_baseline": self.base, "feature_branch": "feature",
@@ -110,6 +115,9 @@ class RepositoryFixture(unittest.TestCase):
         self.manifest = {
             "schema_version": "2.0", "task_id": "TEST", "started_at": "2026-01-01T00:00:00+00:00",
             "finished_at": "2026-01-01T00:00:01+00:00", "codex_runtime_seconds": 1.0,
+            "requested_model": None, "actual_runtime_model": "fixture-model",
+            "actual_reasoning_effort": "high", "token_usage": None,
+            "network_use": {"allowed": False, "used": False, "observation": "network prohibited"},
             "exit_code": 0, "final_codex_status": "PASS", "repository_path": str(self.repo),
             "baseline_branch": "main", "baseline_head": self.base, "origin_main_head": self.base,
             "feature_branch": "feature", "feature_head": self.feature,
@@ -119,8 +127,6 @@ class RepositoryFixture(unittest.TestCase):
             "git_diff_check": {"passed": True}, "secret_scan": {"passed": True},
             "deployment_contract": self.contract,
         }
-        self.package = self.root / "package"
-        self.package.mkdir()
         self.path = self.package / "result-manifest.json"
         self.results = self.root / "results"
         self.backups = self.root / "backups"
@@ -133,7 +139,7 @@ class RepositoryFixture(unittest.TestCase):
         self.path.write_text(json.dumps(self.manifest), encoding="utf-8")
 
     def inspect(self):
-        return integration.inspect_manifest(self.manifest, expected_repository=self.repo)
+        return integration.inspect_manifest(self.manifest, manifest_path=self.path, expected_repository=self.repo)
 
     def stage_cli(self, *extra):
         self.write()
@@ -165,7 +171,7 @@ class RepositoryFixture(unittest.TestCase):
 
     def test_default_repository_boundary_rejects_manifest_redirect(self):
         with self.assertRaisesRegex(integration.IntegrationError, "unexpected repository"):
-            integration.inspect_manifest(self.manifest)
+            integration.inspect_manifest(self.manifest, manifest_path=self.path)
 
     def test_baseline_head_mismatch_rejected(self):
         self.manifest["baseline_head"] = "0" * 40
@@ -207,6 +213,63 @@ class RepositoryFixture(unittest.TestCase):
         with self.assertRaisesRegex(integration.IntegrationError, "required tests failed"):
             self.inspect()
 
+    def test_test_evidence_must_match_contract_exactly_and_in_order(self):
+        unrelated = record(name="unrelated")
+        self.manifest["tests"] = [unrelated]
+        with self.assertRaisesRegex(integration.IntegrationError, "does not match"):
+            self.inspect()
+
+        self.manifest["tests"] = []
+        with self.assertRaisesRegex(integration.IntegrationError, "missing or empty"):
+            self.inspect()
+
+        second_command = [sys.executable, "-c", "print('second')"]
+        second_content = b"second\n"
+        (self.package / "test-artifacts" / "second.log").write_bytes(second_content)
+        self.contract["result_validation_tests"].append({"name": "second", "command": second_command, "timeout": 30})
+        second = record("second", command=second_command, artifact="test-artifacts/second.log", content=second_content)
+        first = record()
+        self.manifest["tests"] = [first]
+        with self.assertRaisesRegex(integration.IntegrationError, "count differs"):
+            self.inspect()
+        self.manifest["tests"] = [first, second, record()]
+        with self.assertRaisesRegex(integration.IntegrationError, "count differs"):
+            self.inspect()
+        self.manifest["tests"] = [second, first]
+        with self.assertRaisesRegex(integration.IntegrationError, "does not match"):
+            self.inspect()
+        mismatched = copy.deepcopy(first)
+        mismatched["command"] = [sys.executable, "-c", "print('wrong')"]
+        self.manifest["tests"] = [mismatched, second]
+        with self.assertRaisesRegex(integration.IntegrationError, "does not match"):
+            self.inspect()
+
+    def test_test_artifact_path_integrity_and_file_type_are_enforced(self):
+        artifact = self.package / "test-artifacts" / "synthetic.log"
+        artifact.unlink()
+        with self.assertRaisesRegex(integration.IntegrationError, "outside or missing"):
+            self.inspect()
+
+        artifact.write_bytes(b"tampered")
+        with self.assertRaisesRegex(integration.IntegrationError, "size/checksum"):
+            self.inspect()
+
+        outside = self.root / "outside.log"
+        outside.write_bytes(b"")
+        artifact.unlink()
+        artifact.symlink_to(outside)
+        with self.assertRaisesRegex(integration.IntegrationError, "outside or missing|regular non-symlink"):
+            self.inspect()
+
+        artifact.unlink()
+        artifact.write_bytes(b"")
+        self.manifest["tests"][0]["output_artifact"] = "../outside.log"
+        with self.assertRaisesRegex(integration.IntegrationError, "outside"):
+            self.inspect()
+        self.manifest["tests"][0]["output_artifact"] = str(outside)
+        with self.assertRaisesRegex(integration.IntegrationError, "artifact metadata"):
+            self.inspect()
+
     def test_hidden_actual_changed_path_and_allowed_scope_rejected(self):
         self.manifest["changed_files"] = []
         with self.assertRaisesRegex(integration.IntegrationError, "changed_files mismatch"):
@@ -240,6 +303,28 @@ class RepositoryFixture(unittest.TestCase):
         self.manifest["deployment_contract"] = None
         with self.assertRaisesRegex(integration.IntegrationError, "deployment contract must be an object"):
             self.inspect()
+
+    def test_literal_credentials_are_rejected_without_reflection(self):
+        literal = "literal-" + "sensitive-value-123"
+        forms = [
+            ["tool", "--" + "token", literal],
+            ["tool", "api_" + "key=" + literal],
+            ["tool", "Authorization", "Bearer " + literal],
+            ["tool", "-----BEGIN " + "PRIVATE KEY-----", literal],
+        ]
+        for command in forms:
+            with self.subTest(form=command[1]):
+                contract = copy.deepcopy(self.contract)
+                contract["pre_merge_tests"] = [{"name": "unsafe", "command": command, "timeout": 30}]
+                with self.assertRaises(integration.IntegrationError) as raised:
+                    integration.validate_contract(contract, self.manifest)
+                self.assertNotIn(literal, str(raised.exception))
+        placeholder = copy.deepcopy(self.contract)
+        placeholder["pre_merge_tests"] = [{
+            "name": "fixture", "command": ["tool", "--" + "token", "synthetic-non-secret-placeholder"],
+            "timeout": 30,
+        }]
+        self.assertTrue(integration.validate_contract(placeholder, self.manifest))
 
     def test_dry_run_is_read_only(self):
         before = integration.repository_state(self.repo)
@@ -279,7 +364,7 @@ class RepositoryFixture(unittest.TestCase):
 
         with mock.patch.object(integration, "inspect_manifest", side_effect=moving_inspect):
             run_dir, state = integration.stage(self.path, self.manifest, args)
-        self.assertIn(state["status"], {"ROLLED_BACK", "INTERNAL_ERROR"})
+        self.assertEqual(state["status"], "AUTOMATED_CHECK_FAILED")
         self.assertIn("feature HEAD mismatch", state["failure"])
         self.assertEqual(integration.repository_state(self.repo)["head"], self.base)
 
@@ -301,6 +386,38 @@ class RepositoryFixture(unittest.TestCase):
             _, state = integration.stage(self.path, self.manifest, self._stage_args())
         self.assertEqual(state["status"], "ROLLED_BACK")
         self.assertIn("local merge failed", state["failure"])
+
+    def test_pre_merge_test_failure_performs_no_git_or_service_rollback(self):
+        self.contract["pre_merge_tests"] = [{
+            "name": "pre-fail", "command": [sys.executable, "-c", "raise SystemExit(7)"], "timeout": 30,
+        }]
+        before = integration.repository_state(self.repo)
+        result = self.stage_cli()
+        self.assertEqual(result.returncode, 3)
+        state = json.loads((self.run_dir() / "integration-manifest.json").read_text())
+        self.assertEqual(state["status"], "AUTOMATED_CHECK_FAILED")
+        self.assertEqual(integration.repository_state(self.repo), before)
+        self.assertFalse((integration.git_common_dir(self.repo) / "kven-integration-active.json").exists())
+
+    def test_migration_validation_failure_leaves_live_database_and_git_untouched(self):
+        database = self.root / "migration-live.sqlite"
+        with sqlite3.connect(database) as connection:
+            connection.execute("create table values_table(value text)")
+            connection.execute("insert into values_table values ('original')")
+        self.contract["backups"]["sqlite"] = [{"path": str(database), "services": []}]
+        self.contract["migration_checks"] = [{
+            "database": str(database),
+            "command": [sys.executable, "-c", "raise SystemExit(8)"],
+            "application_smoke_command": [sys.executable, "-c", "pass"],
+            "idempotent": True,
+        }]
+        before = integration.repository_state(self.repo)
+        self.write()
+        _, state = integration.stage(self.path, self.manifest, self._stage_args())
+        self.assertEqual(state["status"], "AUTOMATED_CHECK_FAILED")
+        self.assertEqual(integration.repository_state(self.repo), before)
+        with sqlite3.connect(database) as connection:
+            self.assertEqual(connection.execute("select value from values_table").fetchone()[0], "original")
 
     def test_finalize_requires_acceptance_then_pushes(self):
         self.assertEqual(self.stage_cli().returncode, 0)
@@ -346,6 +463,67 @@ class RepositoryFixture(unittest.TestCase):
         self.assertIn("repository changed", result.stderr)
         self.assertEqual((self.repo / "feature.txt").read_text(), "operator data\n")
         self.assertEqual(cmd("git", "--git-dir", str(self.remote), "rev-parse", "main").stdout.strip(), self.base)
+
+    def test_stage_readiness_tracked_mutation_never_awaits_acceptance(self):
+        target = self.repo / "base.txt"
+        self.contract["readiness_checks"] = [{
+            "name": "dirty-tracked", "command": [sys.executable, "-c", f"from pathlib import Path; Path({str(target)!r}).write_text('readiness mutation')"],
+            "timeout": 30,
+        }]
+        self.write()
+        _, state = integration.stage(self.path, self.manifest, self._stage_args())
+        self.assertEqual(state["status"], "INTERNAL_ERROR")
+        self.assertNotEqual(state["status"], "AWAITING_ACCEPTANCE")
+        self.assertEqual(target.read_text(), "readiness mutation")
+        self.assertEqual(cmd("git", "--git-dir", str(self.remote), "rev-parse", "main").stdout.strip(), self.base)
+
+    def test_stage_readiness_untracked_mutation_is_preserved_and_refused(self):
+        target = self.repo / "readiness-untracked.txt"
+        self.contract["readiness_checks"] = [{
+            "name": "dirty-untracked", "command": [sys.executable, "-c", f"from pathlib import Path; Path({str(target)!r}).write_text('preserve')"],
+            "timeout": 30,
+        }]
+        self.write()
+        _, state = integration.stage(self.path, self.manifest, self._stage_args())
+        self.assertEqual(state["status"], "INTERNAL_ERROR")
+        self.assertEqual(target.read_text(), "preserve")
+
+    def test_stage_fatal_log_mutation_causes_guarded_rollback_refusal(self):
+        target = self.repo / "feature.txt"
+        self.contract["fatal_log_checks"] = [{
+            "name": "dirty-fatal", "command": [sys.executable, "-c", f"from pathlib import Path; Path({str(target)!r}).write_text('fatal mutation')"],
+            "timeout": 30,
+        }]
+        self.write()
+        _, state = integration.stage(self.path, self.manifest, self._stage_args())
+        self.assertEqual(state["status"], "INTERNAL_ERROR")
+        self.assertIn("refusing rollback", state["rollback_failure"])
+        self.assertEqual(target.read_text(), "fatal mutation")
+
+    def _assert_finalize_check_mutation_refused(self, category):
+        marker = self.root / f"{category}-second-run"
+        target = self.repo / "base.txt"
+        code = (
+            "from pathlib import Path; "
+            f"m=Path({str(marker)!r}); t=Path({str(target)!r}); "
+            "t.write_text('finalize mutation') if m.exists() else m.write_text('stage complete')"
+        )
+        self.contract[category] = [{"name": category, "command": [sys.executable, "-c", code], "timeout": 30}]
+        self.write()
+        run_dir, state = integration.stage(self.path, self.manifest, self._stage_args())
+        self.assertEqual(state["status"], "AWAITING_ACCEPTANCE")
+        args = type("Args", (), {"repository": str(self.repo), "accept": "PASS", "notes": ""})()
+        with integration.repository_lock(self.repo) as active:
+            with self.assertRaisesRegex(integration.IntegrationError, "repository changed"):
+                integration.finalize_run(run_dir, state, args, active)
+        self.assertEqual(target.read_text(), "finalize mutation")
+        self.assertEqual(cmd("git", "--git-dir", str(self.remote), "rev-parse", "main").stdout.strip(), self.base)
+
+    def test_finalize_readiness_repository_mutation_prevents_push(self):
+        self._assert_finalize_check_mutation_refused("readiness_checks")
+
+    def test_finalize_fatal_log_repository_mutation_prevents_push(self):
+        self._assert_finalize_check_mutation_refused("fatal_log_checks")
 
     def test_dirty_tracked_and_untracked_rollback_refused_without_loss(self):
         for untracked in (False, True):
@@ -612,6 +790,73 @@ path.write_text(json.dumps(data))
         with self.assertRaisesRegex(integration.IntegrationError, "rapid restart loop"):
             integration.restart_declared_service(self.manager, "kven2-main.service", timeout=1)
 
+    def test_systemd_rc3_preserves_exact_failed_and_transitional_states(self):
+        for state in ("failed", "activating", "deactivating", "reloading", "unknown"):
+            with self.subTest(state=state):
+                self.set_service(state)
+                self.assertEqual(integration.service_state(self.manager, "kven2-main.service"), state)
+
+    def test_unsupported_pre_stage_service_state_has_zero_live_mutation(self):
+        for unsupported in ("failed", "activating", "deactivating"):
+            with self.subTest(state=unsupported):
+                marker = integration.git_common_dir(self.repo) / "kven-integration-active.json"
+                marker.unlink(missing_ok=True)
+                if self.results.exists():
+                    shutil_rmtree(self.results)
+                self.set_service(unsupported)
+                self.service_contract()
+                before = integration.repository_state(self.repo)
+                _, state = self.stage_service()
+                data = json.loads(self.service_state_file.read_text())["kven2-main.service"]
+                self.assertEqual(state["status"], "AUTOMATED_CHECK_FAILED")
+                self.assertEqual(data["state"], unsupported)
+                self.assertEqual(data["restarts"], 0)
+                self.assertEqual(integration.repository_state(self.repo), before)
+                self.assertFalse(marker.exists())
+
+    def test_delayed_restart_count_drift_after_readiness_is_detected(self):
+        self.service_contract()
+        code = (
+            "import json,pathlib; "
+            f"p=pathlib.Path({str(self.service_state_file)!r}); d=json.loads(p.read_text()); "
+            "d['kven2-main.service']['restarts']+=1; p.write_text(json.dumps(d))"
+        )
+        self.contract["readiness_checks"] = [{"name": "delayed-loop", "command": [sys.executable, "-c", code], "timeout": 30}]
+        _, state = self.stage_service()
+        self.assertEqual(state["status"], "ROLLED_BACK")
+        self.assertIn("restart count changed", state["failure"])
+
+    def test_finalize_detects_restart_count_drift(self):
+        self.service_contract()
+        run_dir, state = self.stage_service()
+        data = json.loads(self.service_state_file.read_text())
+        data["kven2-main.service"]["restarts"] += 1
+        self.service_state_file.write_text(json.dumps(data), encoding="utf-8")
+        args = type("Args", (), {"repository": str(self.repo), "accept": "PASS", "notes": ""})()
+        with integration.repository_lock(self.repo) as marker:
+            with self.assertRaisesRegex(integration.IntegrationError, "restart count changed"):
+                integration.finalize_run(run_dir, state, args, marker)
+        self.assertEqual(cmd("git", "--git-dir", str(self.remote), "rev-parse", "main").stdout.strip(), self.base)
+
+    def test_finalize_check_service_state_mutation_prevents_push(self):
+        self.service_contract()
+        marker_path = self.root / "finalize-service-check"
+        code = (
+            "import json,pathlib; "
+            f"m=pathlib.Path({str(marker_path)!r}); p=pathlib.Path({str(self.service_state_file)!r}); "
+            "d=json.loads(p.read_text()); "
+            "d['kven2-main.service']['state']='inactive' if m.exists() else d['kven2-main.service']['state']; "
+            "p.write_text(json.dumps(d)); m.write_text('seen')"
+        )
+        self.contract["readiness_checks"] = [{"name": "state-drift", "command": [sys.executable, "-c", code], "timeout": 30}]
+        run_dir, state = self.stage_service()
+        self.assertEqual(state["status"], "AWAITING_ACCEPTANCE")
+        args = type("Args", (), {"repository": str(self.repo), "accept": "PASS", "notes": ""})()
+        with integration.repository_lock(self.repo) as marker:
+            with self.assertRaisesRegex(integration.IntegrationError, "service state or restart count changed"):
+                integration.finalize_run(run_dir, state, args, marker)
+        self.assertEqual(cmd("git", "--git-dir", str(self.remote), "rev-parse", "main").stdout.strip(), self.base)
+
     def test_readiness_and_fatal_log_failures_roll_back(self):
         for readiness, fatal in ((7, 0), (0, 8)):
             with self.subTest(readiness=readiness, fatal=fatal):
@@ -639,12 +884,13 @@ path.write_text(json.dumps(data))
         self.service_contract()
         run_dir, state = self.stage_service()
         self.assertEqual(state["status"], "AWAITING_ACCEPTANCE")
+        staged_service_data = self.service_state_file.read_text()
         self.set_service("inactive")
         args = type("Args", (), {"repository": str(self.repo), "accept": "PASS", "notes": ""})()
         with integration.repository_lock(self.repo) as marker:
-            with self.assertRaisesRegex(integration.IntegrationError, "service state changed"):
+            with self.assertRaisesRegex(integration.IntegrationError, "service state or restart count changed"):
                 integration.finalize_run(run_dir, state, args, marker)
-        self.set_service("active")
+        self.service_state_file.write_text(staged_service_data, encoding="utf-8")
         state = json.loads((run_dir / "integration-manifest.json").read_text())
         state["contract"]["readiness_checks"][0]["command"] = [sys.executable, "-c", "raise SystemExit(2)"]
         with integration.repository_lock(self.repo) as marker:

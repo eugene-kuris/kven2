@@ -91,6 +91,12 @@ class UnitTests(unittest.TestCase):
             self.assertTrue(first[0]["passed"])
             self.assertTrue(second[0]["passed"])
 
+    def test_runtime_model_reasoning_and_token_header_parsing(self):
+        parsed = runner.parse_runtime_metadata("", "model: gpt-fixture\nreasoning effort: high\ntokens used: 12,345\n")
+        self.assertEqual(parsed, {
+            "actual_model": "gpt-fixture", "actual_reasoning_effort": "high", "token_usage": 12345,
+        })
+
 
 class IntegrationTests(unittest.TestCase):
     def setUp(self):
@@ -118,12 +124,23 @@ if sys.argv[1:] == ['--version']:
  print('codex-cli test'); raise SystemExit(0)
 args=sys.argv[1:]; work=pathlib.Path(args[args.index('-C')+1]); out=pathlib.Path(args[args.index('--output-last-message')+1])
 prompt=sys.stdin.read(); (work/'agent.txt').write_text(prompt)
-contract={'schema_version':'2.0','result_validation_tests':[{'name':'synthetic-validation','command':[sys.executable,'-c',"import os,pathlib; pathlib.Path('validation-dirty').write_text('dirty') if os.environ.get('VALIDATION_DIRTY') else None; raise SystemExit(int(os.environ.get('VALIDATION_EXIT','0')))"],'timeout':30}]}
+mutation='''import os,pathlib,subprocess
+mode=os.environ.get('VALIDATION_MUTATION') or ('untracked' if os.environ.get('VALIDATION_DIRTY') else '')
+if mode:
+ p=pathlib.Path('validation-'+mode); p.write_text('preserve')
+ if mode in {'stage','commit'}: subprocess.run(['git','add',str(p)],check=True)
+ if mode=='commit': subprocess.run(['git','-c','user.name=Test','-c','user.email=test@example.invalid','commit','-m','validation mutation'],check=True,stdout=subprocess.DEVNULL)
+raise SystemExit(int(os.environ.get('VALIDATION_EXIT','0')))
+'''
+contract={'schema_version':'2.0','result_validation_tests':[{'name':'synthetic-validation','command':[sys.executable,'-c',mutation],'timeout':30}]}
+if os.environ.get('CONTRACT_LITERAL'): contract['result_validation_tests'][0]['command'] += ['--'+'token', os.environ['CONTRACT_LITERAL']]
 (work/'deployment-contract.json').write_text(json.dumps(contract))
 subprocess.run(['git','add','agent.txt','deployment-contract.json'],cwd=work,check=True)
 subprocess.run(['git','-c','user.name=Test','-c','user.email=test@example.invalid','commit','-m','agent work'],cwd=work,check=True,stdout=subprocess.DEVNULL)
-out.write_text('final report')
-print('fake stdout'); print('fake progress',file=sys.stderr)
+out.write_text('final report --token '+os.environ['CONTRACT_LITERAL'] if os.environ.get('CONTRACT_LITERAL') else 'final report')
+model=os.environ.get('ACTUAL_MODEL') or (args[args.index('--model')+1] if '--model' in args else 'default-fixture-model')
+print('model: '+model, file=sys.stderr); print('reasoning effort: high', file=sys.stderr); print('tokens used: 1234', file=sys.stderr)
+print('fake stdout'+((' --token '+os.environ['CONTRACT_LITERAL']) if os.environ.get('CONTRACT_LITERAL') else '')); print('fake progress',file=sys.stderr)
 raise SystemExit(int(os.environ.get('FAKE_CODEX_EXIT','0')))
 """, encoding="utf-8")
         fake.chmod(0o755)
@@ -165,7 +182,14 @@ raise SystemExit(int(os.environ.get('FAKE_CODEX_EXIT','0')))
         self.assertIn("finished_at", record)
         self.assertIn("duration_seconds", record)
         self.assertEqual(record["exit_code"], 0)
-        self.assertTrue(Path(record["output_artifact"]).is_file())
+        self.assertFalse(Path(record["output_artifact"]).is_absolute())
+        self.assertTrue((package / record["output_artifact"]).is_file())
+        self.assertEqual(record["artifact_size"], (package / record["output_artifact"]).stat().st_size)
+        self.assertEqual(manifest["requested_model"], "unit-model")
+        self.assertEqual(manifest["actual_runtime_model"], "unit-model")
+        self.assertEqual(manifest["actual_reasoning_effort"], "high")
+        self.assertEqual(manifest["token_usage"], 1234)
+        self.assertFalse(manifest["network_use"]["used"])
         self.assertEqual(stat.S_IMODE(package.stat().st_mode), 0o755)
         self.assertTrue(all(stat.S_IMODE(p.stat().st_mode) == 0o644 for p in package.iterdir() if p.is_file()))
         branches = command("git", "-C", str(self.repo), "branch", "--format=%(refname:short)").stdout
@@ -212,6 +236,63 @@ raise SystemExit(int(os.environ.get('FAKE_CODEX_EXIT','0')))
         manifest = json.loads((package / "result-manifest.json").read_text())
         self.assertEqual(manifest["final_codex_status"], "FAIL")
         self.assertIn("feature-worktree-not-clean", (package / "summary.txt").read_text())
+
+    def test_validation_command_commit_does_not_replace_tested_feature_head(self):
+        env = self.env.copy(); env["VALIDATION_MUTATION"] = "commit"
+        result = self.invoke(env=env)
+        self.assertEqual(result.returncode, 1)
+        package = next(self.results.glob("demo-*"))
+        manifest = json.loads((package / "result-manifest.json").read_text())
+        worktree = next(self.worktrees.glob("demo-*"))
+        actual = command("git", "-C", str(worktree), "rev-parse", "HEAD").stdout.strip()
+        self.assertEqual(manifest["final_codex_status"], "FAIL")
+        self.assertNotEqual(manifest["feature_head"], actual)
+        self.assertIn("feature-state-changed-during-validation", (package / "summary.txt").read_text())
+
+    def test_validation_command_stages_file_and_runner_fails(self):
+        env = self.env.copy(); env["VALIDATION_MUTATION"] = "stage"
+        result = self.invoke(env=env)
+        self.assertEqual(result.returncode, 1)
+        package = next(self.results.glob("demo-*"))
+        manifest = json.loads((package / "result-manifest.json").read_text())
+        self.assertEqual(manifest["final_codex_status"], "FAIL")
+        worktree = next(self.worktrees.glob("demo-*"))
+        self.assertIn("validation-stage", command("git", "-C", str(worktree), "diff", "--cached", "--name-only").stdout)
+
+    def test_validation_command_untracked_data_is_preserved_on_failure(self):
+        env = self.env.copy(); env["VALIDATION_MUTATION"] = "untracked"
+        result = self.invoke(env=env)
+        self.assertEqual(result.returncode, 1)
+        worktree = next(self.worktrees.glob("demo-*"))
+        self.assertEqual((worktree / "validation-untracked").read_text(), "preserve")
+
+    def test_requested_actual_model_mismatch_fails(self):
+        env = self.env.copy(); env["ACTUAL_MODEL"] = "different-runtime-model"
+        result = self.invoke("--model", "requested-model", env=env)
+        self.assertEqual(result.returncode, 1)
+        manifest = json.loads((next(self.results.glob("demo-*")) / "result-manifest.json").read_text())
+        self.assertEqual(manifest["requested_model"], "requested-model")
+        self.assertEqual(manifest["actual_runtime_model"], "different-runtime-model")
+        self.assertEqual(manifest["final_codex_status"], "FAIL")
+
+    def test_no_requested_model_still_records_actual_runtime_model(self):
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0)
+        manifest = json.loads((next(self.results.glob("demo-*")) / "result-manifest.json").read_text())
+        self.assertIsNone(manifest["requested_model"])
+        self.assertEqual(manifest["actual_runtime_model"], "default-fixture-model")
+
+    def test_literal_contract_credential_never_enters_result_evidence(self):
+        literal = "literal-" + "sensitive-value-123"
+        env = self.env.copy(); env["CONTRACT_LITERAL"] = literal
+        result = self.invoke(env=env)
+        self.assertEqual(result.returncode, 1)
+        package = next(self.results.glob("demo-*"))
+        manifest = json.loads((package / "result-manifest.json").read_text())
+        self.assertIsNone(manifest["deployment_contract"])
+        for path in package.rglob("*"):
+            if path.is_file():
+                self.assertNotIn(literal, path.read_text(encoding="utf-8", errors="replace"), str(path))
 
 
 if __name__ == "__main__":

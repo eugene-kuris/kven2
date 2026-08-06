@@ -39,7 +39,7 @@ Packages are created below `/home/eugene/kven-codex-results/<task>-<timestamp>-<
 - `result-manifest.json`, the canonical machine-readable result (schema `2.0`);
 - `result-summary.md`, the canonical human entry point and next command;
 
-- original and effective prompts, task ID, timestamps, duration, and summary;
+- defensively redacted original/effective prompts, task ID, timestamps, duration, and summary;
 - Codex version and credential-free authentication status;
 - final response, stdout, progress/stderr, and exit code;
 - main baseline, branch/worktree details, final Git state, commits, changed files, and diff summary;
@@ -47,7 +47,7 @@ Packages are created below `/home/eugene/kven-codex-results/<task>-<timestamp>-<
 
 The package deliberately excludes authentication files, private `.env` contents, tokens, credentials, databases, and private runtime logs. Interrupted and failed runs preserve whatever evidence was produced.
 
-When a committed `deployment-contract.json` is present, the runner embeds its parsed value in the manifest. A malformed contract is recorded as an error rather than interpreted from the final natural-language response. The contract must declare non-empty `result_validation_tests`. The runner itself executes them after Codex and records exact redacted argv, timestamps, duration, exit code, pass/fail, bounded output, and a full redacted artifact. Empty or failed evidence forces a failed final status.
+When a committed `deployment-contract.json` is present, the runner validates it before embedding it. Literal credential-bearing argv or private-key material is refused without persisting the raw contract. A malformed/unsafe contract is recorded as a redacted error rather than interpreted from the final natural-language response. The contract must declare non-empty `result_validation_tests`. The runner snapshots exact feature branch/HEAD/index/status, executes the commands, and requires the snapshot to remain identical after each command. It records exact names/redacted argv in contract order, timestamps, duration, exit code, pass/fail, bounded output, and package-relative artifacts with sizes and SHA-256 values. Empty, mismatched, failed, tampered, or repository-mutating evidence forces a failed final status. Requested model, actual startup-stream model, reasoning effort, and reported token use are distinct facts; model mismatch also forces failure.
 
 Post-Codex integration is described in `KVEN_INTEGRATION_WORKFLOW.md`. Begin with the exact command printed in `result-summary.md`.
 

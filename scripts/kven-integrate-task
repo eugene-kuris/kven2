@@ -30,7 +30,24 @@ SERVICE_ALLOWLIST = {
     "kven2-telegram-gateway.service", "kven-client-gateway.service",
     "email-agent.service",
 }
-SECRET_RE = re.compile(r"(?i)(password|secret|token|api[_-]?key)(\s*[:=]\s*|=)([^\s]+)")
+SECRET_RE = re.compile(
+    r"(?i)(password|secret|token|api[_-]?key|access[_-]?token|authorization)"
+    r"(\s*[:=]\s*|=)([^\s]+)"
+)
+SENSITIVE_OPTION_RE = re.compile(
+    r"(?i)^--?(?:password|secret|token|api[-_]?key|access[-_]?token|authorization)$"
+)
+SENSITIVE_ASSIGNMENT_RE = re.compile(
+    r"(?i)^(?:--?)?(?:password|secret|token|api[-_]?key|access[-_]?token|authorization)="
+)
+PRIVATE_KEY_RE = re.compile(r"(?i)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
+PRIVATE_KEY_BLOCK_RE = re.compile(
+    r"(?is)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----"
+)
+OPTION_VALUE_RE = re.compile(
+    r"(?i)(--?(?:password|secret|token|api[-_]?key|access[-_]?token|authorization)\s+)([^\s]+)"
+)
+BEARER_RE = re.compile(r"(?i)(\bBearer\s+)([^\s]+)")
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 ACTIVE_STATES = {"BACKING_UP", "MIGRATING", "PRE_MERGE_TESTING", "MERGING", "POST_MERGE_TESTING",
                  "DEPLOYING", "RESTARTING_SERVICES", "VERIFYING", "AWAITING_ACCEPTANCE",
@@ -87,6 +104,9 @@ def write_artifact(path: Path, text: str, *, mode=0o644) -> None:
 
 
 def redact(text: str) -> str:
+    text = PRIVATE_KEY_BLOCK_RE.sub("[REDACTED PRIVATE KEY]", text)
+    text = OPTION_VALUE_RE.sub(lambda match: f"{match.group(1)}[REDACTED]", text)
+    text = BEARER_RE.sub(lambda match: f"{match.group(1)}[REDACTED]", text)
     return SECRET_RE.sub(lambda match: f"{match.group(1)}{match.group(2)}[REDACTED]", text)
 
 
@@ -98,12 +118,51 @@ def redact_argv(command) -> list[str]:
         if hide_next:
             result.append("[REDACTED]")
             hide_next = False
-        elif text.lower() in {"--password", "--secret", "--token", "--api-key", "--api_key"}:
+        elif SENSITIVE_OPTION_RE.fullmatch(text):
             result.append(text)
             hide_next = True
+        elif text.lower() in {"authorization", "bearer"}:
+            result.append(text)
+            hide_next = True
+        elif PRIVATE_KEY_RE.search(text):
+            result.append("[REDACTED PRIVATE KEY]")
         else:
             result.append(redact(text))
     return result
+
+
+def _non_secret_fixture(value: str) -> bool:
+    normalized = value.strip().lower()
+    return any(marker in normalized for marker in (
+        "placeholder", "example", "[redacted]", "synthetic-non-secret", "fixture-non-secret",
+    ))
+
+
+def reject_literal_secrets(command, label: str) -> None:
+    """Reject credential material without reflecting the offending value."""
+    hide_next = False
+    for raw in command:
+        value = str(raw)
+        lowered = value.strip().lower()
+        if hide_next:
+            if not _non_secret_fixture(value):
+                raise IntegrationError(f"{label} contains a literal credential value")
+            hide_next = False
+            continue
+        if SENSITIVE_OPTION_RE.fullmatch(value) or lowered in {"authorization", "bearer"}:
+            hide_next = True
+            continue
+        if SENSITIVE_ASSIGNMENT_RE.match(value):
+            assigned = value.split("=", 1)[1]
+            if not _non_secret_fixture(assigned):
+                raise IntegrationError(f"{label} contains a literal credential assignment")
+        if lowered.startswith("authorization:") or lowered.startswith("bearer "):
+            if not _non_secret_fixture(value):
+                raise IntegrationError(f"{label} contains literal authorization material")
+        if PRIVATE_KEY_RE.search(value):
+            raise IntegrationError(f"{label} contains private-key material")
+    if hide_next:
+        raise IntegrationError(f"{label} has a credential option without an indirect value")
 
 
 def bounded(text: str, limit=OUTPUT_LIMIT) -> str:
@@ -147,6 +206,7 @@ def validate_command_items(value, label: str, *, required_nonempty=False) -> lis
         command = item["command"]
         if not isinstance(command, list) or not command or not all(_is_string(x) for x in command):
             raise IntegrationError(f"{label}[{index}].command must be a non-empty argv array")
+        reject_literal_secrets(command, f"{label}[{index}].command")
         timeout = item.get("timeout", 300)
         if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout < 1 or timeout > 7200:
             raise IntegrationError(f"{label}[{index}].timeout is invalid")
@@ -205,6 +265,7 @@ def validate_contract(contract: object, manifest: dict) -> dict:
         for key in ("command", "application_smoke_command"):
             if not isinstance(check[key], list) or not check[key] or not all(_is_string(x) for x in check[key]):
                 raise IntegrationError(f"migration_checks[{index}].{key} must be a non-empty argv array")
+            reject_literal_secrets(check[key], f"migration_checks[{index}].{key}")
         if check.get("verification_sql", []) and not all(_is_string(x) for x in check["verification_sql"]):
             raise IntegrationError(f"migration_checks[{index}].verification_sql is invalid")
     for field in ("result_validation_tests", "pre_merge_tests", "post_merge_tests"):
@@ -217,8 +278,8 @@ def validate_contract(contract: object, manifest: dict) -> dict:
     if not isinstance(checklist, list) or not checklist or not all(_is_string(x) for x in checklist):
         raise IntegrationError("acceptance_checklist must be a non-empty string array")
     rollback = _require_keys(contract["rollback"], {"restore_git", "restore_backups", "verify_readiness"}, "rollback")
-    if not all(type(rollback[x]) is bool for x in rollback):
-        raise IntegrationError("rollback values must be booleans")
+    if not all(rollback[x] is True for x in rollback):
+        raise IntegrationError("all production rollback safety guarantees must be enabled")
     contract["backups"] = normalized_backups
     return contract
 
@@ -229,9 +290,10 @@ def validate_manifest_types(data: object) -> dict:
         "exit_code", "final_codex_status", "repository_path", "baseline_branch", "baseline_head",
         "origin_main_head", "feature_branch", "feature_head", "worktree_path", "commits_created",
         "changed_files", "tests", "git_diff_check", "secret_scan", "deployment_contract",
+        "requested_model", "actual_runtime_model", "actual_reasoning_effort", "token_usage", "network_use",
     }
     data = _require_keys(data, required, "result manifest", {
-        "codex_model", "token_usage", "summary", "network_use", "deployment_contract_error",
+        "codex_model", "summary", "deployment_contract_error",
         "requested_deployment_services", "requested_backup_targets", "requested_migration_checks",
         "result_package_path",
     })
@@ -248,6 +310,21 @@ def validate_manifest_types(data: object) -> dict:
         raise IntegrationError("codex_runtime_seconds must be numeric")
     if type(data["exit_code"]) is not int or data["final_codex_status"] not in {"PASS", "FAIL"}:
         raise IntegrationError("result status fields are invalid")
+    if data["requested_model"] is not None and not _is_string(data["requested_model"]):
+        raise IntegrationError("requested_model must be null or a non-empty string")
+    if not _is_string(data["actual_runtime_model"]) or not _is_string(data["actual_reasoning_effort"]):
+        raise IntegrationError("actual runtime model/reasoning evidence is required")
+    if data["requested_model"] is not None and data["requested_model"] != data["actual_runtime_model"]:
+        raise IntegrationError("requested and actual runtime model conflict")
+    if data["token_usage"] is not None and (type(data["token_usage"]) is not int or data["token_usage"] < 0):
+        raise IntegrationError("token_usage must be null or a non-negative integer")
+    network = _require_keys(data["network_use"], {"allowed", "used", "observation"}, "network_use")
+    if (type(network["allowed"]) is not bool
+            or (network["used"] is not None and type(network["used"]) is not bool)
+            or not _is_string(network["observation"])):
+        raise IntegrationError("network_use evidence is invalid")
+    if network["allowed"] is False and network["used"] is not False:
+        raise IntegrationError("prohibited network use must be recorded as false")
     if not isinstance(data["changed_files"], list) or len(data["changed_files"]) != len(set(data["changed_files"])) or not all(_is_string(x) for x in data["changed_files"]):
         raise IntegrationError("changed_files must be a unique string array")
     commits = data["commits_created"]
@@ -260,15 +337,19 @@ def validate_manifest_types(data: object) -> dict:
     tests = data["tests"]
     if not isinstance(tests, list) or not tests:
         raise IntegrationError("required test evidence is missing or empty")
-    test_required = {"name", "command", "started_at", "finished_at", "duration_seconds", "exit_code", "passed", "bounded_output", "output_artifact"}
+    test_required = {"name", "command", "started_at", "finished_at", "duration_seconds", "exit_code", "passed", "bounded_output", "output_artifact", "artifact_size", "artifact_sha256"}
     for index, test in enumerate(tests):
         test = _require_keys(test, test_required, f"tests[{index}]")
         if not isinstance(test["command"], list) or not test["command"] or not all(_is_string(x) for x in test["command"]):
             raise IntegrationError(f"tests[{index}].command must be a non-empty argv array")
         if type(test["exit_code"]) is not int or type(test["passed"]) is not bool:
             raise IntegrationError(f"tests[{index}] outcome fields are invalid")
-        if not all(_is_string(test[x]) for x in ("name", "started_at", "finished_at", "output_artifact")) or not isinstance(test["bounded_output"], str):
+        if not all(_is_string(test[x]) for x in ("name", "started_at", "finished_at", "output_artifact", "artifact_sha256")) or not isinstance(test["bounded_output"], str):
             raise IntegrationError(f"tests[{index}] evidence fields are invalid")
+        if Path(test["output_artifact"]).is_absolute() or not re.fullmatch(r"[0-9a-f]{64}", test["artifact_sha256"]):
+            raise IntegrationError(f"tests[{index}] artifact metadata is invalid")
+        if type(test["artifact_size"]) is not int or test["artifact_size"] < 0:
+            raise IntegrationError(f"tests[{index}].artifact_size is invalid")
         if not isinstance(test["duration_seconds"], (int, float)) or isinstance(test["duration_seconds"], bool):
             raise IntegrationError(f"tests[{index}].duration_seconds is invalid")
     for field in ("git_diff_check", "secret_scan"):
@@ -340,8 +421,33 @@ def verify_feature_worktree(manifest: dict) -> dict:
     return state
 
 
-def inspect_manifest(manifest: dict, *, expected_repository: Path = DEFAULT_REPOSITORY) -> dict:
+def _verify_test_evidence(manifest: dict, manifest_path: Path) -> None:
+    package = manifest_path.resolve().parent
+    required = manifest["deployment_contract"]["result_validation_tests"]
+    tests = manifest["tests"]
+    if len(tests) != len(required):
+        raise IntegrationError("test evidence count differs from result_validation_tests")
+    for index, (test, expected) in enumerate(zip(tests, required)):
+        if test["name"] != expected["name"] or test["command"] != redact_argv(expected["command"]):
+            raise IntegrationError(f"tests[{index}] does not match result_validation_tests order/name/argv")
+        relative = Path(test["output_artifact"])
+        if relative.is_absolute() or ".." in relative.parts:
+            raise IntegrationError(f"tests[{index}] artifact path is outside the result package")
+        artifact = package / relative
+        try:
+            resolved = artifact.resolve(strict=True)
+            resolved.relative_to(package)
+        except (OSError, ValueError):
+            raise IntegrationError(f"tests[{index}] artifact path is outside or missing") from None
+        if artifact.is_symlink() or not resolved.is_file():
+            raise IntegrationError(f"tests[{index}] artifact must be a regular non-symlink file")
+        if resolved.stat().st_size != test["artifact_size"] or sha256(resolved) != test["artifact_sha256"]:
+            raise IntegrationError(f"tests[{index}] artifact size/checksum mismatch")
+
+
+def inspect_manifest(manifest: dict, *, manifest_path: Path, expected_repository: Path = DEFAULT_REPOSITORY) -> dict:
     validate_manifest_types(manifest)
+    _verify_test_evidence(manifest, manifest_path)
     repo = Path(manifest["repository_path"]).resolve()
     expected = expected_repository.resolve()
     if repo != expected:
@@ -495,7 +601,7 @@ def service_state(manager: list[str], service: str, *, timeout=10) -> str:
     value = (result.stdout.strip() or result.stderr.strip()).splitlines()[0] if (result.stdout.strip() or result.stderr.strip()) else "unknown"
     if result.returncode == 0 and value == "active":
         return "active"
-    if value == "inactive" or result.returncode == 3:
+    if value == "inactive":
         return "inactive"
     return value or f"exit-{result.returncode}"
 
@@ -632,12 +738,38 @@ def validate_migrations(contract: dict, backups: list[dict], run_dir: Path) -> l
     return results
 
 
-def run_checks(items: list, run_dir: Path, category: str, *, cwd: Path) -> list[dict]:
+def require_repository_state(repo: Path, expected: dict, phase: str) -> None:
+    actual = repository_state(repo)
+    if expected.get("status") or actual != expected:
+        raise IntegrationError(f"repository changed during {phase}")
+
+
+def service_snapshot(manager: list[str], services: list[str], timeout: float) -> dict:
+    return {
+        service: {
+            "state": service_state(manager, service, timeout=timeout),
+            "restart_count": restart_count(manager, service, timeout=timeout),
+        }
+        for service in services
+    }
+
+
+def require_service_snapshot(manager: list[str], expected: dict, timeout: float, phase: str) -> dict:
+    actual = service_snapshot(manager, list(expected), timeout)
+    if actual != expected:
+        raise IntegrationError(f"service state or restart count changed during {phase}")
+    return actual
+
+
+def run_checks(items: list, run_dir: Path, category: str, *, cwd: Path,
+               expected_repository_state: dict | None = None) -> list[dict]:
     records = []
     for index, item in enumerate(items):
         record = command_record(item["command"], run_dir / "logs" / f"{category}-{index}.log",
                                 cwd=cwd, timeout=item["timeout"])
         records.append(record)
+        if expected_repository_state is not None:
+            require_repository_state(cwd, expected_repository_state, f"{category}[{index}]")
         if not record["passed"]:
             raise IntegrationError(f"{category} command failed; see {record['output_artifact']}")
     return records
@@ -793,8 +925,14 @@ def restore_service_states(state: dict, run_dir: Path, contract: dict, args) -> 
         wait_service_state(args.service_manager, service, target, timeout=args.service_timeout)
         records[service] = service_state(args.service_manager, service)
     if any(value == "active" for value in desired.values()) or not desired:
-        state["rollback_readiness"] = run_checks(contract["readiness_checks"], run_dir, "rollback-readiness", cwd=Path(state["repository"]))
-        state["rollback_fatal_logs"] = run_checks(contract["fatal_log_checks"], run_dir, "rollback-fatal-logs", cwd=Path(state["repository"]))
+        state["rollback_readiness"] = run_checks(
+            contract["readiness_checks"], run_dir, "rollback-readiness", cwd=Path(state["repository"]),
+            expected_repository_state=state["expected_repository_state"],
+        )
+        state["rollback_fatal_logs"] = run_checks(
+            contract["fatal_log_checks"], run_dir, "rollback-fatal-logs", cwd=Path(state["repository"]),
+            expected_repository_state=state["expected_repository_state"],
+        )
     return records
 
 
@@ -848,7 +986,7 @@ def rollback_state(run_dir: Path, state: dict, reason: str, *, marker: Path | No
 def stage(manifest_path: Path, manifest: dict, args) -> tuple[Path, dict]:
     repo = Path(args.repository).resolve()
     with repository_lock(repo) as marker:
-        preflight = inspect_manifest(manifest, expected_repository=repo)
+        preflight = inspect_manifest(manifest, manifest_path=manifest_path, expected_repository=repo)
         identifier = run_id(manifest["task_id"])
         run_dir = Path(args.result_root).resolve() / manifest["task_id"] / identifier
         backup_dir = Path(args.backup_root).resolve() / identifier
@@ -865,6 +1003,7 @@ def stage(manifest_path: Path, manifest: dict, args) -> tuple[Path, dict]:
             "service_manager": args.service_manager, "service_timeout": args.service_timeout,
             "acceptance_checklist": contract["acceptance_checklist"],
             "expected_repository_state": preflight["main_state"],
+            "live_mutation_started": False,
             "commands": {
                 "finalize": f"{repo}/scripts/kven-integrate-task finalize {run_dir} --accept PASS --repository {repo}",
                 "rollback": f"{repo}/scripts/kven-integrate-task rollback {run_dir} --repository {repo}",
@@ -878,6 +1017,9 @@ def stage(manifest_path: Path, manifest: dict, args) -> tuple[Path, dict]:
             state["service_status_before"] = {service: service_state(args.service_manager, service) for service in contract["services"]}
             if any(value not in {"active", "inactive"} for value in state["service_status_before"].values()):
                 raise IntegrationError("declared service has an unsupported pre-stage state")
+            state["service_snapshot_before"] = service_snapshot(
+                args.service_manager, contract["services"], args.service_timeout,
+            )
             atomic_json(run_dir / "services-before.json", state["service_status_before"])
             persist(run_dir, state, "BACKING_UP", "BACKING_UP")
             state["backups"] = create_backups(contract, backup_dir)
@@ -886,13 +1028,17 @@ def stage(manifest_path: Path, manifest: dict, args) -> tuple[Path, dict]:
             state["migration_validation"] = validate_migrations(contract, state["backups"], run_dir)
             atomic_json(run_dir / "migration-validation.json", state["migration_validation"])
             persist(run_dir, state, "PRE_MERGE_TESTING", "PRE_MERGE_TESTING")
-            state["pre_merge_tests"] = run_checks(contract["pre_merge_tests"], run_dir, "pre-merge", cwd=repo)
+            state["pre_merge_tests"] = run_checks(
+                contract["pre_merge_tests"], run_dir, "pre-merge", cwd=repo,
+                expected_repository_state=state["expected_repository_state"],
+            )
             atomic_json(run_dir / "pre-merge-tests.json", state["pre_merge_tests"])
             # This is the last preflight before the first repository mutation.
-            immediate = inspect_manifest(manifest, expected_repository=repo)
+            immediate = inspect_manifest(manifest, manifest_path=manifest_path, expected_repository=repo)
             if immediate["main_state"] != state["expected_repository_state"]:
                 raise IntegrationError("repository changed between initial and immediate pre-mutation preflight")
             persist(run_dir, state, "MERGING", "MERGING")
+            state["live_mutation_started"] = True
             merge = git(repo, "merge", "--no-ff", "--no-edit", manifest["feature_head"])
             write_artifact(run_dir / "merge.log", redact(merge.stdout + merge.stderr))
             if merge.returncode:
@@ -900,16 +1046,24 @@ def stage(manifest_path: Path, manifest: dict, args) -> tuple[Path, dict]:
                 state["expected_repository_state"] = repository_state(repo)
                 raise IntegrationError("local merge failed; no conflict resolution attempted")
             state["staged_head"] = require_git(repo, "rev-parse", "HEAD")
-            state["expected_repository_state"] = repository_state(repo)
+            clean_staged_state = repository_state(repo)
+            if clean_staged_state["status"]:
+                raise IntegrationError("merge did not produce an exact clean staged repository state")
+            state["expected_repository_state"] = clean_staged_state
             atomic_json(run_dir / "git-after-merge.json", state["expected_repository_state"])
             persist(run_dir, state, "POST_MERGE_TESTING", "POST_MERGE_TESTING")
-            state["post_merge_tests"] = run_checks(contract["post_merge_tests"], run_dir, "post-merge", cwd=repo)
+            state["post_merge_tests"] = run_checks(
+                contract["post_merge_tests"], run_dir, "post-merge", cwd=repo,
+                expected_repository_state=clean_staged_state,
+            )
             atomic_json(run_dir / "post-merge-tests.json", state["post_merge_tests"])
             if contract["deployment_steps"]:
                 persist(run_dir, state, "DEPLOYING", "DEPLOYING")
-                state["deployment_steps"] = run_checks(contract["deployment_steps"], run_dir, "deployment", cwd=repo)
-            if repository_state(repo) != state["expected_repository_state"]:
-                raise IntegrationError("repository changed unexpectedly after merge")
+                state["deployment_steps"] = run_checks(
+                    contract["deployment_steps"], run_dir, "deployment", cwd=repo,
+                    expected_repository_state=clean_staged_state,
+                )
+            require_repository_state(repo, clean_staged_state, "post-deployment guard")
             persist(run_dir, state, "RESTARTING_SERVICES", "RESTARTING_SERVICES")
             state["service_restart_evidence"] = []
             for service in contract["services"]:
@@ -919,13 +1073,36 @@ def stage(manifest_path: Path, manifest: dict, args) -> tuple[Path, dict]:
                     )
                 else:
                     wait_service_state(args.service_manager, service, "inactive", timeout=args.service_timeout)
+                require_repository_state(repo, clean_staged_state, f"service restart group for {service}")
+            state["service_snapshot_after_activation"] = service_snapshot(
+                args.service_manager, contract["services"], args.service_timeout,
+            )
             persist(run_dir, state, "VERIFYING", "VERIFYING")
-            state["readiness"] = run_checks(contract["readiness_checks"], run_dir, "readiness", cwd=repo)
-            state["fatal_log_checks"] = run_checks(contract["fatal_log_checks"], run_dir, "fatal-logs", cwd=repo)
+            state["readiness"] = run_checks(
+                contract["readiness_checks"], run_dir, "readiness", cwd=repo,
+                expected_repository_state=clean_staged_state,
+            )
+            require_service_snapshot(
+                args.service_manager, state["service_snapshot_after_activation"], args.service_timeout,
+                "readiness checks",
+            )
+            state["fatal_log_checks"] = run_checks(
+                contract["fatal_log_checks"], run_dir, "fatal-logs", cwd=repo,
+                expected_repository_state=clean_staged_state,
+            )
+            require_service_snapshot(
+                args.service_manager, state["service_snapshot_after_activation"], args.service_timeout,
+                "fatal-log checks",
+            )
             state["expected_service_state"] = {service: service_state(args.service_manager, service) for service in contract["services"]}
             if state["expected_service_state"] != state["service_status_before"]:
                 raise IntegrationError("service state differs from the pre-stage active/inactive contract")
-            state["expected_repository_state"] = repository_state(repo)
+            require_repository_state(repo, clean_staged_state, "AWAITING_ACCEPTANCE guard")
+            state["expected_service_snapshot"] = service_snapshot(
+                args.service_manager, contract["services"], args.service_timeout,
+            )
+            if state["expected_service_snapshot"] != state["service_snapshot_after_activation"]:
+                raise IntegrationError("service restart count drifted before acceptance")
             state["staged_at"] = now()
             atomic_json(run_dir / "services-after.json", state["expected_service_state"])
             atomic_json(run_dir / "readiness.json", state["readiness"])
@@ -936,31 +1113,45 @@ def stage(manifest_path: Path, manifest: dict, args) -> tuple[Path, dict]:
             state["failure"] = "stage interrupted"
             persist(run_dir, state, "INTERRUPTED", "INTERRUPTED")
         except Exception as exc:
-            state["failure"] = str(exc)
+            state["failure"] = redact(str(exc))
             persist(run_dir, state, "AUTOMATED_CHECK_FAILED", "AUTOMATED_CHECK_FAILED")
-            try:
-                rollback_state(run_dir, state, str(exc), marker=marker)
-            except Exception as rollback_exc:
-                state["status"] = "INTERNAL_ERROR"
-                state["rollback_failure"] = str(rollback_exc)
-                persist(run_dir, state, "ROLLBACK_FAILED", "INTERNAL_ERROR")
+            if not state.get("live_mutation_started"):
+                clear_active(marker, state)
+            else:
+                try:
+                    rollback_state(run_dir, state, state["failure"], marker=marker)
+                except Exception as rollback_exc:
+                    state["status"] = "INTERNAL_ERROR"
+                    state["rollback_failure"] = redact(str(rollback_exc))
+                    persist(run_dir, state, "ROLLBACK_FAILED", "INTERNAL_ERROR")
         return run_dir, state
 
 
 def verify_staged_state(run_dir: Path, state: dict) -> None:
     repo = Path(state["repository"])
-    actual = repository_state(repo)
-    if actual != state.get("expected_repository_state") or actual["head"] != state.get("staged_head"):
-        raise IntegrationError("repository changed after stage")
+    require_repository_state(repo, state["expected_repository_state"], "finalize pre-check")
+    if state["expected_repository_state"]["head"] != state.get("staged_head"):
+        raise IntegrationError("recorded staged repository HEAD is inconsistent")
     origin = require_git(repo, "rev-parse", "refs/remotes/origin/main")
     if origin != state["origin_baseline_head"]:
         raise IntegrationError("origin/main changed after stage")
-    for service, expected in state.get("expected_service_state", {}).items():
-        actual_service = service_state(state["service_manager"], service, timeout=state["service_timeout"])
-        if actual_service != expected:
-            raise IntegrationError(f"service state changed after stage: {service} expected {expected}, found {actual_service}")
-    state["finalize_readiness"] = run_checks(state["contract"]["readiness_checks"], run_dir, "finalize-readiness", cwd=repo)
-    state["finalize_fatal_logs"] = run_checks(state["contract"]["fatal_log_checks"], run_dir, "finalize-fatal-logs", cwd=repo)
+    require_service_snapshot(
+        state["service_manager"], state.get("expected_service_snapshot", {}), state["service_timeout"],
+        "finalize pre-check",
+    )
+    state["finalize_readiness"] = run_checks(
+        state["contract"]["readiness_checks"], run_dir, "finalize-readiness", cwd=repo,
+        expected_repository_state=state["expected_repository_state"],
+    )
+    state["finalize_fatal_logs"] = run_checks(
+        state["contract"]["fatal_log_checks"], run_dir, "finalize-fatal-logs", cwd=repo,
+        expected_repository_state=state["expected_repository_state"],
+    )
+    require_repository_state(repo, state["expected_repository_state"], "finalize post-check")
+    require_service_snapshot(
+        state["service_manager"], state.get("expected_service_snapshot", {}), state["service_timeout"],
+        "finalize post-check",
+    )
 
 
 def finalize_run(run_dir: Path, state: dict, args, marker: Path) -> dict:
@@ -1030,7 +1221,7 @@ def main(argv=None) -> int:
         trusted_repo = Path(args.repository).resolve()
         if args.command in {"inspect", "dry-run", "stage"}:
             path, manifest = load_manifest(args.target)
-            report = inspect_manifest(manifest, expected_repository=trusted_repo)
+            report = inspect_manifest(manifest, manifest_path=path, expected_repository=trusted_repo)
             if args.command == "inspect":
                 print(json.dumps(report, indent=2, sort_keys=True))
                 return 0
@@ -1047,7 +1238,12 @@ def main(argv=None) -> int:
             run_dir, state = stage(path, manifest, args)
             print(f"integration result: {run_dir}")
             print(f"status: {state['status']}")
-            return 0 if state["status"] == "AWAITING_ACCEPTANCE" else 1
+            return {
+                "AWAITING_ACCEPTANCE": 0,
+                "AUTOMATED_CHECK_FAILED": 3,
+                "ROLLED_BACK": 4,
+                "INTERNAL_ERROR": 5,
+            }.get(state["status"], 5)
         run_dir, state = load_run(args.target)
         if Path(state["repository"]).resolve() != trusted_repo:
             raise IntegrationError("run repository differs from trusted repository boundary")
@@ -1064,7 +1260,7 @@ def main(argv=None) -> int:
             print("status: FINALIZED")
             return 0
     except (IntegrationError, OSError, KeyError, TypeError, ValueError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        print(f"error: {redact(str(exc))}", file=sys.stderr)
         return 2
 
 
