@@ -230,8 +230,15 @@ raise SystemExit(int(os.environ.get('FAKE_CODEX_EXIT','0')))
         self.assertEqual(record["artifact_size"], (package / record["output_artifact"]).stat().st_size)
         self.assertEqual(manifest["requested_model"], "unit-model")
         self.assertEqual(manifest["actual_runtime_model"], "unit-model")
+        self.assertEqual(manifest["actual_runtime_provider"], "openai")
         self.assertEqual(manifest["actual_reasoning_effort"], "high")
+        self.assertEqual(manifest["runtime_session_id"], "fixture-session")
         self.assertEqual(manifest["token_usage"], 1234)
+        self.assertGreaterEqual(manifest["codex_runtime_seconds"], 0)
+        self.assertEqual(
+            manifest["codex_runtime_seconds"],
+            float((package / "duration-seconds.txt").read_text().strip()),
+        )
         self.assertFalse(manifest["network_use"]["used"])
         self.assertEqual(manifest["evidence_provenance"]["method"], "automatic_runner")
         self.assertEqual(stat.S_IMODE(package.stat().st_mode), 0o755)

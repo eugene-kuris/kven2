@@ -878,6 +878,7 @@ Phase: `{state.get('phase', 'unknown')}`
 Failure/refusal: {failures}
 Bound contract: `{state.get('deployment_contract_path', 'unavailable')}`
 Contract SHA-256: `{state.get('deployment_contract_sha256', 'unavailable')}`
+Push trust boundary: `git push`, local push hooks, and post-push executable checks are reconciled before FINALIZED.
 
 ## Acceptance
 
@@ -969,7 +970,9 @@ def validate_run_state(state: object) -> dict:
     normalized = validate_contract(state["contract"], {"baseline_head": state["baseline_head"], "feature_branch": state["feature_branch"]})
     if canonical_contract_sha256(normalized) != state["deployment_contract_sha256"]:
         raise IntegrationError("persisted integration contract was mutated")
-    if state["status"] in {"AWAITING_ACCEPTANCE", "FINALIZING", "FINALIZED"} and "staged_head" not in state:
+    if state["status"] in {
+        "AWAITING_ACCEPTANCE", "FINALIZING", "FINALIZE_RECOVERY_REQUIRED", "FINALIZED",
+    } and "staged_head" not in state:
         raise IntegrationError("staged integration state is missing staged_head")
     return state
 
@@ -1279,38 +1282,88 @@ def verify_staged_state(run_dir: Path, state: dict) -> None:
     )
 
 
-def reconcile_interrupted_finalize(run_dir: Path, state: dict) -> None:
-    """Reconcile a completed push without rewriting remote history."""
+def bounded_repository_evidence(repo: Path) -> dict:
+    """Describe repository drift without persisting an unbounded status listing."""
+    actual = repository_state(repo)
+    status = redact(actual.pop("status"))
+    actual.update({
+        "status_bounded": bounded(status),
+        "status_sha256": hashlib.sha256(status.encode("utf-8")).hexdigest(),
+        "status_entries": len(status.splitlines()) if status else 0,
+    })
+    return actual
+
+
+def reconcile_final_state(run_dir: Path, state: dict, *, category: str) -> dict:
+    """Prove exact local, service, check, contract, and remote state after push."""
+    started = now()
+    monotonic = time.monotonic()
     repo = Path(state["repository"])
     verify_run_contract_binding(state)
-    require_repository_state(repo, state["expected_repository_state"], "interrupted finalize reconciliation")
+    require_repository_state(repo, state["expected_repository_state"], f"{category} reconciliation pre-check")
     if state["expected_repository_state"]["head"] != state["staged_head"]:
         raise IntegrationError("recorded staged repository HEAD is inconsistent")
     require_service_snapshot(
         state["service_manager"], state.get("expected_service_snapshot", {}), state["service_timeout"],
-        "interrupted finalize reconciliation pre-check",
+        f"{category} reconciliation pre-check",
     )
-    state["reconciliation_readiness"] = run_checks(
-        state["contract"]["readiness_checks"], run_dir, "reconciliation-readiness", cwd=repo,
+    readiness = run_checks(
+        state["contract"]["readiness_checks"], run_dir, f"{category}-readiness", cwd=repo,
         expected_repository_state=state["expected_repository_state"],
     )
-    state["reconciliation_fatal_logs"] = run_checks(
-        state["contract"]["fatal_log_checks"], run_dir, "reconciliation-fatal-logs", cwd=repo,
+    fatal_logs = run_checks(
+        state["contract"]["fatal_log_checks"], run_dir, f"{category}-fatal-logs", cwd=repo,
         expected_repository_state=state["expected_repository_state"],
     )
-    require_repository_state(repo, state["expected_repository_state"], "interrupted finalize reconciliation post-check")
-    require_service_snapshot(
+    require_repository_state(repo, state["expected_repository_state"], f"{category} reconciliation post-check")
+    services = require_service_snapshot(
         state["service_manager"], state.get("expected_service_snapshot", {}), state["service_timeout"],
-        "interrupted finalize reconciliation post-check",
+        f"{category} reconciliation post-check",
     )
     if require_git(repo, "rev-parse", "refs/remotes/origin/main") != state["staged_head"]:
-        raise IntegrationError("origin/main changed during interrupted finalize reconciliation")
+        raise IntegrationError(f"origin/main changed during {category} reconciliation")
+    return {
+        "status": "PASSED", "started_at": started, "finished_at": now(),
+        "duration_seconds": round(time.monotonic() - monotonic, 3),
+        "contract_sha256": state["deployment_contract_sha256"],
+        "repository_state": state["expected_repository_state"],
+        "service_snapshot": services, "readiness": readiness, "fatal_log_checks": fatal_logs,
+        "origin_main": state["staged_head"],
+    }
+
+
+def persist_push_evidence(run_dir: Path, state: dict) -> None:
+    atomic_json(run_dir / "push-evidence.json", state["push_evidence"])
+
+
+def recovery_required_after_push(run_dir: Path, state: dict, marker: Path, exc: Exception) -> None:
+    repo = Path(state["repository"])
+    failure = redact(str(exc))
+    reconciliation = state["push_evidence"].setdefault("post_push_reconciliation", {})
+    reconciliation.update({"status": "FAILED", "finished_at": now(), "failure": bounded(failure)})
+    state["reconciliation_failure"] = bounded(failure)
+    state["recovery_evidence"] = {
+        "remote_push_completed": True,
+        "origin_main": state["push_evidence"].get("origin_main_after"),
+        "staged_head": state["staged_head"],
+        "repository_state": bounded_repository_evidence(repo),
+        "failure": bounded(failure), "checked_at": now(),
+        "ordinary_rollback_permitted": False, "remote_history_rewrite_permitted": False,
+    }
+    persist_push_evidence(run_dir, state)
+    persist(run_dir, state, "FINALIZE_RECOVERY_REQUIRED", "FINALIZE_RECOVERY_REQUIRED")
+    clear_active(marker, state)
 
 
 def finalize_run(run_dir: Path, state: dict, args, marker: Path) -> dict:
     repo = Path(state["repository"])
     if repo.resolve() != Path(args.repository).resolve():
         raise IntegrationError("run repository differs from explicit repository boundary")
+    if state["status"] == "FINALIZE_RECOVERY_REQUIRED":
+        raise IntegrationError(
+            "remote push completed but exact final state is unproven; automatic finalize and ordinary rollback "
+            "are refused until the operator restores the recorded state and follows the documented recovery path"
+        )
     if state["status"] == "FINALIZED":
         verify_run_contract_binding(state)
         require_repository_state(repo, state["expected_repository_state"], "already-finalized verification")
@@ -1326,23 +1379,42 @@ def finalize_run(run_dir: Path, state: dict, args, marker: Path) -> dict:
         origin = require_git(repo, "rev-parse", "refs/remotes/origin/main")
         if origin == state["staged_head"]:
             claim_active(marker, run_dir, state)
+            push_evidence = state.setdefault("push_evidence", {
+                "command": redact_argv([
+                    "git", "-C", str(repo), "push", "origin", f"{state['staged_head']}:refs/heads/main",
+                ]),
+                "outcome": "INTERRUPTED_OUTCOME_UNKNOWN",
+                "origin_main_before": state["origin_baseline_head"],
+            })
+            push_evidence.update({
+                "origin_main_after": origin, "remote_known_updated": True,
+                "post_push_reconciliation": {"status": "PENDING", "started_at": now()},
+            })
+            persist_push_evidence(run_dir, state)
+            persist(run_dir, state, "POST_PUSH_RECONCILING", "FINALIZING")
             try:
-                reconcile_interrupted_finalize(run_dir, state)
+                result = reconcile_final_state(run_dir, state, category="post-push")
             except Exception as exc:
-                state["reconciliation_failure"] = redact(str(exc))
-                state["recovery_evidence"] = {
-                    "origin_main": origin, "staged_head": state["staged_head"],
-                    "repository_state": repository_state(repo), "checked_at": now(),
-                }
-                persist(run_dir, state, "FINALIZE_RECOVERY_REQUIRED", "FINALIZE_RECOVERY_REQUIRED")
-                clear_active(marker, state)
-                raise IntegrationError("push completed but finalize reconciliation failed; recovery is required") from exc
+                recovery_required_after_push(run_dir, state, marker, exc)
+                raise IntegrationError(
+                    "remote push completed but post-push reconciliation failed; recovery is required"
+                ) from exc
+            push_evidence["post_push_reconciliation"] = result
+            persist_push_evidence(run_dir, state)
+            persist(run_dir, state, "POST_PUSH_RECONCILED", "FINALIZING")
             state.update({"status": "FINALIZED", "phase": "COMPLETE", "origin_main": origin, "finalized_at": now()})
             persist(run_dir, state, "COMPLETE", "FINALIZED")
             clear_active(marker, state)
             return state
         if origin != state["origin_baseline_head"]:
-            raise IntegrationError("interrupted finalize found an unexpected origin/main")
+            claim_active(marker, run_dir, state)
+            state["remote_state_failure"] = {
+                "origin_main_before": state["origin_baseline_head"], "origin_main_after": origin,
+                "staged_head": state["staged_head"], "push_exit_code": None,
+            }
+            persist(run_dir, state, "FINALIZE_REMOTE_STATE_UNEXPECTED", "INTERNAL_ERROR")
+            clear_active(marker, state)
+            raise IntegrationError("interrupted finalize found an unexpected origin/main; automatic retry is unsafe")
     elif state["status"] != "AWAITING_ACCEPTANCE":
         raise IntegrationError("integration is not awaiting acceptance")
     if args.accept != "PASS":
@@ -1354,15 +1426,57 @@ def finalize_run(run_dir: Path, state: dict, args, marker: Path) -> dict:
     state["acceptance"] = acceptance
     persist(run_dir, state, "FINALIZING", "FINALIZING")
     push_command = ["git", "-C", str(repo), "push", "origin", f"{state['staged_head']}:refs/heads/main"]
+    if state.get("push_evidence"):
+        state.setdefault("push_attempts", []).append(state["push_evidence"])
+    origin_before = require_git(repo, "rev-parse", "refs/remotes/origin/main")
+    state["push_evidence"] = {
+        "command": redact_argv(push_command), "outcome": "PENDING",
+        "origin_main_before": origin_before, "remote_known_updated": False,
+        "post_push_reconciliation": {"status": "NOT_STARTED"},
+    }
+    persist_push_evidence(run_dir, state)
+    persist(run_dir, state, "PUSHING", "FINALIZING")
     push = command_record(push_command, run_dir / "push.log", timeout=300)
-    state["push_evidence"] = push
-    atomic_json(run_dir / "push-evidence.json", push)
-    if not push["passed"]:
-        persist(run_dir, state, "FINALIZING", "FINALIZING")
-        raise IntegrationError("push failed; see push.log")
     origin = require_git(repo, "rev-parse", "refs/remotes/origin/main")
-    if origin != state["staged_head"]:
-        raise IntegrationError("origin/main verification failed")
+    push.update({
+        "outcome": "PASSED" if push["passed"] else "FAILED",
+        "origin_main_before": origin_before, "origin_main_after": origin,
+        "remote_known_updated": origin == state["staged_head"],
+        "local_repository_state_after": bounded_repository_evidence(repo),
+        "post_push_reconciliation": {"status": "NOT_STARTED"},
+    })
+    state["push_evidence"] = push
+    persist_push_evidence(run_dir, state)
+    persist(run_dir, state, "PUSH_OUTCOME_RECORDED", "FINALIZING")
+    if origin == state["staged_head"]:
+        push["post_push_reconciliation"] = {"status": "PENDING", "started_at": now()}
+        persist_push_evidence(run_dir, state)
+        persist(run_dir, state, "POST_PUSH_RECONCILING", "FINALIZING")
+        try:
+            result = reconcile_final_state(run_dir, state, category="post-push")
+        except Exception as exc:
+            recovery_required_after_push(run_dir, state, marker, exc)
+            raise IntegrationError(
+                "remote push completed but post-push reconciliation failed; recovery is required"
+            ) from exc
+        push["post_push_reconciliation"] = result
+        persist_push_evidence(run_dir, state)
+        persist(run_dir, state, "POST_PUSH_RECONCILED", "FINALIZING")
+    elif origin == state["origin_baseline_head"] and not push["passed"]:
+        push["post_push_reconciliation"] = {"status": "NOT_REQUIRED_REMOTE_UNCHANGED"}
+        persist_push_evidence(run_dir, state)
+        persist(run_dir, state, "FINALIZING", "FINALIZING")
+        raise IntegrationError("push failed and origin/main remains at the baseline; finalize is retryable")
+    else:
+        push["post_push_reconciliation"] = {"status": "NOT_RUN_UNEXPECTED_REMOTE_STATE"}
+        state["remote_state_failure"] = {
+            "origin_main_before": origin_before, "origin_main_after": origin,
+            "staged_head": state["staged_head"], "push_exit_code": push["exit_code"],
+        }
+        persist_push_evidence(run_dir, state)
+        persist(run_dir, state, "FINALIZE_REMOTE_STATE_UNEXPECTED", "INTERNAL_ERROR")
+        clear_active(marker, state)
+        raise IntegrationError("push produced an unexpected origin/main state; automatic retry is unsafe")
     state.update({"status": "FINALIZED", "phase": "COMPLETE", "origin_main": origin, "finalized_at": now()})
     persist(run_dir, state, "COMPLETE", "FINALIZED")
     clear_active(marker, state)

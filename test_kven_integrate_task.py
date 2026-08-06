@@ -62,6 +62,33 @@ SCENARIO_COVERAGE = {
     37: ["test_coverage_map_has_all_37_scenarios"],
 }
 
+R4_REGRESSION_COVERAGE = {
+    "push_hook_repository_mutation": [
+        "test_post_push_tracked_hook_mutation_requires_recovery",
+        "test_post_push_untracked_hook_mutation_requires_recovery",
+        "test_post_push_index_hook_mutation_requires_recovery",
+        "test_post_push_branch_hook_mutation_requires_recovery",
+    ],
+    "push_hook_service_mutation": [
+        "test_post_push_service_state_hook_mutation_requires_recovery",
+        "test_post_push_restart_hook_mutation_requires_recovery",
+    ],
+    "post_push_executable_checks": [
+        "test_post_push_readiness_marker_failure_requires_recovery",
+        "test_post_push_fatal_log_marker_failure_requires_recovery",
+        "test_post_push_readiness_repository_mutation_requires_recovery",
+        "test_post_push_readiness_service_mutation_requires_recovery",
+    ],
+    "push_outcomes_and_recovery": [
+        "test_finalize_requires_acceptance_then_pushes",
+        "test_clean_interrupted_push_uses_shared_reconciliation",
+        "test_failed_push_with_unchanged_remote_remains_retryable",
+        "test_interrupted_finalize_unexpected_remote_is_internal_error",
+        "test_recovery_required_refuses_repeat_without_remote_rewrite",
+        "test_already_finalized_drift_is_non_mutating_error",
+    ],
+}
+
 
 def cmd(*args, cwd=None, env=None):
     return subprocess.run(args, cwd=cwd, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -189,6 +216,18 @@ class RepositoryFixture(unittest.TestCase):
 
     def run_dir(self):
         return next((self.results / "TEST").iterdir())
+
+    def install_pre_push_hook(self, body):
+        hook = integration.git_common_dir(self.repo) / "hooks" / "pre-push"
+        hook.write_text(f"#!{sys.executable}\n{body}\n", encoding="utf-8")
+        hook.chmod(0o755)
+        return hook
+
+    def finalize_cli(self, run_dir=None):
+        return cmd(
+            sys.executable, str(SCRIPT), "finalize", str(run_dir or self.run_dir()),
+            "--accept", "PASS", "--repository", str(self.repo),
+        )
 
     def test_valid_manifest_parsing_and_inspection(self):
         _, loaded = integration.load_manifest(str(self.package))
@@ -550,6 +589,147 @@ class RepositoryFixture(unittest.TestCase):
         self.assertTrue((run_dir / "acceptance-result.json").is_file())
         self.assertTrue((run_dir / "push-evidence.json").is_file())
         self.assertEqual(cmd("git", "--git-dir", str(self.remote), "rev-parse", "main").stdout.strip(), state["staged_head"])
+        push = state["push_evidence"]
+        self.assertEqual(push["command"], [
+            "git", "-C", str(self.repo), "push", "origin", f"{state['staged_head']}:refs/heads/main",
+        ])
+        self.assertEqual(push["origin_main_before"], self.base)
+        self.assertEqual(push["origin_main_after"], state["staged_head"])
+        self.assertTrue(push["remote_known_updated"])
+        self.assertEqual(push["post_push_reconciliation"]["status"], "PASSED")
+        self.assertTrue(Path(push["output_artifact"]).is_file())
+        for field in ("started_at", "finished_at", "duration_seconds", "exit_code", "bounded_output"):
+            self.assertIn(field, push)
+
+    def test_post_push_tracked_hook_mutation_requires_recovery(self):
+        self.assertEqual(self.stage_cli().returncode, 0)
+        run_dir = self.run_dir()
+        target = self.repo / "base.txt"
+        self.install_pre_push_hook(
+            "from pathlib import Path\n"
+            f"Path({str(target)!r}).write_text('hook-mutated\\n', encoding='utf-8')"
+        )
+        finalized = cmd(
+            sys.executable, str(SCRIPT), "finalize", str(run_dir), "--accept", "PASS",
+            "--repository", str(self.repo),
+        )
+        self.assertNotEqual(finalized.returncode, 0)
+        state = json.loads((run_dir / "integration-manifest.json").read_text())
+        self.assertEqual(state["status"], "FINALIZE_RECOVERY_REQUIRED")
+        self.assertEqual(target.read_text(), "hook-mutated\n")
+        self.assertEqual(
+            cmd("git", "--git-dir", str(self.remote), "rev-parse", "main").stdout.strip(),
+            state["staged_head"],
+        )
+        self.assertFalse((integration.git_common_dir(self.repo) / "kven-integration-active.json").exists())
+
+    def test_post_push_untracked_hook_mutation_requires_recovery(self):
+        self.assertEqual(self.stage_cli().returncode, 0)
+        target = self.repo / "hook-untracked.txt"
+        self.install_pre_push_hook(
+            "from pathlib import Path\n"
+            f"Path({str(target)!r}).write_text('preserve\\n', encoding='utf-8')"
+        )
+        self.assertNotEqual(self.finalize_cli().returncode, 0)
+        state = json.loads((self.run_dir() / "integration-manifest.json").read_text())
+        self.assertEqual(state["status"], "FINALIZE_RECOVERY_REQUIRED")
+        self.assertEqual(target.read_text(), "preserve\n")
+        self.assertEqual(cmd("git", "--git-dir", str(self.remote), "rev-parse", "main").stdout.strip(), state["staged_head"])
+
+    def test_post_push_index_hook_mutation_requires_recovery(self):
+        self.assertEqual(self.stage_cli().returncode, 0)
+        target = self.repo / "feature.txt"
+        self.install_pre_push_hook(
+            "import subprocess\nfrom pathlib import Path\n"
+            f"Path({str(target)!r}).write_text('index mutation\\n', encoding='utf-8')\n"
+            f"subprocess.run(['git', '-C', {str(self.repo)!r}, 'add', 'feature.txt'], check=True)"
+        )
+        self.assertNotEqual(self.finalize_cli().returncode, 0)
+        state = json.loads((self.run_dir() / "integration-manifest.json").read_text())
+        self.assertEqual(state["status"], "FINALIZE_RECOVERY_REQUIRED")
+        self.assertNotEqual(integration.repository_state(self.repo)["index_tree"], state["expected_repository_state"]["index_tree"])
+
+    def test_post_push_branch_hook_mutation_requires_recovery(self):
+        self.assertEqual(self.stage_cli().returncode, 0)
+        self.install_pre_push_hook(
+            "import subprocess\n"
+            f"repo={str(self.repo)!r}\n"
+            "subprocess.run(['git', '-C', repo, 'branch', 'hook-branch', 'HEAD'], check=True)\n"
+            "subprocess.run(['git', '-C', repo, 'symbolic-ref', 'HEAD', 'refs/heads/hook-branch'], check=True)"
+        )
+        self.assertNotEqual(self.finalize_cli().returncode, 0)
+        state = json.loads((self.run_dir() / "integration-manifest.json").read_text())
+        self.assertEqual(state["status"], "FINALIZE_RECOVERY_REQUIRED")
+        self.assertEqual(integration.repository_state(self.repo)["branch"], "hook-branch")
+
+    def _post_push_marker_failure(self, category):
+        marker = self.root / f"post-push-{category}-marker"
+        self.contract[category] = [{
+            "name": category,
+            "command": [
+                sys.executable, "-c",
+                f"from pathlib import Path; raise SystemExit(7 if Path({str(marker)!r}).exists() else 0)",
+            ],
+            "timeout": 30,
+        }]
+        self.assertEqual(self.stage_cli().returncode, 0)
+        self.install_pre_push_hook(f"from pathlib import Path\nPath({str(marker)!r}).write_text('pushed')")
+        self.assertNotEqual(self.finalize_cli().returncode, 0)
+        state = json.loads((self.run_dir() / "integration-manifest.json").read_text())
+        self.assertEqual(state["status"], "FINALIZE_RECOVERY_REQUIRED")
+        self.assertEqual(state["push_evidence"]["post_push_reconciliation"]["status"], "FAILED")
+        self.assertEqual(cmd("git", "--git-dir", str(self.remote), "rev-parse", "main").stdout.strip(), state["staged_head"])
+
+    def test_post_push_readiness_marker_failure_requires_recovery(self):
+        self._post_push_marker_failure("readiness_checks")
+
+    def test_post_push_fatal_log_marker_failure_requires_recovery(self):
+        self._post_push_marker_failure("fatal_log_checks")
+
+    def test_post_push_readiness_repository_mutation_requires_recovery(self):
+        counter = self.root / "readiness-counter"
+        target = self.repo / "base.txt"
+        code = (
+            "from pathlib import Path; "
+            f"c=Path({str(counter)!r}); t=Path({str(target)!r}); "
+            "n=int(c.read_text())+1 if c.exists() else 1; c.write_text(str(n)); "
+            "t.write_text('post-push readiness mutation\\n') if n >= 3 else None"
+        )
+        self.contract["readiness_checks"] = [{"name": "mutating-readiness", "command": [sys.executable, "-c", code], "timeout": 30}]
+        self.assertEqual(self.stage_cli().returncode, 0)
+        self.install_pre_push_hook("pass")
+        self.assertNotEqual(self.finalize_cli().returncode, 0)
+        state = json.loads((self.run_dir() / "integration-manifest.json").read_text())
+        self.assertEqual(state["status"], "FINALIZE_RECOVERY_REQUIRED")
+        self.assertEqual(target.read_text(), "post-push readiness mutation\n")
+
+    def test_failed_push_with_unchanged_remote_remains_retryable(self):
+        self.assertEqual(self.stage_cli().returncode, 0)
+        self.install_pre_push_hook("raise SystemExit(9)")
+        result = self.finalize_cli()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("finalize is retryable", result.stderr)
+        state = json.loads((self.run_dir() / "integration-manifest.json").read_text())
+        self.assertEqual(state["status"], "FINALIZING")
+        self.assertFalse(state["push_evidence"]["remote_known_updated"])
+        self.assertEqual(state["push_evidence"]["origin_main_after"], self.base)
+        self.assertEqual(cmd("git", "--git-dir", str(self.remote), "rev-parse", "main").stdout.strip(), self.base)
+        self.assertTrue((integration.git_common_dir(self.repo) / "kven-integration-active.json").exists())
+
+    def test_recovery_required_refuses_repeat_without_remote_rewrite(self):
+        self.assertEqual(self.stage_cli().returncode, 0)
+        target = self.repo / "base.txt"
+        self.install_pre_push_hook(
+            "from pathlib import Path\n"
+            f"Path({str(target)!r}).write_text('preserve after push\\n', encoding='utf-8')"
+        )
+        self.assertNotEqual(self.finalize_cli().returncode, 0)
+        remote_after_push = cmd("git", "--git-dir", str(self.remote), "rev-parse", "main").stdout.strip()
+        repeat = self.finalize_cli()
+        self.assertNotEqual(repeat.returncode, 0)
+        self.assertIn("automatic finalize and ordinary rollback are refused", repeat.stderr)
+        self.assertEqual(cmd("git", "--git-dir", str(self.remote), "rev-parse", "main").stdout.strip(), remote_after_push)
+        self.assertEqual(target.read_text(), "preserve after push\n")
 
     def test_finalize_before_awaiting_acceptance_is_refused(self):
         self.assertEqual(self.stage_cli().returncode, 0)
@@ -609,6 +789,27 @@ class RepositoryFixture(unittest.TestCase):
         with integration.repository_lock(self.repo) as marker:
             result = integration.finalize_run(run_dir, state, args, marker)
         self.assertEqual(result["status"], "FINALIZED")
+
+    def test_clean_interrupted_push_uses_shared_reconciliation(self):
+        run_dir, state = self.interrupted_finalize_fixture()
+        args = type("Args", (), {"repository": str(self.repo), "accept": "PASS", "notes": ""})()
+        with integration.repository_lock(self.repo) as marker:
+            result = integration.finalize_run(run_dir, state, args, marker)
+        self.assertEqual(result["status"], "FINALIZED")
+        self.assertEqual(result["push_evidence"]["post_push_reconciliation"]["status"], "PASSED")
+
+    def test_interrupted_finalize_unexpected_remote_is_internal_error(self):
+        self.assertEqual(self.stage_cli().returncode, 0)
+        run_dir = self.run_dir()
+        state = json.loads((run_dir / "integration-manifest.json").read_text())
+        integration.persist(run_dir, state, "FINALIZING", "FINALIZING")
+        cmd("git", "-C", str(self.repo), "update-ref", "refs/remotes/origin/main", self.feature)
+        result = self.finalize_cli(run_dir)
+        self.assertNotEqual(result.returncode, 0)
+        persisted = json.loads((run_dir / "integration-manifest.json").read_text())
+        self.assertEqual(persisted["status"], "INTERNAL_ERROR")
+        self.assertFalse((integration.git_common_dir(self.repo) / "kven-integration-active.json").exists())
+        self.assertEqual(cmd("git", "--git-dir", str(self.remote), "rev-parse", "main").stdout.strip(), self.base)
 
     def test_already_finalized_drift_is_non_mutating_error(self):
         self.assertEqual(self.stage_cli().returncode, 0)
@@ -1130,6 +1331,54 @@ path.write_text(json.dumps(data))
                 integration.finalize_run(run_dir, state, args, marker)
         self.assertEqual(cmd("git", "--git-dir", str(self.remote), "rev-parse", "main").stdout.strip(), self.base)
 
+    def _post_push_service_hook_mutation(self, drift):
+        self.service_contract()
+        run_dir, state = self.stage_service()
+        change = (
+            "d['kven2-main.service']['state']='inactive'"
+            if drift == "state"
+            else "d['kven2-main.service']['restarts']+=1"
+        )
+        self.install_pre_push_hook(
+            "import json\nfrom pathlib import Path\n"
+            f"p=Path({str(self.service_state_file)!r})\n"
+            "d=json.loads(p.read_text())\n"
+            f"{change}\n"
+            "p.write_text(json.dumps(d))"
+        )
+        result = self.finalize_cli(run_dir)
+        self.assertNotEqual(result.returncode, 0)
+        persisted = json.loads((run_dir / "integration-manifest.json").read_text())
+        self.assertEqual(persisted["status"], "FINALIZE_RECOVERY_REQUIRED")
+        self.assertEqual(persisted["push_evidence"]["post_push_reconciliation"]["status"], "FAILED")
+        self.assertEqual(cmd("git", "--git-dir", str(self.remote), "rev-parse", "main").stdout.strip(), state["staged_head"])
+
+    def test_post_push_service_state_hook_mutation_requires_recovery(self):
+        self._post_push_service_hook_mutation("state")
+
+    def test_post_push_restart_hook_mutation_requires_recovery(self):
+        self._post_push_service_hook_mutation("restart")
+
+    def test_post_push_readiness_service_mutation_requires_recovery(self):
+        self.service_contract()
+        counter = self.root / "service-readiness-counter"
+        code = (
+            "import json; from pathlib import Path; "
+            f"c=Path({str(counter)!r}); p=Path({str(self.service_state_file)!r}); "
+            "n=int(c.read_text())+1 if c.exists() else 1; c.write_text(str(n)); "
+            "d=json.loads(p.read_text()); "
+            "d['kven2-main.service']['state']='inactive' if n >= 3 else d['kven2-main.service']['state']; "
+            "p.write_text(json.dumps(d))"
+        )
+        self.contract["readiness_checks"] = [{"name": "mutating-readiness", "command": [sys.executable, "-c", code], "timeout": 30}]
+        run_dir, state = self.stage_service()
+        self.install_pre_push_hook("pass")
+        result = self.finalize_cli(run_dir)
+        self.assertNotEqual(result.returncode, 0)
+        persisted = json.loads((run_dir / "integration-manifest.json").read_text())
+        self.assertEqual(persisted["status"], "FINALIZE_RECOVERY_REQUIRED")
+        self.assertEqual(cmd("git", "--git-dir", str(self.remote), "rev-parse", "main").stdout.strip(), state["staged_head"])
+
     def test_readiness_and_fatal_log_failures_roll_back(self):
         for readiness, fatal in ((7, 0), (0, 8)):
             with self.subTest(readiness=readiness, fatal=fatal):
@@ -1171,33 +1420,28 @@ path.write_text(json.dumps(data))
                 integration.finalize_run(run_dir, state, args, marker)
         self.assertEqual(cmd("git", "--git-dir", str(self.remote), "rev-parse", "main").stdout.strip(), self.base)
 
-    def test_interrupted_finalize_service_and_restart_drift_require_recovery(self):
-        for drift in ("state", "restart"):
-            with self.subTest(drift=drift):
-                marker_path = integration.git_common_dir(self.repo) / "kven-integration-active.json"
-                marker_path.unlink(missing_ok=True)
-                if self.results.exists():
-                    shutil_rmtree(self.results)
-                if integration.repository_state(self.repo)["head"] != self.base:
-                    cmd("git", "-C", str(self.repo), "reset", "--hard", self.base)
-                cmd("git", "--git-dir", str(self.remote), "update-ref", "refs/heads/main", self.base)
-                cmd("git", "-C", str(self.repo), "update-ref", "refs/remotes/origin/main", self.base)
-                self.set_service("active")
-                self.service_contract()
-                run_dir, state = self.stage_service()
-                integration.persist(run_dir, state, "FINALIZING", "FINALIZING")
-                cmd("git", "-C", str(self.repo), "push", "origin", f"{state['staged_head']}:refs/heads/main")
-                data = json.loads(self.service_state_file.read_text())
-                if drift == "state":
-                    data["kven2-main.service"]["state"] = "inactive"
-                else:
-                    data["kven2-main.service"]["restarts"] += 1
-                self.service_state_file.write_text(json.dumps(data), encoding="utf-8")
-                args = type("Args", (), {"repository": str(self.repo), "accept": "PASS", "notes": ""})()
-                with integration.repository_lock(self.repo) as marker:
-                    with self.assertRaisesRegex(integration.IntegrationError, "recovery is required"):
-                        integration.finalize_run(run_dir, state, args, marker)
-                self.assertEqual(json.loads((run_dir / "integration-manifest.json").read_text())["status"], "FINALIZE_RECOVERY_REQUIRED")
+    def _interrupted_finalize_service_drift(self, drift):
+        self.service_contract()
+        run_dir, state = self.stage_service()
+        integration.persist(run_dir, state, "FINALIZING", "FINALIZING")
+        cmd("git", "-C", str(self.repo), "push", "origin", f"{state['staged_head']}:refs/heads/main")
+        data = json.loads(self.service_state_file.read_text())
+        if drift == "state":
+            data["kven2-main.service"]["state"] = "inactive"
+        else:
+            data["kven2-main.service"]["restarts"] += 1
+        self.service_state_file.write_text(json.dumps(data), encoding="utf-8")
+        args = type("Args", (), {"repository": str(self.repo), "accept": "PASS", "notes": ""})()
+        with integration.repository_lock(self.repo) as marker:
+            with self.assertRaisesRegex(integration.IntegrationError, "recovery is required"):
+                integration.finalize_run(run_dir, state, args, marker)
+        self.assertEqual(json.loads((run_dir / "integration-manifest.json").read_text())["status"], "FINALIZE_RECOVERY_REQUIRED")
+
+    def test_interrupted_finalize_service_drift_requires_recovery(self):
+        self._interrupted_finalize_service_drift("state")
+
+    def test_interrupted_finalize_restart_drift_requires_recovery(self):
+        self._interrupted_finalize_service_drift("restart")
 
     def test_rollback_restores_fixture_database_and_configuration(self):
         database = self.root / "live.sqlite"
@@ -1227,6 +1471,12 @@ class CoverageTests(unittest.TestCase):
     def test_coverage_map_has_all_37_scenarios(self):
         self.assertEqual(set(SCENARIO_COVERAGE), set(range(1, 38)))
         names = {name for tests in SCENARIO_COVERAGE.values() for name in tests}
+        discovered = {name for cls in (RepositoryFixture, BackupMigrationTests, FakeServiceTests, CoverageTests)
+                      for name in dir(cls) if name.startswith("test_")}
+        self.assertTrue(names <= discovered)
+
+    def test_r4_regression_map_references_discovered_tests(self):
+        names = {name for tests in R4_REGRESSION_COVERAGE.values() for name in tests}
         discovered = {name for cls in (RepositoryFixture, BackupMigrationTests, FakeServiceTests, CoverageTests)
                       for name in dir(cls) if name.startswith("test_")}
         self.assertTrue(names <= discovered)
