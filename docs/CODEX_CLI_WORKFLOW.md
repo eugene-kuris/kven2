@@ -70,6 +70,8 @@ The canonical manifest records `actual_runtime_model`, `actual_runtime_provider`
 
 Post-Codex integration is described in `KVEN_INTEGRATION_WORKFLOW.md`. Begin with the exact command printed in `result-summary.md`.
 
+Integration does not execute `pre_merge_tests` from unmerged production main or from this preserved operator worktree. It creates its own disposable detached checkout from the manifest's exact feature object ID, fingerprints it around every command, removes/prunes it, and reverifies production before any backup or merge. `post_merge_tests` run later from the exact staged production main.
+
 ## Branch and worktree lifecycle
 
 Successful creation produces `codex/<task>-<timestamp>-<pid>` and `/opt/kven2-worktrees/<task>-<timestamp>-<pid>`. Both remain after completion.

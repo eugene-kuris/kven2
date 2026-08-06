@@ -17,6 +17,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 
@@ -455,19 +456,23 @@ def repository_state(repo: Path) -> dict:
     return {"branch": branch, "head": head, "index_tree": index_fingerprint, "status": status}
 
 
-def verify_feature_worktree(manifest: dict) -> dict:
-    worktree = Path(manifest["worktree_path"]).resolve()
-    if not worktree.is_dir():
-        raise IntegrationError(f"feature worktree is missing: {worktree}")
-    top = require_git(worktree, "rev-parse", "--show-toplevel")
-    if Path(top).resolve() != worktree:
-        raise IntegrationError("feature worktree path is not its Git top level")
-    state = repository_state(worktree)
-    if state["branch"] != manifest["feature_branch"] or state["head"] != manifest["feature_head"]:
-        raise IntegrationError("feature worktree branch/head state differs from manifest")
-    if state["status"]:
-        raise IntegrationError("feature worktree is dirty")
-    return state
+def verify_feature_object(repo: Path, manifest: dict) -> dict:
+    """Verify the immutable feature object without trusting mutable worktree metadata."""
+    feature_head = manifest["feature_head"]
+    resolved = git(repo, "rev-parse", "--verify", f"{feature_head}^{{commit}}")
+    if resolved.returncode or resolved.stdout.strip() != feature_head:
+        raise IntegrationError("exact feature commit object is missing")
+    branch = git(repo, "rev-parse", "--verify", f"refs/heads/{manifest['feature_branch']}")
+    if branch.returncode:
+        raise IntegrationError("recorded feature branch is missing")
+    return {
+        "feature_head": feature_head,
+        "object_type": require_git(repo, "cat-file", "-t", feature_head),
+        "recorded_branch": manifest["feature_branch"],
+        "current_branch_head": branch.stdout.strip() if branch.returncode == 0 else None,
+        "recorded_worktree_path": manifest["worktree_path"],
+        "mutable_sources_trusted": False,
+    }
 
 
 def _verify_test_evidence(manifest: dict, manifest_path: Path) -> None:
@@ -521,11 +526,7 @@ def inspect_manifest(manifest: dict, *, manifest_path: Path, expected_repository
     origin = require_git(repo, "rev-parse", "refs/remotes/origin/main")
     if origin != manifest["origin_main_head"] or origin != manifest["baseline_head"]:
         raise IntegrationError("main/origin-main mismatch")
-    feature = git(repo, "rev-parse", f"refs/heads/{manifest['feature_branch']}")
-    if feature.returncode:
-        raise IntegrationError("feature branch is missing")
-    if feature.stdout.strip() != manifest["feature_head"]:
-        raise IntegrationError("feature HEAD mismatch")
+    feature_state = verify_feature_object(repo, manifest)
     contract, contract_digest = verify_contract_binding(repo, manifest)
     _verify_test_evidence({**manifest, "deployment_contract": contract}, manifest_path)
     evidence_scan = scan_tree(manifest_path.resolve().parent)
@@ -549,7 +550,6 @@ def inspect_manifest(manifest: dict, *, manifest_path: Path, expected_repository
     if not secret_scan["passed"]:
         locations = [f"{item['file']}:{item['line'] or '-'}:{item['category']}" for item in secret_scan["matches"]]
         raise IntegrationError("independent offline secret scan failed: " + ", ".join(locations))
-    feature_state = verify_feature_worktree(manifest)
     return {
         "eligible": True, "repository": str(repo), "head": main_state["head"],
         "feature_head": manifest["feature_head"], "actual_changed_files": actual,
@@ -576,6 +576,7 @@ def command_record(command, artifact: Path, *, cwd=None, timeout=300, env=None) 
         "command": redact_argv(command), "started_at": started, "finished_at": now(),
         "duration_seconds": round(time.monotonic() - monotonic, 3), "exit_code": code,
         "passed": code == 0, "output_artifact": str(artifact), "bounded_output": bounded(output),
+        "cwd": str(Path(cwd).resolve()) if cwd is not None else None,
     }
 
 
@@ -862,6 +863,166 @@ def run_checks(items: list, run_dir: Path, category: str, *, cwd: Path,
     return records
 
 
+def _symlink_fingerprint(repo: Path) -> list[dict]:
+    links = []
+    for root, directories, files in os.walk(repo, topdown=True, followlinks=False):
+        root_path = Path(root)
+        entries = list(directories) + list(files)
+        for name in entries:
+            path = root_path / name
+            if path == repo / ".git":
+                continue
+            try:
+                if path.is_symlink():
+                    target = os.readlink(path)
+                    links.append({
+                        "path": path.relative_to(repo).as_posix(),
+                        "target_sha256": hashlib.sha256(target.encode("utf-8", errors="surrogateescape")).hexdigest(),
+                    })
+            except OSError as exc:
+                raise IntegrationError("cannot fingerprint validation checkout symlinks") from exc
+        directories[:] = [
+            name for name in directories
+            if not (root_path / name).is_symlink() and (root_path / name) != repo / ".git"
+        ]
+    return sorted(links, key=lambda item: item["path"])
+
+
+def validation_checkout_state(checkout: Path) -> dict:
+    resolved = checkout.resolve(strict=True)
+    state = repository_state(resolved)
+    state.update({
+        "checkout_path": str(resolved),
+        "status_sha256": hashlib.sha256(state["status"].encode("utf-8", errors="surrogateescape")).hexdigest(),
+        "symlinks": _symlink_fingerprint(resolved),
+    })
+    return state
+
+
+def _validation_worktree_paths(repo: Path) -> list[Path]:
+    listing = git(repo, "worktree", "list", "--porcelain")
+    if listing.returncode:
+        raise IntegrationError("cannot list validation worktrees")
+    paths = []
+    for line in listing.stdout.splitlines():
+        if line.startswith("worktree "):
+            paths.append(Path(line.removeprefix("worktree ")).resolve())
+    return paths
+
+
+def create_validation_checkout(repo: Path, feature_head: str, run_id_value: str) -> tuple[Path, Path, dict]:
+    parent = Path(tempfile.mkdtemp(prefix=f".kven-validation-{run_id_value}-", dir=repo.parent))
+    checkout = parent / "checkout"
+    command = ["git", "-C", str(repo), "worktree", "add", "--detach", str(checkout), feature_head]
+    started = now()
+    monotonic = time.monotonic()
+    try:
+        result = run(command)
+    except Exception as exc:
+        result = subprocess.CompletedProcess(command, 125, "", redact(str(exc)))
+    record = {
+        "command": redact_argv(command), "cwd": str(repo), "started_at": started,
+        "finished_at": now(), "duration_seconds": round(time.monotonic() - monotonic, 3),
+        "exit_code": result.returncode, "passed": result.returncode == 0,
+        "bounded_output": bounded(result.stdout + result.stderr),
+    }
+    return parent, checkout, record
+
+
+def cleanup_validation_checkout(repo: Path, parent: Path, checkout: Path) -> dict:
+    started = now()
+    monotonic = time.monotonic()
+    initially_registered = checkout.resolve() in _validation_worktree_paths(repo)
+    if initially_registered:
+        remove = run(("git", "-C", repo, "worktree", "remove", "--force", checkout))
+    elif checkout.exists() and checkout.is_dir() and not checkout.is_symlink():
+        shutil.rmtree(checkout)
+        remove = subprocess.CompletedProcess([], 0, "", "")
+    elif checkout.exists() or checkout.is_symlink():
+        remove = subprocess.CompletedProcess([], 1, "", "unexpected validation checkout file type")
+    else:
+        remove = subprocess.CompletedProcess([], 0, "", "")
+    prune = run(("git", "-C", repo, "worktree", "prune"))
+    registered = checkout.resolve() in _validation_worktree_paths(repo)
+    path_exists = checkout.exists() or checkout.is_symlink()
+    parent_error = None
+    if not path_exists:
+        try:
+            parent.rmdir()
+        except OSError as exc:
+            parent_error = type(exc).__name__
+    passed = remove.returncode == 0 and prune.returncode == 0 and not registered and not path_exists and parent_error is None
+    record = {
+        "started_at": started, "finished_at": now(),
+        "duration_seconds": round(time.monotonic() - monotonic, 3),
+        "remove_exit_code": remove.returncode, "prune_exit_code": prune.returncode,
+        "registered_after_prune": registered, "checkout_exists_after_cleanup": path_exists,
+        "parent_cleanup_error": parent_error, "passed": passed,
+        "bounded_output": bounded(remove.stdout + remove.stderr + prune.stdout + prune.stderr),
+    }
+    return record
+
+
+def run_feature_validation(repo: Path, feature_head: str, items: list, run_dir: Path,
+                           run_id_value: str) -> tuple[list[dict], dict]:
+    evidence_path = run_dir / "validation-checkout.json"
+    evidence = {
+        "schema_version": SCHEMA_VERSION, "feature_head": feature_head,
+        "detached": True, "commands": [], "cleanup": None,
+    }
+    parent = checkout = None
+    failure = None
+    try:
+        parent, checkout, creation = create_validation_checkout(repo, feature_head, run_id_value)
+        evidence.update({"checkout_path": str(checkout.resolve()), "creation": creation})
+        atomic_json(evidence_path, evidence)
+        if not creation["passed"]:
+            raise IntegrationError("validation checkout creation failed")
+        initial = validation_checkout_state(checkout)
+        evidence["initial_fingerprint"] = initial
+        if initial["head"] != feature_head or initial["branch"] or initial["status"]:
+            raise IntegrationError("validation checkout is not the exact clean detached feature HEAD")
+        atomic_json(evidence_path, evidence)
+        for index, item in enumerate(items):
+            before = validation_checkout_state(checkout)
+            command_evidence = {
+                "name": item["name"], "argv": redact_argv(item["command"]),
+                "cwd": str(checkout.resolve()), "exact_feature_head": feature_head,
+                "before": before,
+            }
+            evidence["commands"].append(command_evidence)
+            atomic_json(evidence_path, evidence)
+            record = command_record(
+                item["command"], run_dir / "logs" / f"pre-merge-{index}.log",
+                cwd=checkout, timeout=item["timeout"],
+                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+            )
+            after = validation_checkout_state(checkout)
+            command_evidence.update({"command": record, "after": after, "fingerprint_unchanged": after == before})
+            atomic_json(evidence_path, evidence)
+            if after != before:
+                raise IntegrationError(f"validation checkout changed during pre-merge[{index}]")
+            if not record["passed"]:
+                raise IntegrationError(f"pre-merge command failed; see {record['output_artifact']}")
+    except Exception as exc:
+        failure = exc
+        evidence["failure"] = redact(str(exc))
+        atomic_json(evidence_path, evidence)
+    finally:
+        if parent is not None and checkout is not None:
+            try:
+                evidence["cleanup"] = cleanup_validation_checkout(repo, parent, checkout)
+                if not evidence["cleanup"]["passed"]:
+                    failure = IntegrationError("validation checkout cleanup or prune failed")
+            except Exception as exc:
+                evidence["cleanup"] = {"passed": False, "failure": redact(str(exc))}
+                failure = exc
+            atomic_json(evidence_path, evidence)
+    if failure is not None:
+        raise failure
+    return [item["command"] for item in evidence["commands"]], evidence
+
+
 def run_id(task_id: str) -> str:
     safe = re.sub(r"[^a-z0-9]+", "-", task_id.lower()).strip("-")
     return f"{safe}-{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
@@ -878,6 +1039,10 @@ Phase: `{state.get('phase', 'unknown')}`
 Failure/refusal: {failures}
 Bound contract: `{state.get('deployment_contract_path', 'unavailable')}`
 Contract SHA-256: `{state.get('deployment_contract_sha256', 'unavailable')}`
+Pre-merge context: exact feature HEAD in a tool-created disposable detached checkout.
+Validation checkout: `{state.get('validation_checkout', {}).get('checkout_path', 'not created')}`
+Validation cleanup: `{state.get('validation_checkout', {}).get('cleanup', {}).get('passed', 'not run')}`
+Post-merge context: exact staged production main.
 Push trust boundary: `git push`, local push hooks, and post-push executable checks are reconciled before FINALIZED.
 
 ## Acceptance
@@ -1111,7 +1276,6 @@ def stage(manifest_path: Path, manifest: dict, args) -> tuple[Path, dict]:
         run_dir = Path(args.result_root).resolve() / manifest["task_id"] / identifier
         backup_dir = Path(args.backup_root).resolve() / identifier
         run_dir.mkdir(parents=True, mode=0o755)
-        backup_dir.mkdir(parents=True, mode=0o700)
         contract = preflight["contract"]
         state = {
             "schema_version": SCHEMA_VERSION, "run_id": identifier, "task_id": manifest["task_id"],
@@ -1143,6 +1307,19 @@ def stage(manifest_path: Path, manifest: dict, args) -> tuple[Path, dict]:
                 args.service_manager, contract["services"], args.service_timeout,
             )
             atomic_json(run_dir / "services-before.json", state["service_status_before"])
+            persist(run_dir, state, "PRE_MERGE_TESTING", "PRE_MERGE_TESTING")
+            state["pre_merge_tests"], state["validation_checkout"] = run_feature_validation(
+                repo, manifest["feature_head"], contract["pre_merge_tests"], run_dir, identifier,
+            )
+            atomic_json(run_dir / "pre-merge-tests.json", state["pre_merge_tests"])
+            atomic_json(run_dir / "validation-checkout.json", state["validation_checkout"])
+            # Production must still be the exact baseline after validation checkout cleanup.
+            after_validation = inspect_manifest(
+                manifest, manifest_path=manifest_path, expected_repository=repo,
+            )
+            if after_validation["main_state"] != state["expected_repository_state"]:
+                raise IntegrationError("production repository changed during feature validation")
+            backup_dir.mkdir(parents=True, mode=0o700)
             persist(run_dir, state, "BACKING_UP", "BACKING_UP")
             state["backups"] = create_backups(contract, backup_dir)
             atomic_json(run_dir / "backup-manifest.json", state["backups"])
@@ -1151,12 +1328,6 @@ def stage(manifest_path: Path, manifest: dict, args) -> tuple[Path, dict]:
                 contract, state["backups"], run_dir, protected_work_dir=backup_dir / "migration-copies",
             )
             atomic_json(run_dir / "migration-validation.json", state["migration_validation"])
-            persist(run_dir, state, "PRE_MERGE_TESTING", "PRE_MERGE_TESTING")
-            state["pre_merge_tests"] = run_checks(
-                contract["pre_merge_tests"], run_dir, "pre-merge", cwd=repo,
-                expected_repository_state=state["expected_repository_state"],
-            )
-            atomic_json(run_dir / "pre-merge-tests.json", state["pre_merge_tests"])
             # This is the last preflight before the first repository mutation.
             immediate = inspect_manifest(manifest, manifest_path=manifest_path, expected_repository=repo)
             if immediate["main_state"] != state["expected_repository_state"]:
@@ -1240,6 +1411,18 @@ def stage(manifest_path: Path, manifest: dict, args) -> tuple[Path, dict]:
             state["failure"] = "stage interrupted"
             persist(run_dir, state, "INTERRUPTED", "INTERRUPTED")
         except Exception as exc:
+            validation_evidence_path = run_dir / "validation-checkout.json"
+            if validation_evidence_path.is_file():
+                try:
+                    state["validation_checkout"] = json.loads(
+                        validation_evidence_path.read_text(encoding="utf-8")
+                    )
+                    state["pre_merge_tests"] = [
+                        item["command"] for item in state["validation_checkout"].get("commands", [])
+                        if "command" in item
+                    ]
+                except (OSError, json.JSONDecodeError):
+                    state["validation_checkout_evidence_error"] = "validation evidence could not be reloaded"
             state["failure"] = redact(str(exc))
             persist(run_dir, state, "AUTOMATED_CHECK_FAILED", "AUTOMATED_CHECK_FAILED")
             if not state.get("live_mutation_started"):
@@ -1515,7 +1698,17 @@ def main(argv=None) -> int:
                 print(json.dumps({
                     "dry_run": True, "repository": str(trusted_repo),
                     "would_backup": contract["backups"], "would_merge_exact_commit": manifest["feature_head"],
-                    "would_test": contract["pre_merge_tests"] + contract["post_merge_tests"],
+                    "would_test": {
+                        "pre_merge": {
+                            "context": "disposable detached checkout of exact feature HEAD",
+                            "feature_head": manifest["feature_head"],
+                            "commands": contract["pre_merge_tests"],
+                        },
+                        "post_merge": {
+                            "context": "exact staged production main",
+                            "commands": contract["post_merge_tests"],
+                        },
+                    },
                     "would_restart": [x for x in contract["services"]],
                     "would_check": contract["readiness_checks"], "would_check_logs": contract["fatal_log_checks"],
                 }, indent=2, sort_keys=True))

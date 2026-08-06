@@ -89,6 +89,30 @@ R4_REGRESSION_COVERAGE = {
     ],
 }
 
+R5_REGRESSION_COVERAGE = {
+    "exact_feature_context": [
+        "test_real_shape_feature_only_validation_reaches_awaiting_acceptance",
+        "test_feature_branch_move_uses_recorded_exact_head",
+        "test_dirty_operator_worktree_does_not_affect_exact_validation",
+    ],
+    "validation_mutation_refusal": [
+        "test_validation_tracked_mutation_refused_before_live_mutation",
+        "test_validation_staged_mutation_refused_before_live_mutation",
+        "test_validation_untracked_and_symlink_mutations_refused_before_live_mutation",
+        "test_validation_head_movement_refused_before_live_mutation",
+        "test_validation_branch_attachment_refused_before_live_mutation",
+    ],
+    "checkout_failure_cleanup": [
+        "test_validation_worktree_creation_failure_has_no_production_mutation",
+        "test_validation_prune_failure_has_no_production_mutation",
+        "test_failed_pre_merge_evidence_is_preserved_and_checkout_removed",
+    ],
+    "execution_boundary": [
+        "test_real_shape_feature_only_validation_reaches_awaiting_acceptance",
+        "test_post_merge_test_cwd_is_staged_production_main",
+    ],
+}
+
 
 def cmd(*args, cwd=None, env=None):
     return subprocess.run(args, cwd=cwd, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -116,17 +140,33 @@ class RepositoryFixture(unittest.TestCase):
         cmd("git", "-C", str(self.repo), "config", "user.email", "test@example.invalid")
         cmd("git", "-C", str(self.repo), "config", "user.name", "Test")
         (self.repo / "base.txt").write_text("base\n", encoding="utf-8")
-        cmd("git", "-C", str(self.repo), "add", "base.txt")
+        (self.repo / "test_kven_codex_task.py").write_text(
+            "import unittest\n\nclass BaselineTest(unittest.TestCase):\n"
+            "    def test_baseline(self):\n        self.assertTrue(True)\n",
+            encoding="utf-8",
+        )
+        cmd("git", "-C", str(self.repo), "add", "base.txt", "test_kven_codex_task.py")
         cmd("git", "-C", str(self.repo), "commit", "-m", "base")
         cmd("git", "-C", str(self.repo), "remote", "add", "origin", str(self.remote))
         cmd("git", "-C", str(self.repo), "push", "-u", "origin", "main")
         self.base = cmd("git", "-C", str(self.repo), "rev-parse", "HEAD").stdout.strip()
         cmd("git", "-C", str(self.repo), "worktree", "add", "-b", "feature", str(self.feature_worktree), self.base)
         (self.feature_worktree / "feature.txt").write_text("feature\n", encoding="utf-8")
+        (self.feature_worktree / "test_kven_integrate_task.py").write_text(
+            "import unittest\n\nclass FeatureIntegrationTest(unittest.TestCase):\n"
+            "    def test_feature_integration(self):\n        self.assertTrue(True)\n",
+            encoding="utf-8",
+        )
+        (self.feature_worktree / "test_feature_only.py").write_text(
+            "import unittest\n\nclass FeatureOnlyTest(unittest.TestCase):\n"
+            "    def test_feature_only(self):\n        self.assertTrue(True)\n",
+            encoding="utf-8",
+        )
         check = {"name": "synthetic", "command": [sys.executable, "-c", "pass"], "timeout": 30}
         self.contract = {
             "schema_version": "2.0", "expected_baseline": self.base, "feature_branch": "feature",
-            "allowed_paths": ["deployment-contract.json", "feature.txt"], "services": [],
+            "allowed_paths": ["deployment-contract.json", "feature.txt", "test_feature_only.py",
+                              "test_kven_integrate_task.py"], "services": [],
             "backups": {"sqlite": [], "configuration": []}, "migration_checks": [],
             "result_validation_tests": [copy.deepcopy(check)], "pre_merge_tests": [copy.deepcopy(check)],
             "post_merge_tests": [copy.deepcopy(check)], "readiness_checks": [], "fatal_log_checks": [],
@@ -134,7 +174,8 @@ class RepositoryFixture(unittest.TestCase):
             "rollback": {"restore_git": True, "restore_backups": True, "verify_readiness": True},
         }
         (self.feature_worktree / "deployment-contract.json").write_text(json.dumps(self.contract), encoding="utf-8")
-        cmd("git", "-C", str(self.feature_worktree), "add", "feature.txt", "deployment-contract.json")
+        cmd("git", "-C", str(self.feature_worktree), "add", "feature.txt", "deployment-contract.json",
+            "test_feature_only.py", "test_kven_integrate_task.py")
         cmd("git", "-C", str(self.feature_worktree), "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "feature")
         self.feature = cmd("git", "-C", str(self.feature_worktree), "rev-parse", "HEAD").stdout.strip()
         self.package = self.root / "package"
@@ -156,7 +197,8 @@ class RepositoryFixture(unittest.TestCase):
             "feature_branch": "feature", "feature_head": self.feature,
             "worktree_path": str(self.feature_worktree),
             "commits_created": [{"sha": self.feature, "subject": "feature"}],
-            "changed_files": ["deployment-contract.json", "feature.txt"], "tests": [record()],
+            "changed_files": ["deployment-contract.json", "feature.txt", "test_feature_only.py",
+                              "test_kven_integrate_task.py"], "tests": [record()],
             "git_diff_check": {"passed": True}, "secret_scan": {"passed": True},
             "evidence_secret_scan": {"passed": True},
             "deployment_contract": self.contract, "deployment_contract_path": "deployment-contract.json",
@@ -234,7 +276,9 @@ class RepositoryFixture(unittest.TestCase):
         self.assertEqual(loaded["task_id"], "TEST")
         report = self.inspect()
         self.assertTrue(report["eligible"])
-        self.assertEqual(report["actual_changed_files"], ["deployment-contract.json", "feature.txt"])
+        self.assertEqual(report["actual_changed_files"], [
+            "deployment-contract.json", "feature.txt", "test_feature_only.py", "test_kven_integrate_task.py",
+        ])
         self.assertEqual(report["deployment_contract_sha256"], self.manifest["deployment_contract_sha256"])
 
     def test_package_only_contract_mutations_and_hash_mismatch_are_rejected(self):
@@ -350,8 +394,8 @@ class RepositoryFixture(unittest.TestCase):
             self.inspect()
 
     def test_feature_head_mismatch_rejected(self):
-        cmd("git", "-C", str(self.feature_worktree), "commit", "--allow-empty", "-m", "moved")
-        with self.assertRaisesRegex(integration.IntegrationError, "feature HEAD mismatch"):
+        self.manifest["feature_head"] = "0" * 40
+        with self.assertRaisesRegex(integration.IntegrationError, "exact feature commit object is missing"):
             self.inspect()
 
     def test_failed_codex_status_rejected(self):
@@ -429,7 +473,9 @@ class RepositoryFixture(unittest.TestCase):
         self.manifest["changed_files"] = []
         with self.assertRaisesRegex(integration.IntegrationError, "changed_files mismatch"):
             self.inspect()
-        self.manifest["changed_files"] = ["deployment-contract.json", "feature.txt"]
+        self.manifest["changed_files"] = [
+            "deployment-contract.json", "feature.txt", "test_feature_only.py", "test_kven_integrate_task.py",
+        ]
         self.contract["allowed_paths"] = ["different.txt"]
         self.bind_contract()
         with self.assertRaisesRegex(integration.IntegrationError, "outside contract"):
@@ -506,23 +552,193 @@ class RepositoryFixture(unittest.TestCase):
         self.assertEqual(cmd("git", "-C", str(self.repo), "rev-parse", "HEAD").stdout.strip(), self.base)
         self.assertTrue((run_dir / "rollback-result.json").is_file())
 
-    def test_branch_move_between_preflights_is_rejected(self):
+    def test_feature_branch_move_uses_recorded_exact_head(self):
         args = self._stage_args()
+        recorded = self.manifest["feature_head"]
         real_inspect = integration.inspect_manifest
         calls = 0
+        moved = None
 
         def moving_inspect(*values, **kwargs):
-            nonlocal calls
+            nonlocal calls, moved
             calls += 1
             if calls == 2:
                 cmd("git", "-C", str(self.feature_worktree), "commit", "--allow-empty", "-m", "race")
+                moved = cmd("git", "-C", str(self.feature_worktree), "rev-parse", "HEAD").stdout.strip()
             return real_inspect(*values, **kwargs)
 
         with mock.patch.object(integration, "inspect_manifest", side_effect=moving_inspect):
             run_dir, state = integration.stage(self.path, self.manifest, args)
+        self.assertEqual(state["status"], "AWAITING_ACCEPTANCE")
+        self.assertEqual(state["feature_head"], recorded)
+        self.assertNotEqual(moved, recorded)
+        self.assertEqual(cmd("git", "-C", str(self.repo), "merge-base", "--is-ancestor", recorded,
+                             state["staged_head"]).returncode, 0)
+        self.assertNotEqual(cmd("git", "-C", str(self.repo), "merge-base", "--is-ancestor", moved,
+                                state["staged_head"]).returncode, 0)
+        self.assertTrue(state["validation_checkout"]["cleanup"]["passed"])
+        self.assertFalse(Path(state["validation_checkout"]["checkout_path"]).exists())
+
+    def _stage_with_pre_merge(self, command, name="r5-validation"):
+        self.contract["pre_merge_tests"] = [{"name": name, "command": command, "timeout": 30}]
+        args = self._stage_args()
+        before = integration.repository_state(self.repo)
+        run_dir, state = integration.stage(self.path, self.manifest, args)
+        return run_dir, state, before
+
+    def _assert_pre_mutation_validation_refusal(self, state, before):
         self.assertEqual(state["status"], "AUTOMATED_CHECK_FAILED")
-        self.assertIn("feature HEAD mismatch", state["failure"])
-        self.assertEqual(integration.repository_state(self.repo)["head"], self.base)
+        self.assertFalse(state["live_mutation_started"])
+        self.assertEqual(integration.repository_state(self.repo), before)
+        self.assertFalse(self.backups.exists())
+        evidence = state["validation_checkout"]
+        self.assertFalse(Path(evidence["checkout_path"]).exists())
+        checkout = str(Path(evidence["checkout_path"]).resolve())
+        self.assertNotIn(f"worktree {checkout}", cmd(
+            "git", "-C", str(self.repo), "worktree", "list", "--porcelain",
+        ).stdout)
+        return evidence
+
+    def test_real_shape_feature_only_validation_reaches_awaiting_acceptance(self):
+        exact = [
+            sys.executable, "-m", "unittest", "test_kven_codex_task", "test_kven_integrate_task",
+        ]
+        feature_only = [sys.executable, "-m", "unittest", "test_feature_only"]
+        no_bytecode = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+        baseline_exact = cmd(*exact, cwd=self.repo, env=no_bytecode)
+        baseline_feature_only = cmd(*feature_only, cwd=self.repo, env=no_bytecode)
+        self.assertNotEqual(baseline_exact.returncode, 0)
+        self.assertIn("test_kven_integrate_task", baseline_exact.stderr)
+        self.assertNotEqual(baseline_feature_only.returncode, 0)
+        self.assertIn("test_feature_only", baseline_feature_only.stderr)
+        self.contract["pre_merge_tests"] = [
+            {"name": "real-shape", "command": exact, "timeout": 30},
+            {"name": "feature-only", "command": feature_only, "timeout": 30},
+        ]
+        result = self.stage_cli()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        state = json.loads((self.run_dir() / "integration-manifest.json").read_text())
+        self.assertEqual(state["status"], "AWAITING_ACCEPTANCE")
+        evidence = state["validation_checkout"]
+        self.assertTrue(evidence["cleanup"]["passed"])
+        self.assertFalse(Path(evidence["checkout_path"]).exists())
+        for item in evidence["commands"]:
+            self.assertEqual(item["cwd"], evidence["checkout_path"])
+            self.assertEqual(item["exact_feature_head"], state["feature_head"])
+            self.assertEqual(item["before"], item["after"])
+            self.assertEqual(item["before"]["branch"], "")
+            self.assertEqual(item["before"]["head"], state["feature_head"])
+            self.assertTrue(item["command"]["passed"])
+        parents = cmd("git", "-C", str(self.repo), "rev-list", "--parents", "-n", "1",
+                      state["staged_head"]).stdout.split()
+        self.assertIn(state["feature_head"], parents[1:])
+
+    def test_dirty_operator_worktree_does_not_affect_exact_validation(self):
+        args = self._stage_args()
+        recorded = self.manifest["feature_head"]
+        (self.feature_worktree / "feature.txt").write_text("operator dirty data\n", encoding="utf-8")
+        (self.feature_worktree / "operator-untracked.txt").write_text("preserve\n", encoding="utf-8")
+        _, state = integration.stage(self.path, self.manifest, args)
+        self.assertEqual(state["status"], "AWAITING_ACCEPTANCE")
+        self.assertEqual(state["feature_head"], recorded)
+        self.assertEqual((self.feature_worktree / "feature.txt").read_text(), "operator dirty data\n")
+        self.assertTrue((self.feature_worktree / "operator-untracked.txt").is_file())
+        self.assertTrue(state["validation_checkout"]["cleanup"]["passed"])
+
+    def test_validation_tracked_mutation_refused_before_live_mutation(self):
+        command = [
+            sys.executable, "-c",
+            "from pathlib import Path; Path('feature.txt').write_text('validation mutation\\n')",
+        ]
+        _, state, before = self._stage_with_pre_merge(command)
+        evidence = self._assert_pre_mutation_validation_refusal(state, before)
+        self.assertFalse(evidence["commands"][0]["fingerprint_unchanged"])
+
+    def test_validation_staged_mutation_refused_before_live_mutation(self):
+        command = ["git", "update-index", "--chmod=+x", "feature.txt"]
+        _, state, before = self._stage_with_pre_merge(command)
+        evidence = self._assert_pre_mutation_validation_refusal(state, before)
+        item = evidence["commands"][0]
+        self.assertNotEqual(item["before"]["index_tree"], item["after"]["index_tree"])
+
+    def test_validation_untracked_and_symlink_mutations_refused_before_live_mutation(self):
+        command = [
+            sys.executable, "-c",
+            "from pathlib import Path; import os; Path('created.txt').write_text('created'); "
+            "os.symlink('feature.txt', 'created-link')",
+        ]
+        _, state, before = self._stage_with_pre_merge(command)
+        evidence = self._assert_pre_mutation_validation_refusal(state, before)
+        item = evidence["commands"][0]
+        self.assertIn("created.txt", item["after"]["status"])
+        self.assertTrue(any(link["path"] == "created-link" for link in item["after"]["symlinks"]))
+
+    def test_validation_head_movement_refused_before_live_mutation(self):
+        command = ["git", "commit", "--allow-empty", "-m", "validation head movement"]
+        _, state, before = self._stage_with_pre_merge(command)
+        evidence = self._assert_pre_mutation_validation_refusal(state, before)
+        item = evidence["commands"][0]
+        self.assertNotEqual(item["before"]["head"], item["after"]["head"])
+
+    def test_validation_branch_attachment_refused_before_live_mutation(self):
+        command = ["git", "switch", "-c", "validation-attached"]
+        _, state, before = self._stage_with_pre_merge(command)
+        evidence = self._assert_pre_mutation_validation_refusal(state, before)
+        self.assertEqual(evidence["commands"][0]["after"]["branch"], "validation-attached")
+
+    def test_validation_worktree_creation_failure_has_no_production_mutation(self):
+        args = self._stage_args()
+        before = integration.repository_state(self.repo)
+        real_run = integration.run
+
+        def fail_add(command, **kwargs):
+            values = [str(value) for value in command]
+            if "worktree" in values and "add" in values:
+                return subprocess.CompletedProcess(values, 1, "", "synthetic creation failure")
+            return real_run(command, **kwargs)
+
+        with mock.patch.object(integration, "run", side_effect=fail_add):
+            _, state = integration.stage(self.path, self.manifest, args)
+        evidence = self._assert_pre_mutation_validation_refusal(state, before)
+        self.assertFalse(evidence["creation"]["passed"])
+        self.assertTrue(evidence["cleanup"]["passed"])
+
+    def test_validation_prune_failure_has_no_production_mutation(self):
+        args = self._stage_args()
+        before = integration.repository_state(self.repo)
+        real_run = integration.run
+
+        def fail_prune(command, **kwargs):
+            values = [str(value) for value in command]
+            if len(values) >= 2 and values[-2:] == ["worktree", "prune"]:
+                return subprocess.CompletedProcess(values, 1, "", "synthetic prune failure")
+            return real_run(command, **kwargs)
+
+        with mock.patch.object(integration, "run", side_effect=fail_prune):
+            _, state = integration.stage(self.path, self.manifest, args)
+        evidence = self._assert_pre_mutation_validation_refusal(state, before)
+        self.assertFalse(evidence["cleanup"]["passed"])
+        self.assertEqual(evidence["cleanup"]["prune_exit_code"], 1)
+        self.assertIn("cleanup or prune failed", state["failure"])
+
+    def test_failed_pre_merge_evidence_is_preserved_and_checkout_removed(self):
+        command = [sys.executable, "-c", "print('expected failure'); raise SystemExit(7)"]
+        run_dir, state, before = self._stage_with_pre_merge(command)
+        evidence = self._assert_pre_mutation_validation_refusal(state, before)
+        item = evidence["commands"][0]
+        self.assertFalse(item["command"]["passed"])
+        self.assertEqual(item["command"]["exit_code"], 7)
+        self.assertEqual(item["command"]["cwd"], evidence["checkout_path"])
+        self.assertTrue(Path(item["command"]["output_artifact"]).is_file())
+        self.assertTrue((run_dir / "validation-checkout.json").is_file())
+
+    def test_post_merge_test_cwd_is_staged_production_main(self):
+        result = self.stage_cli()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        state = json.loads((self.run_dir() / "integration-manifest.json").read_text())
+        self.assertEqual(state["status"], "AWAITING_ACCEPTANCE")
+        self.assertEqual(state["post_merge_tests"][0]["cwd"], str(self.repo.resolve()))
+        self.assertEqual(integration.repository_state(self.repo)["head"], state["staged_head"])
 
     def _stage_args(self, service_manager=None, timeout=1):
         self.bind_contract()
@@ -1477,6 +1693,12 @@ class CoverageTests(unittest.TestCase):
 
     def test_r4_regression_map_references_discovered_tests(self):
         names = {name for tests in R4_REGRESSION_COVERAGE.values() for name in tests}
+        discovered = {name for cls in (RepositoryFixture, BackupMigrationTests, FakeServiceTests, CoverageTests)
+                      for name in dir(cls) if name.startswith("test_")}
+        self.assertTrue(names <= discovered)
+
+    def test_r5_regression_map_references_discovered_tests(self):
+        names = {name for tests in R5_REGRESSION_COVERAGE.values() for name in tests}
         discovered = {name for cls in (RepositoryFixture, BackupMigrationTests, FakeServiceTests, CoverageTests)
                       for name in dir(cls) if name.startswith("test_")}
         self.assertTrue(names <= discovered)

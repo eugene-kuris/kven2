@@ -17,7 +17,7 @@
   },
   "expected_baseline": "91ca8fb8ed1f6aa60c366d032995e03ca9acce54",
   "fatal_log_checks": [],
-  "feature_branch": "codex/work-kven-ops-002a-r4-console-20260806T174159Z-1299714",
+  "feature_branch": "codex/work-kven-ops-002a-r5-console-20260806T184128Z-1359302",
   "migration_checks": [],
   "post_merge_tests": [
     {
