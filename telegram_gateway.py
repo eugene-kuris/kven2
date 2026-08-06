@@ -27,6 +27,8 @@ DEFAULT_TELEGRAM_KVEN_MODEL = settings.MAIN_MODEL
 DEFAULT_TELEGRAM_POLLING_TIMEOUT = 50
 DEFAULT_TELEGRAM_IDLE_DELAY = 0.1
 DEFAULT_TELEGRAM_ERROR_DELAY = 5.0
+DEFAULT_TELEGRAM_BATCH_DEBOUNCE = 1.5
+DEFAULT_TELEGRAM_EXACT_TAIL_TOKENS = 4096
 DEFAULT_TELEGRAM_LOG_LEVEL = "INFO"
 
 _ALLOWED_LOG_LEVELS = {
@@ -55,6 +57,8 @@ class TelegramGatewayConfig:
     error_delay: float = (
         DEFAULT_TELEGRAM_ERROR_DELAY
     )
+    batch_debounce_seconds: float = DEFAULT_TELEGRAM_BATCH_DEBOUNCE
+    exact_tail_token_budget: int = DEFAULT_TELEGRAM_EXACT_TAIL_TOKENS
     log_level: str = DEFAULT_TELEGRAM_LOG_LEVEL
 
     def __repr__(self) -> str:
@@ -70,6 +74,8 @@ class TelegramGatewayConfig:
             f"polling_timeout={self.polling_timeout!r}, "
             f"idle_delay={self.idle_delay!r}, "
             f"error_delay={self.error_delay!r}, "
+            f"batch_debounce_seconds={self.batch_debounce_seconds!r}, "
+            f"exact_tail_token_budget={self.exact_tail_token_budget!r}, "
             f"log_level={self.log_level!r}"
             ")"
         )
@@ -250,6 +256,17 @@ def load_telegram_gateway_config(
         default=DEFAULT_TELEGRAM_ERROR_DELAY,
         allow_zero=False,
     )
+    batch_debounce_seconds = _finite_float(
+        environment,
+        "TELEGRAM_BATCH_DEBOUNCE_SECONDS",
+        default=DEFAULT_TELEGRAM_BATCH_DEBOUNCE,
+        allow_zero=True,
+    )
+    exact_tail_token_budget = _positive_integer(
+        environment,
+        "TELEGRAM_EXACT_TAIL_TOKEN_BUDGET",
+        default=DEFAULT_TELEGRAM_EXACT_TAIL_TOKENS,
+    )
     log_level = _optional_text(
         environment,
         "TELEGRAM_LOG_LEVEL",
@@ -272,6 +289,8 @@ def load_telegram_gateway_config(
         polling_timeout=polling_timeout,
         idle_delay=idle_delay,
         error_delay=error_delay,
+        batch_debounce_seconds=batch_debounce_seconds,
+        exact_tail_token_budget=exact_tail_token_budget,
         log_level=log_level,
     )
 
@@ -292,7 +311,18 @@ def build_telegram_gateway_runtime(
         TelegramGatewayRuntime
     ),
 ) -> Any:
-    store = store_factory(config.db_path)
+    if store_factory is TelegramStore:
+        store = store_factory(
+            config.db_path,
+            batch_debounce_seconds=(
+                config.batch_debounce_seconds
+            ),
+            exact_tail_token_budget=(
+                config.exact_tail_token_budget
+            ),
+        )
+    else:
+        store = store_factory(config.db_path)
     telegram_bot = bot_factory(config.bot_token)
     kven_client = kven_factory(
         model=config.kven_model,

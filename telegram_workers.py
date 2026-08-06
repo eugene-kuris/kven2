@@ -48,10 +48,14 @@ async def run_generation_once(
     if job is None:
         return False
 
-    messages = await store.load_conversation(
-        job.chat_id,
-        through_update_id=job.update_id,
-    )
+    context_builder = getattr(store, "build_generation_context", None)
+    if context_builder is not None:
+        messages = await context_builder(job)
+    else:
+        messages = await store.load_conversation(
+            job.chat_id,
+            through_update_id=job.update_id,
+        )
 
     response_text = await kven_client.generate_reply(
         messages

@@ -16,6 +16,8 @@ class TelegramTextUpdate:
     message_id: int
     text: str
     raw_update: dict[str, Any]
+    message_date: int | None = None
+    reply_to_message_id: int | None = None
 
 
 class TelegramUpdateStore(Protocol):
@@ -133,6 +135,8 @@ def parse_authorized_text_update(
         message.get("message_id")
     )
     text = message.get("text")
+    if text is None:
+        text = message.get("caption")
 
     if chat_id is None or message_id is None:
         return None
@@ -146,6 +150,18 @@ def parse_authorized_text_update(
         user_id=user_id,
         message_id=message_id,
         text=text,
+        message_date=(
+            message.get("date")
+            if isinstance(message.get("date"), int)
+            and not isinstance(message.get("date"), bool)
+            else None
+        ),
+        reply_to_message_id=(
+            message.get("reply_to_message", {}).get("message_id")
+            if isinstance(message.get("reply_to_message"), dict)
+            and isinstance(message.get("reply_to_message", {}).get("message_id"), int)
+            else None
+        ),
         raw_update=raw_update,
     )
 
@@ -169,6 +185,11 @@ async def ingest_telegram_update(
         )
         return False
 
+    extra = {}
+    if parsed.message_date is not None:
+        extra["message_date"] = parsed.message_date
+    if parsed.reply_to_message_id is not None:
+        extra["reply_to_message_id"] = parsed.reply_to_message_id
     return await store.enqueue_text_update(
         update_id=parsed.update_id,
         chat_id=parsed.chat_id,
@@ -176,4 +197,5 @@ async def ingest_telegram_update(
         message_id=parsed.message_id,
         text=parsed.text,
         raw_update=parsed.raw_update,
+        **extra,
     )

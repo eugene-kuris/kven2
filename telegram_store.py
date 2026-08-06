@@ -3,11 +3,15 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from telegram_bot_api import split_telegram_text
+from context_window import estimate_tokens_from_chars
 
 
 @dataclass(frozen=True)
@@ -22,6 +26,8 @@ class TelegramJob:
     attempts: int
     delivery_attempts: int
     response_text: str | None
+    stream_id: int | None = None
+    batch_update_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -61,8 +67,25 @@ class TelegramDelivery:
 
 
 class TelegramStore:
-    def __init__(self, db_path: str):
+    def __init__(
+        self,
+        db_path: str,
+        *,
+        batch_debounce_seconds: float = 0.0,
+        exact_tail_token_budget: int = 4096,
+    ):
         self.db_path = db_path
+        if batch_debounce_seconds < 0:
+            raise ValueError(
+                "Telegram batch debounce must be "
+                "non-negative"
+            )
+        if exact_tail_token_budget <= 0:
+            raise ValueError(
+                "Telegram exact-tail budget must be positive"
+            )
+        self.batch_debounce_seconds = float(batch_debounce_seconds)
+        self.exact_tail_token_budget = int(exact_tail_token_budget)
 
     async def init(self) -> None:
         await asyncio.to_thread(self._init_sync)
@@ -100,6 +123,8 @@ class TelegramStore:
         message_id: int,
         text: str,
         raw_update: dict[str, Any],
+        message_date: int | None = None,
+        reply_to_message_id: int | None = None,
     ) -> bool:
         return await asyncio.to_thread(
             self._enqueue_text_update_sync,
@@ -109,6 +134,8 @@ class TelegramStore:
             message_id,
             text,
             raw_update,
+            message_date,
+            reply_to_message_id,
         )
 
     async def claim_next_job(self) -> TelegramJob | None:
@@ -167,6 +194,15 @@ class TelegramStore:
             self._load_conversation_sync,
             chat_id,
             through_update_id,
+        )
+
+    async def build_generation_context(
+        self,
+        job: TelegramJob,
+    ) -> list[dict[str, str]]:
+        return await asyncio.to_thread(
+            self._build_generation_context_sync,
+            job,
         )
 
     async def recover_incomplete_jobs(self) -> int:
@@ -356,8 +392,92 @@ class TelegramStore:
                         chat_id,
                         id
                     );
+
+                CREATE TABLE IF NOT EXISTS telegram_streams (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (
+                        strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    ),
+                    UNIQUE(chat_id, user_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS telegram_job_messages (
+                    job_id INTEGER NOT NULL,
+                    update_id INTEGER NOT NULL UNIQUE,
+                    ordinal INTEGER NOT NULL,
+                    PRIMARY KEY(job_id, ordinal),
+                    FOREIGN KEY(job_id) REFERENCES telegram_jobs(id),
+                    FOREIGN KEY(update_id) REFERENCES telegram_updates(update_id)
+                );
+
                 """
             )
+            for table, column, declaration in (
+                ("telegram_updates", "message_date", "INTEGER"),
+                ("telegram_updates", "reply_to_message_id", "INTEGER"),
+                ("telegram_jobs", "stream_id", "INTEGER"),
+                ("telegram_jobs", "ready_at", "REAL"),
+                ("telegram_messages", "stream_id", "INTEGER"),
+                ("telegram_messages", "telegram_date", "INTEGER"),
+                ("telegram_messages", "reply_to_message_id", "INTEGER"),
+            ):
+                self._ensure_column(
+                    connection,
+                    table,
+                    column,
+                    declaration,
+                )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS "
+                "idx_telegram_jobs_stream_status "
+                "ON telegram_jobs(stream_id, status, id)"
+            )
+            self._migrate_relationship_rows(connection)
+
+    @staticmethod
+    def _ensure_column(
+        connection: sqlite3.Connection,
+        table: str,
+        column: str,
+        declaration: str,
+    ) -> None:
+        columns = {
+            row["name"]
+            for row in connection.execute(
+                f"PRAGMA table_info({table})"
+            )
+        }
+        if column not in columns:
+            connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+
+    @staticmethod
+    def _migrate_relationship_rows(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """INSERT OR IGNORE INTO telegram_streams(chat_id, user_id)
+               SELECT DISTINCT chat_id, user_id FROM telegram_updates"""
+        )
+        connection.execute(
+            """UPDATE telegram_jobs SET stream_id = (
+                   SELECT id FROM telegram_streams s
+                   WHERE s.chat_id = telegram_jobs.chat_id
+                     AND s.user_id = telegram_jobs.user_id)
+               WHERE stream_id IS NULL"""
+        )
+        connection.execute(
+            """UPDATE telegram_jobs SET ready_at = 0 WHERE ready_at IS NULL"""
+        )
+        connection.execute(
+            """INSERT OR IGNORE INTO telegram_job_messages(job_id, update_id, ordinal)
+               SELECT id, update_id, 0 FROM telegram_jobs"""
+        )
+        connection.execute(
+            """UPDATE telegram_messages SET stream_id = (
+                   SELECT j.stream_id FROM telegram_jobs j
+                   WHERE j.update_id = telegram_messages.source_update_id)
+               WHERE stream_id IS NULL"""
+        )
 
     @staticmethod
     def _advance_offset_sync(
@@ -441,6 +561,8 @@ class TelegramStore:
         message_id: int,
         text: str,
         raw_update: dict[str, Any],
+        message_date: int | None,
+        reply_to_message_id: int | None,
     ) -> bool:
         raw_json = json.dumps(
             raw_update,
@@ -478,9 +600,9 @@ class TelegramStore:
                         user_id,
                         message_id,
                         text,
-                        raw_json
+                        raw_json, message_date, reply_to_message_id
                     )
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         update_id,
@@ -489,40 +611,75 @@ class TelegramStore:
                         message_id,
                         text,
                         raw_json,
+                        message_date,
+                        reply_to_message_id,
                     ),
                 )
 
                 connection.execute(
+                    "INSERT OR IGNORE INTO telegram_streams(chat_id, user_id) VALUES (?, ?)",
+                    (chat_id, user_id),
+                )
+                stream_id = int(connection.execute(
+                    "SELECT id FROM telegram_streams WHERE chat_id = ? AND user_id = ?",
+                    (chat_id, user_id),
+                ).fetchone()["id"])
+
+                queued = connection.execute(
+                    "SELECT id FROM telegram_jobs WHERE stream_id = ? AND status = 'queued' ORDER BY id DESC LIMIT 1",
+                    (stream_id,),
+                ).fetchone()
+
+                if queued is None:
+                    cursor = connection.execute(
                     """
                     INSERT INTO telegram_jobs(
-                        update_id,
+                        update_id, stream_id, ready_at,
                         chat_id,
                         user_id,
                         message_id,
                         text
                     )
-                    VALUES (?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         update_id,
+                        stream_id,
+                        time.time() + self.batch_debounce_seconds,
                         chat_id,
                         user_id,
                         message_id,
                         text,
                     ),
                 )
+                    job_id = int(cursor.lastrowid)
+                    ordinal = 0
+                else:
+                    job_id = int(queued["id"])
+                    ordinal = int(connection.execute(
+                        "SELECT COUNT(*) AS count FROM telegram_job_messages WHERE job_id = ?",
+                        (job_id,),
+                    ).fetchone()["count"])
+                    connection.execute(
+                        "UPDATE telegram_jobs SET ready_at = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?",
+                        (time.time() + self.batch_debounce_seconds, job_id),
+                    )
+                connection.execute(
+                    "INSERT INTO telegram_job_messages(job_id, update_id, ordinal) VALUES (?, ?, ?)",
+                    (job_id, update_id, ordinal),
+                )
 
                 connection.execute(
                     """
                     INSERT INTO telegram_messages(
-                        chat_id,
+                        chat_id, stream_id, telegram_date, reply_to_message_id,
                         role,
                         content,
                         source_update_id,
                         telegram_message_id
                     )
                     VALUES (
-                        ?,
+                        ?, ?, ?, ?,
                         'user',
                         ?,
                         ?,
@@ -530,7 +687,7 @@ class TelegramStore:
                     )
                     """,
                     (
-                        chat_id,
+                        chat_id, stream_id, message_date, reply_to_message_id,
                         text,
                         update_id,
                         message_id,
@@ -561,9 +718,16 @@ class TelegramStore:
                     SELECT *
                     FROM telegram_jobs
                     WHERE status = 'queued'
+                      AND ready_at <= ?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM telegram_jobs active
+                          WHERE active.stream_id = telegram_jobs.stream_id
+                            AND active.status = 'processing'
+                      )
                     ORDER BY id
                     LIMIT 1
-                    """
+                    """,
+                    (time.time(),),
                 ).fetchone()
 
                 if row is None:
@@ -599,13 +763,21 @@ class TelegramStore:
                     (row["id"],),
                 ).fetchone()
 
+                batch_update_ids = tuple(
+                    int(item["update_id"])
+                    for item in connection.execute(
+                        "SELECT update_id FROM telegram_job_messages WHERE job_id = ? ORDER BY ordinal",
+                        (row["id"],),
+                    ).fetchall()
+                )
+
                 connection.execute("COMMIT")
 
             except Exception:
                 connection.execute("ROLLBACK")
                 raise
 
-        return self._job_from_row(claimed)
+        return self._job_from_row(claimed, batch_update_ids)
 
     def _claim_next_delivery_sync(
         self,
@@ -885,14 +1057,14 @@ class TelegramStore:
                     """
                     INSERT OR IGNORE INTO
                         telegram_messages(
-                            chat_id,
+                            chat_id, stream_id,
                             role,
                             content,
                             source_update_id,
                             telegram_message_id
                         )
                     VALUES (
-                        ?,
+                        ?, ?,
                         'assistant',
                         ?,
                         ?,
@@ -901,6 +1073,7 @@ class TelegramStore:
                     """,
                     (
                         job["chat_id"],
+                        job["stream_id"],
                         response_text,
                         job["update_id"],
                     ),
@@ -1177,6 +1350,73 @@ class TelegramStore:
             for row in rows
         ]
 
+    @staticmethod
+    def _display_time(epoch: int | None, stored: str) -> str:
+        if epoch is not None:
+            value = datetime.fromtimestamp(epoch, timezone.utc)
+        else:
+            value = datetime.fromisoformat(stored.replace("Z", "+00:00"))
+        return value.astimezone(ZoneInfo("Europe/Kyiv")).isoformat(timespec="seconds")
+
+    def _build_generation_context_sync(self, job: TelegramJob) -> list[dict[str, str]]:
+        batch_ids = job.batch_update_ids or (job.update_id,)
+        cutoff = max(batch_ids)
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT m.id, m.role, m.content, m.source_update_id,
+                          m.telegram_message_id, m.created_at, m.telegram_date,
+                          m.reply_to_message_id
+                   FROM telegram_messages m
+                   WHERE m.stream_id = ? AND m.source_update_id <= ?
+                   ORDER BY m.id""",
+                (job.stream_id, cutoff),
+            ).fetchall()
+            references = {}
+            for row in rows:
+                reply_id = row["reply_to_message_id"]
+                if row["source_update_id"] in batch_ids and reply_id is not None:
+                    referenced = connection.execute(
+                        """SELECT id, role, content, source_update_id,
+                                  telegram_message_id, created_at, telegram_date,
+                                  reply_to_message_id
+                           FROM telegram_messages
+                           WHERE stream_id = ? AND telegram_message_id = ?
+                           ORDER BY id LIMIT 1""",
+                        (job.stream_id, reply_id),
+                    ).fetchone()
+                    if referenced is not None:
+                        references[int(referenced["id"])] = referenced
+
+        def project(row: sqlite3.Row, *, referenced: bool = False) -> dict[str, str]:
+            timestamp = self._display_time(row["telegram_date"], row["created_at"])
+            prefix = f"[Telegram time: {timestamp}]"
+            if referenced:
+                prefix = f"[Explicit reply reference; {prefix[1:]}"
+            if row["reply_to_message_id"] is not None:
+                prefix += f" [Replies to Telegram message {row['reply_to_message_id']}]"
+            return {"role": str(row["role"]), "content": f"{prefix}\n{row['content']}"}
+
+        current = [row for row in rows if row["source_update_id"] in batch_ids and row["role"] == "user"]
+        ordinary = [row for row in rows if row not in current and int(row["id"]) not in references]
+        selected = []
+        used = sum(estimate_tokens_from_chars(len(project(row)["content"])) for row in current)
+        used += sum(estimate_tokens_from_chars(len(project(row, referenced=True)["content"])) for row in references.values())
+        for row in reversed(ordinary):
+            cost = estimate_tokens_from_chars(len(project(row)["content"]))
+            if used + cost <= self.exact_tail_token_budget:
+                selected.append(row)
+                used += cost
+            else:
+                break
+        selected.reverse()
+        included_ids = {int(row["id"]) for row in selected + current}
+        output = [project(row) for row in selected]
+        for row_id, row in sorted(references.items()):
+            if row_id not in included_ids:
+                output.append(project(row, referenced=True))
+        output.extend(project(row) for row in current)
+        return output
+
     def _recover_incomplete_jobs_sync(
         self,
     ) -> int:
@@ -1274,6 +1514,7 @@ class TelegramStore:
     @staticmethod
     def _job_from_row(
         row: sqlite3.Row,
+        batch_update_ids: tuple[int, ...] = (),
     ) -> TelegramJob:
         return TelegramJob(
             id=int(row["id"]),
@@ -1293,4 +1534,6 @@ class TelegramStore:
                 is not None
                 else None
             ),
+            stream_id=(int(row["stream_id"]) if row["stream_id"] is not None else None),
+            batch_update_ids=batch_update_ids,
         )
