@@ -1,5 +1,22 @@
 # Codex CLI Task Workflow
 
+## Durable execution is the default
+
+Run long Codex and operational tasks in a named GNU screen session so execution
+survives the initiating SSH connection. Create a logged session with:
+
+```bash
+screen -L -Logfile /home/eugene/TASK-screen.log -S task-name
+```
+
+Detach with `Ctrl-a d`, list sessions with `screen -ls`, and reattach with
+`screen -r task-name`. The durable log is an operational evidence artifact and
+must use a stable absolute path. When the command finishes, screen normally
+removes the finished session; `screen -ls` will no longer list it, while the log
+remains available. Result metadata must record the manager, session name,
+reattach command, durable log, durable runner/result paths, and whether execution
+was independent of the initiating SSH connection.
+
 ## Purpose and trust boundary
 
 `scripts/kven-codex-task` turns an approved task prompt into an isolated, durable Codex CLI run. It verifies a clean local `main`, creates a unique feature branch and linked worktree, runs Codex there, and preserves both the work and an inspection package. The runner trusts the installed Codex CLI and the existing repository, but it does not grant access to secrets or protected runtime data.
@@ -36,13 +53,24 @@ Before creating anything, the runner requires Codex, successful ChatGPT authenti
 
 Packages are created below `/home/eugene/kven-codex-results/<task>-<timestamp>-<pid>/`. Directories use mode `0755` and regular files use `0644`. A package includes:
 
-- original and effective prompts, task ID, timestamps, duration, and summary;
+- `result-manifest.json`, the canonical machine-readable result (schema `2.0`);
+- `result-summary.md`, the canonical human entry point and next command;
+
+- defensively redacted original/effective prompts, task ID, timestamps, duration, and summary;
 - Codex version and credential-free authentication status;
 - final response, stdout, progress/stderr, and exit code;
 - main baseline, branch/worktree details, final Git state, commits, changed files, and diff summary;
 - post-run service states, protected mount metadata, and an obvious-secret-pattern scan.
 
 The package deliberately excludes authentication files, private `.env` contents, tokens, credentials, databases, and private runtime logs. Interrupted and failed runs preserve whatever evidence was produced.
+
+When a committed `deployment-contract.json` is present, the runner validates it before embedding it. Literal credential-bearing argv or private-key material is refused without persisting the raw contract. A malformed/unsafe contract is recorded as a redacted error rather than interpreted from the final natural-language response. The contract must declare non-empty `result_validation_tests`. The runner snapshots exact feature branch/HEAD/index/status, executes the commands, and requires the snapshot to remain identical after each command. It records exact names/redacted argv in contract order, timestamps, duration, exit code, pass/fail, bounded output, and package-relative artifacts with sizes and SHA-256 values. Empty, mismatched, failed, tampered, or repository-mutating evidence forces a failed final status.
+
+The canonical manifest records `actual_runtime_model`, `actual_runtime_provider`, `actual_reasoning_effort`, `runtime_session_id`, `token_usage`, and `codex_runtime_seconds` directly. Startup facts come only from the delimited Codex stderr header, token usage only from the terminal stderr usage record, and duration from the runner monotonic timer (also written to `duration-seconds.txt`). Requested and actual models remain distinct; a mismatch forces failure. If an older outer runner is bootstrapping an unmerged runner feature, postprocessing must set `evidence_provenance.method` to `bootstrap_postprocessing`, state that the executing runner lacked the feature, source session/model/provider/reasoning only from the trusted startup header, token usage only after the terminal record exists, duration only from `duration-seconds.txt`, record the execution transport, and rescan the final evidence tree. Unavailable values remain null; they are never estimated.
+
+Post-Codex integration is described in `KVEN_INTEGRATION_WORKFLOW.md`. Begin with the exact command printed in `result-summary.md`.
+
+Integration does not execute `pre_merge_tests` from unmerged production main or from this preserved operator worktree. It creates its own disposable detached checkout from the manifest's exact feature object ID, fingerprints it around every command, removes/prunes it, and reverifies production before any backup or merge. `post_merge_tests` run later from the exact staged production main.
 
 ## Branch and worktree lifecycle
 

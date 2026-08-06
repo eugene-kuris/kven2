@@ -1,0 +1,1747 @@
+#!/usr/bin/env python3
+"""Safely inspect, stage, finalize, or roll back one Kven Codex result."""
+
+from __future__ import annotations
+
+import argparse
+from contextlib import contextmanager
+import datetime as dt
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import sqlite3
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from kven_evidence_security import redact as security_redact  # noqa: E402
+from kven_evidence_security import scan_git_range, scan_tree  # noqa: E402
+
+SCHEMA_VERSION = "2.0"
+DEFAULT_REPOSITORY = Path("/opt/kven2")
+DEFAULT_RESULT_ROOT = Path("/home/eugene/kven-integration-results")
+DEFAULT_BACKUP_ROOT = Path("/var/backups/kven2")
+OUTPUT_LIMIT = 4000
+SERVICE_ALLOWLIST = {
+    "agent-sandbox.service", "kven2-main.service",
+    "kven2-telegram-gateway.service", "kven-client-gateway.service",
+    "email-agent.service",
+}
+SECRET_RE = re.compile(
+    r"(?i)(password|secret|token|api[_-]?key|access[_-]?token|authorization)"
+    r"(\s*[:=]\s*|=)([^\s]+)"
+)
+SENSITIVE_OPTION_RE = re.compile(
+    r"(?i)^--?(?:password|secret|token|api[-_]?key|access[-_]?token|authorization)$"
+)
+SENSITIVE_ASSIGNMENT_RE = re.compile(
+    r"(?i)^(?:--?)?(?:password|secret|token|api[-_]?key|access[-_]?token|authorization)="
+)
+PRIVATE_KEY_RE = re.compile(r"(?i)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
+PRIVATE_KEY_BLOCK_RE = re.compile(
+    r"(?is)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----"
+)
+OPTION_VALUE_RE = re.compile(
+    r"(?i)(--?(?:password|secret|token|api[-_]?key|access[-_]?token|authorization)\s+)([^\s]+)"
+)
+BEARER_RE = re.compile(r"(?i)(\bBearer\s+)([^\s]+)")
+SHA_RE = re.compile(r"[0-9a-f]{40}")
+ACTIVE_STATES = {"BACKING_UP", "MIGRATING", "PRE_MERGE_TESTING", "MERGING", "POST_MERGE_TESTING",
+                 "DEPLOYING", "RESTARTING_SERVICES", "VERIFYING", "AWAITING_ACCEPTANCE",
+                 "FINALIZING", "FINALIZE_RECOVERY_REQUIRED", "ROLLING_BACK", "INTERRUPTED", "INTERNAL_ERROR"}
+TERMINAL_STATES = {"ROLLED_BACK", "FINALIZED"}
+RUN_STATES = ACTIVE_STATES | TERMINAL_STATES | {
+    "CREATED", "AUTOMATED_CHECK_FAILED", "DEPLOYING", "ROLLBACK_FAILED",
+}
+
+
+class IntegrationError(RuntimeError):
+    """A deterministic validation or safety refusal."""
+
+
+def now() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def run(command, *, cwd=None, timeout=300, check=False, env=None):
+    try:
+        return subprocess.run(
+            [str(x) for x in command], cwd=cwd, env=env, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=check,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise IntegrationError(f"command timed out after {timeout}s: {' '.join(redact_argv(command))}") from exc
+
+
+def git(repo: Path, *args: str):
+    return run(("git", "-C", repo, *args))
+
+
+def require_git(repo: Path, *args: str) -> str:
+    result = git(repo, *args)
+    if result.returncode:
+        raise IntegrationError(f"Git command failed: git {' '.join(args)}: {bounded(result.stderr or result.stdout)}")
+    return result.stdout.strip()
+
+
+def atomic_json(path: Path, value, *, mode=0o644) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.chmod(mode)
+    os.replace(temporary, path)
+
+
+def write_artifact(path: Path, text: str, *, mode=0o644) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(text, encoding="utf-8")
+    temporary.chmod(mode)
+    os.replace(temporary, path)
+
+
+def redact(text: str) -> str:
+    return security_redact(text)
+
+
+def redact_argv(command) -> list[str]:
+    result = []
+    hide_next = False
+    for value in command:
+        text = str(value)
+        if hide_next:
+            result.append("[REDACTED]")
+            hide_next = False
+        elif SENSITIVE_OPTION_RE.fullmatch(text):
+            result.append(text)
+            hide_next = True
+        elif text.lower() in {"authorization", "bearer"}:
+            result.append(text)
+            hide_next = True
+        elif PRIVATE_KEY_RE.search(text):
+            result.append("[REDACTED PRIVATE KEY]")
+        else:
+            result.append(redact(text))
+    return result
+
+
+def _non_secret_fixture(value: str) -> bool:
+    normalized = value.strip().lower()
+    return any(marker in normalized for marker in (
+        "placeholder", "example", "[redacted]", "synthetic-non-secret", "fixture-non-secret",
+    ))
+
+
+def reject_literal_secrets(command, label: str) -> None:
+    """Reject credential material without reflecting the offending value."""
+    hide_next = False
+    for raw in command:
+        value = str(raw)
+        lowered = value.strip().lower()
+        if hide_next:
+            if not _non_secret_fixture(value):
+                raise IntegrationError(f"{label} contains a literal credential value")
+            hide_next = False
+            continue
+        if SENSITIVE_OPTION_RE.fullmatch(value) or lowered in {"authorization", "bearer"}:
+            hide_next = True
+            continue
+        if SENSITIVE_ASSIGNMENT_RE.match(value):
+            assigned = value.split("=", 1)[1]
+            if not _non_secret_fixture(assigned):
+                raise IntegrationError(f"{label} contains a literal credential assignment")
+        if lowered.startswith("author" + "ization" + ":") or lowered.startswith("bear" + "er "):
+            if not _non_secret_fixture(value):
+                raise IntegrationError(f"{label} contains literal authorization material")
+        if PRIVATE_KEY_RE.search(value):
+            raise IntegrationError(f"{label} contains private-key material")
+    if hide_next:
+        raise IntegrationError(f"{label} has a credential option without an indirect value")
+
+
+def bounded(text: str, limit=OUTPUT_LIMIT) -> str:
+    clean = redact(text)
+    if len(clean) <= limit:
+        return clean
+    return clean[:limit] + f"\n... truncated ({len(clean) - limit} characters in artifact)\n"
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _is_string(value) -> bool:
+    return isinstance(value, str) and bool(value)
+
+
+def _require_keys(value, required: set[str], label: str, optional: set[str] | None = None) -> dict:
+    if not isinstance(value, dict):
+        raise IntegrationError(f"{label} must be an object")
+    missing = sorted(required - value.keys())
+    if missing:
+        raise IntegrationError(f"{label} missing fields: {', '.join(missing)}")
+    unknown = sorted(value.keys() - required - (optional or set()))
+    if unknown:
+        raise IntegrationError(f"{label} has unknown fields: {', '.join(unknown)}")
+    return value
+
+
+def validate_command_items(value, label: str, *, required_nonempty=False) -> list[dict]:
+    if not isinstance(value, list) or (required_nonempty and not value):
+        requirement = "non-empty " if required_nonempty else ""
+        raise IntegrationError(f"{label} must be a {requirement}array")
+    normalized = []
+    for index, item in enumerate(value):
+        item = _require_keys(item, {"command"}, f"{label}[{index}]", {"timeout", "name"})
+        command = item["command"]
+        if not isinstance(command, list) or not command or not all(_is_string(x) for x in command):
+            raise IntegrationError(f"{label}[{index}].command must be a non-empty argv array")
+        reject_literal_secrets(command, f"{label}[{index}].command")
+        timeout = item.get("timeout", 300)
+        if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout < 1 or timeout > 7200:
+            raise IntegrationError(f"{label}[{index}].timeout is invalid")
+        name = item.get("name", f"{label}-{index + 1}")
+        if not _is_string(name):
+            raise IntegrationError(f"{label}[{index}].name is invalid")
+        normalized.append({"command": command, "timeout": timeout, "name": name})
+    return normalized
+
+
+def validate_contract(contract: object, manifest: dict) -> dict:
+    required = {
+        "schema_version", "expected_baseline", "feature_branch", "allowed_paths", "services",
+        "backups", "migration_checks", "result_validation_tests", "pre_merge_tests",
+        "post_merge_tests", "readiness_checks", "fatal_log_checks", "acceptance_checklist", "rollback",
+    }
+    contract = _require_keys(contract, required, "deployment contract", {"deployment_steps"})
+    contract = json.loads(json.dumps(contract))
+    if contract["schema_version"] != SCHEMA_VERSION:
+        raise IntegrationError("unsupported deployment contract schema")
+    if contract["expected_baseline"] != manifest["baseline_head"]:
+        raise IntegrationError("contract expected baseline differs from result baseline")
+    if contract["feature_branch"] != manifest["feature_branch"]:
+        raise IntegrationError("contract feature branch differs from result feature branch")
+    allowed = contract["allowed_paths"]
+    if not isinstance(allowed, list) or not allowed or not all(_is_string(x) and not Path(x).is_absolute() for x in allowed):
+        raise IntegrationError("contract allowed_paths must be non-empty relative paths")
+    services = contract["services"]
+    if not isinstance(services, list) or len(services) != len(set(services)) or not all(_is_string(x) for x in services):
+        raise IntegrationError("contract services must be a unique string array")
+    refused = sorted(set(services) - SERVICE_ALLOWLIST)
+    if refused:
+        raise IntegrationError("services are not allowlisted: " + ", ".join(refused))
+    backups = _require_keys(contract["backups"], {"sqlite", "configuration"}, "contract backups")
+    normalized_backups = {"sqlite": [], "configuration": []}
+    for kind in ("sqlite", "configuration"):
+        if not isinstance(backups[kind], list):
+            raise IntegrationError(f"contract backups.{kind} must be an array")
+        for index, item in enumerate(backups[kind]):
+            item = _require_keys(item, {"path", "services"}, f"backups.{kind}[{index}]")
+            if not _is_string(item["path"]) or not Path(item["path"]).is_absolute():
+                raise IntegrationError(f"backups.{kind}[{index}].path must be absolute")
+            if not isinstance(item["services"], list) or not all(x in services for x in item["services"]):
+                raise IntegrationError(f"backups.{kind}[{index}].services must reference declared services")
+            normalized_backups[kind].append(item)
+    migrations = contract["migration_checks"]
+    if not isinstance(migrations, list):
+        raise IntegrationError("migration_checks must be an array")
+    for index, check in enumerate(migrations):
+        check = _require_keys(
+            check, {"database", "command", "application_smoke_command"},
+            f"migration_checks[{index}]",
+            {"cwd", "database_env", "idempotent", "timeout", "verification_sql"},
+        )
+        if not _is_string(check["database"]) or not Path(check["database"]).is_absolute():
+            raise IntegrationError(f"migration_checks[{index}].database must be absolute")
+        for key in ("command", "application_smoke_command"):
+            if not isinstance(check[key], list) or not check[key] or not all(_is_string(x) for x in check[key]):
+                raise IntegrationError(f"migration_checks[{index}].{key} must be a non-empty argv array")
+            reject_literal_secrets(check[key], f"migration_checks[{index}].{key}")
+        if check.get("verification_sql", []) and not all(_is_string(x) for x in check["verification_sql"]):
+            raise IntegrationError(f"migration_checks[{index}].verification_sql is invalid")
+    for field in ("result_validation_tests", "pre_merge_tests", "post_merge_tests"):
+        contract[field] = validate_command_items(contract[field], field, required_nonempty=True)
+    for field in ("readiness_checks", "fatal_log_checks", "deployment_steps"):
+        contract[field] = validate_command_items(contract.get(field, []), field)
+    if services and (not contract["readiness_checks"] or not contract["fatal_log_checks"]):
+        raise IntegrationError("declared services require readiness_checks and fatal_log_checks")
+    checklist = contract["acceptance_checklist"]
+    if not isinstance(checklist, list) or not checklist or not all(_is_string(x) for x in checklist):
+        raise IntegrationError("acceptance_checklist must be a non-empty string array")
+    rollback = _require_keys(contract["rollback"], {"restore_git", "restore_backups", "verify_readiness"}, "rollback")
+    if not all(rollback[x] is True for x in rollback):
+        raise IntegrationError("all production rollback safety guarantees must be enabled")
+    contract["backups"] = normalized_backups
+    return contract
+
+
+def canonical_contract_sha256(contract: dict) -> str:
+    """Hash normalized compact, key-sorted, UTF-8 JSON with no trailing newline."""
+    encoded = json.dumps(contract, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def committed_contract(repo: Path, feature_head: str, manifest: dict) -> tuple[dict, str]:
+    path = manifest.get("deployment_contract_path")
+    if path != "deployment-contract.json":
+        raise IntegrationError("deployment contract path must be deployment-contract.json")
+    result = git(repo, "show", f"{feature_head}:{path}")
+    if result.returncode:
+        raise IntegrationError("committed deployment contract is missing")
+    try:
+        raw = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise IntegrationError("committed deployment contract is malformed") from exc
+    normalized = validate_contract(raw, manifest)
+    return normalized, canonical_contract_sha256(normalized)
+
+
+def verify_contract_binding(repo: Path, manifest: dict) -> tuple[dict, str]:
+    normalized, digest = committed_contract(repo, manifest["feature_head"], manifest)
+    recorded = validate_contract(manifest["deployment_contract"], manifest)
+    if recorded != normalized:
+        raise IntegrationError("manifest deployment contract differs from exact committed contract")
+    if manifest.get("deployment_contract_sha256") != digest:
+        raise IntegrationError("deployment contract SHA-256 binding mismatch")
+    return normalized, digest
+
+
+def validate_manifest_types(data: object) -> dict:
+    required = {
+        "schema_version", "task_id", "started_at", "finished_at", "codex_runtime_seconds",
+        "exit_code", "final_codex_status", "repository_path", "baseline_branch", "baseline_head",
+        "origin_main_head", "feature_branch", "feature_head", "worktree_path", "commits_created",
+        "changed_files", "tests", "git_diff_check", "secret_scan", "deployment_contract",
+        "deployment_contract_path", "deployment_contract_sha256", "evidence_secret_scan",
+        "requested_model", "actual_runtime_model", "actual_runtime_provider", "actual_reasoning_effort",
+        "runtime_session_id", "token_usage", "network_use",
+    }
+    data = _require_keys(data, required, "result manifest", {
+        "codex_model", "summary", "deployment_contract_error",
+        "requested_deployment_services", "requested_backup_targets", "requested_migration_checks",
+        "result_package_path", "evidence_provenance", "execution_methodology",
+    })
+    if data["schema_version"] != SCHEMA_VERSION:
+        raise IntegrationError(f"unsupported result manifest schema: {data['schema_version']}")
+    for field in ("task_id", "started_at", "finished_at", "repository_path", "baseline_branch",
+                  "baseline_head", "origin_main_head", "feature_branch", "feature_head", "worktree_path"):
+        if not _is_string(data[field]):
+            raise IntegrationError(f"result manifest field {field} must be a non-empty string")
+    for field in ("baseline_head", "origin_main_head", "feature_head"):
+        if not SHA_RE.fullmatch(data[field]):
+            raise IntegrationError(f"result manifest field {field} must be a commit SHA")
+    if (data["codex_runtime_seconds"] is not None
+            and (not isinstance(data["codex_runtime_seconds"], (int, float))
+                 or isinstance(data["codex_runtime_seconds"], bool))):
+        raise IntegrationError("codex_runtime_seconds must be numeric or null when unavailable")
+    if type(data["exit_code"]) is not int or data["final_codex_status"] not in {"PASS", "FAIL"}:
+        raise IntegrationError("result status fields are invalid")
+    if data["requested_model"] is not None and not _is_string(data["requested_model"]):
+        raise IntegrationError("requested_model must be null or a non-empty string")
+    if not all(_is_string(data[field]) for field in (
+        "actual_runtime_model", "actual_runtime_provider", "actual_reasoning_effort",
+    )) or (data["runtime_session_id"] is not None and not _is_string(data["runtime_session_id"])):
+        raise IntegrationError("actual runtime startup metadata is required")
+    if data["requested_model"] is not None and data["requested_model"] != data["actual_runtime_model"]:
+        raise IntegrationError("requested and actual runtime model conflict")
+    if data["token_usage"] is not None and (type(data["token_usage"]) is not int or data["token_usage"] < 0):
+        raise IntegrationError("token_usage must be null or a non-negative integer")
+    network = _require_keys(data["network_use"], {"allowed", "used", "observation"}, "network_use")
+    if (type(network["allowed"]) is not bool
+            or (network["used"] is not None and type(network["used"]) is not bool)
+            or not _is_string(network["observation"])):
+        raise IntegrationError("network_use evidence is invalid")
+    if network["allowed"] is False and network["used"] is not False:
+        raise IntegrationError("prohibited network use must be recorded as false")
+    provenance = data.get("evidence_provenance")
+    if provenance is not None:
+        provenance = _require_keys(
+            provenance, {"method", "runner_contained_manifest_features", "description"},
+            "evidence_provenance",
+        )
+        if (provenance["method"] not in {"automatic_runner", "bootstrap_postprocessing"}
+                or type(provenance["runner_contained_manifest_features"]) is not bool
+                or not _is_string(provenance["description"])):
+            raise IntegrationError("evidence_provenance is invalid")
+    if not isinstance(data["changed_files"], list) or len(data["changed_files"]) != len(set(data["changed_files"])) or not all(_is_string(x) for x in data["changed_files"]):
+        raise IntegrationError("changed_files must be a unique string array")
+    commits = data["commits_created"]
+    if not isinstance(commits, list) or not commits:
+        raise IntegrationError("commits_created must be non-empty")
+    for index, item in enumerate(commits):
+        item = _require_keys(item, {"sha", "subject"}, f"commits_created[{index}]")
+        if not SHA_RE.fullmatch(item["sha"]) or not _is_string(item["subject"]):
+            raise IntegrationError(f"commits_created[{index}] is invalid")
+    tests = data["tests"]
+    if not isinstance(tests, list) or not tests:
+        raise IntegrationError("required test evidence is missing or empty")
+    test_required = {"name", "command", "started_at", "finished_at", "duration_seconds", "exit_code", "passed", "bounded_output", "output_artifact", "artifact_size", "artifact_sha256"}
+    for index, test in enumerate(tests):
+        test = _require_keys(test, test_required, f"tests[{index}]")
+        if not isinstance(test["command"], list) or not test["command"] or not all(_is_string(x) for x in test["command"]):
+            raise IntegrationError(f"tests[{index}].command must be a non-empty argv array")
+        if type(test["exit_code"]) is not int or type(test["passed"]) is not bool:
+            raise IntegrationError(f"tests[{index}] outcome fields are invalid")
+        if not all(_is_string(test[x]) for x in ("name", "started_at", "finished_at", "output_artifact", "artifact_sha256")) or not isinstance(test["bounded_output"], str):
+            raise IntegrationError(f"tests[{index}] evidence fields are invalid")
+        if Path(test["output_artifact"]).is_absolute() or not re.fullmatch(r"[0-9a-f]{64}", test["artifact_sha256"]):
+            raise IntegrationError(f"tests[{index}] artifact metadata is invalid")
+        if type(test["artifact_size"]) is not int or test["artifact_size"] < 0:
+            raise IntegrationError(f"tests[{index}].artifact_size is invalid")
+        if not isinstance(test["duration_seconds"], (int, float)) or isinstance(test["duration_seconds"], bool):
+            raise IntegrationError(f"tests[{index}].duration_seconds is invalid")
+    if data["deployment_contract_path"] != "deployment-contract.json":
+        raise IntegrationError("deployment_contract_path is invalid")
+    if not isinstance(data["deployment_contract_sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", data["deployment_contract_sha256"]):
+        raise IntegrationError("deployment_contract_sha256 is invalid")
+    for field in ("git_diff_check", "secret_scan", "evidence_secret_scan"):
+        if not isinstance(data[field], dict) or type(data[field].get("passed")) is not bool:
+            raise IntegrationError(f"{field} result is invalid")
+    validate_contract(data["deployment_contract"], data)
+    return data
+
+
+def resolve_manifest(value: str) -> Path:
+    path = Path(value).resolve()
+    if path.is_dir():
+        path = path / "result-manifest.json"
+    if not path.is_file():
+        raise IntegrationError(f"result manifest does not exist: {path}")
+    return path
+
+
+def load_manifest(value: str) -> tuple[Path, dict]:
+    path = resolve_manifest(value)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise IntegrationError(f"malformed result manifest: {exc}") from exc
+    return path, validate_manifest_types(data)
+
+
+def git_changed_files(repo: Path, baseline: str, feature_head: str) -> list[str]:
+    result = git(repo, "diff", "--name-only", f"{baseline}..{feature_head}")
+    if result.returncode:
+        raise IntegrationError("cannot recompute changed files from exact commit range")
+    return sorted(result.stdout.splitlines())
+
+
+def offline_secret_scan(repo: Path, baseline: str, feature_head: str) -> dict:
+    try:
+        return scan_git_range(repo, baseline, feature_head)
+    except RuntimeError as exc:
+        raise IntegrationError("offline secret scan could not read exact changed content") from exc
+
+
+def repository_state(repo: Path) -> dict:
+    branch = require_git(repo, "branch", "--show-current")
+    head = require_git(repo, "rev-parse", "HEAD")
+    status = require_git(repo, "status", "--porcelain=v1", "--untracked-files=all")
+    index = git(repo, "ls-files", "--stage", "-z")
+    if index.returncode:
+        raise IntegrationError("cannot fingerprint repository index")
+    index_fingerprint = hashlib.sha256(index.stdout.encode("utf-8", errors="surrogateescape")).hexdigest()
+    return {"branch": branch, "head": head, "index_tree": index_fingerprint, "status": status}
+
+
+def verify_feature_object(repo: Path, manifest: dict) -> dict:
+    """Verify the immutable feature object without trusting mutable worktree metadata."""
+    feature_head = manifest["feature_head"]
+    resolved = git(repo, "rev-parse", "--verify", f"{feature_head}^{{commit}}")
+    if resolved.returncode or resolved.stdout.strip() != feature_head:
+        raise IntegrationError("exact feature commit object is missing")
+    branch = git(repo, "rev-parse", "--verify", f"refs/heads/{manifest['feature_branch']}")
+    if branch.returncode:
+        raise IntegrationError("recorded feature branch is missing")
+    return {
+        "feature_head": feature_head,
+        "object_type": require_git(repo, "cat-file", "-t", feature_head),
+        "recorded_branch": manifest["feature_branch"],
+        "current_branch_head": branch.stdout.strip() if branch.returncode == 0 else None,
+        "recorded_worktree_path": manifest["worktree_path"],
+        "mutable_sources_trusted": False,
+    }
+
+
+def _verify_test_evidence(manifest: dict, manifest_path: Path) -> None:
+    package = manifest_path.resolve().parent
+    required = manifest["deployment_contract"]["result_validation_tests"]
+    tests = manifest["tests"]
+    if len(tests) != len(required):
+        raise IntegrationError("test evidence count differs from result_validation_tests")
+    for index, (test, expected) in enumerate(zip(tests, required)):
+        if test["name"] != expected["name"] or test["command"] != redact_argv(expected["command"]):
+            raise IntegrationError(f"tests[{index}] does not match result_validation_tests order/name/argv")
+        relative = Path(test["output_artifact"])
+        if relative.is_absolute() or ".." in relative.parts:
+            raise IntegrationError(f"tests[{index}] artifact path is outside the result package")
+        artifact = package / relative
+        try:
+            resolved = artifact.resolve(strict=True)
+            resolved.relative_to(package)
+        except (OSError, ValueError):
+            raise IntegrationError(f"tests[{index}] artifact path is outside or missing") from None
+        if artifact.is_symlink() or not resolved.is_file():
+            raise IntegrationError(f"tests[{index}] artifact must be a regular non-symlink file")
+        if resolved.stat().st_size != test["artifact_size"] or sha256(resolved) != test["artifact_sha256"]:
+            raise IntegrationError(f"tests[{index}] artifact size/checksum mismatch")
+
+
+def inspect_manifest(manifest: dict, *, manifest_path: Path, expected_repository: Path = DEFAULT_REPOSITORY) -> dict:
+    validate_manifest_types(manifest)
+    repo = Path(manifest["repository_path"]).resolve()
+    expected = expected_repository.resolve()
+    if repo != expected:
+        raise IntegrationError(f"unexpected repository path: manifest={repo}, required={expected}")
+    if not repo.is_dir():
+        raise IntegrationError(f"repository does not exist: {repo}")
+    if manifest["final_codex_status"] != "PASS" or manifest["exit_code"] != 0:
+        raise IntegrationError("Codex result is not successful")
+    if not manifest["git_diff_check"]["passed"]:
+        raise IntegrationError("recorded git diff check failed")
+    if not manifest["secret_scan"]["passed"]:
+        raise IntegrationError("recorded secret scan failed")
+    failed = [x["name"] for x in manifest["tests"] if not x["passed"] or x["exit_code"] != 0]
+    if failed:
+        raise IntegrationError("required tests failed: " + ", ".join(failed))
+    main_state = repository_state(repo)
+    if main_state["branch"] != manifest["baseline_branch"]:
+        raise IntegrationError(f"baseline worktree must be on {manifest['baseline_branch']}")
+    if main_state["status"]:
+        raise IntegrationError("baseline worktree is dirty")
+    if main_state["head"] != manifest["baseline_head"]:
+        raise IntegrationError(f"baseline HEAD mismatch: expected {manifest['baseline_head']}, found {main_state['head']}")
+    origin = require_git(repo, "rev-parse", "refs/remotes/origin/main")
+    if origin != manifest["origin_main_head"] or origin != manifest["baseline_head"]:
+        raise IntegrationError("main/origin-main mismatch")
+    feature_state = verify_feature_object(repo, manifest)
+    contract, contract_digest = verify_contract_binding(repo, manifest)
+    _verify_test_evidence({**manifest, "deployment_contract": contract}, manifest_path)
+    evidence_scan = scan_tree(manifest_path.resolve().parent)
+    if not evidence_scan["passed"] or not manifest["evidence_secret_scan"]["passed"]:
+        raise IntegrationError("user-readable result evidence secret scan failed")
+    if git(repo, "merge-base", "--is-ancestor", manifest["baseline_head"], manifest["feature_head"]).returncode:
+        raise IntegrationError("feature branch is not based on accepted baseline")
+    commits = require_git(repo, "rev-list", "--reverse", f"{manifest['baseline_head']}..{manifest['feature_head']}").splitlines()
+    if commits != [x["sha"] for x in manifest["commits_created"]]:
+        raise IntegrationError("feature commit set differs from manifest")
+    actual = git_changed_files(repo, manifest["baseline_head"], manifest["feature_head"])
+    if actual != sorted(manifest["changed_files"]):
+        raise IntegrationError(f"manifest changed_files mismatch: actual={actual}, recorded={sorted(manifest['changed_files'])}")
+    unexpected = [path for path in actual if not any(path == allowed or (allowed.endswith("/") and path.startswith(allowed)) for allowed in contract["allowed_paths"])]
+    if unexpected:
+        raise IntegrationError("changed paths outside contract: " + ", ".join(unexpected))
+    diff_check = git(repo, "diff", "--check", f"{manifest['baseline_head']}..{manifest['feature_head']}")
+    if diff_check.returncode:
+        raise IntegrationError("independent git diff --check failed: " + bounded(diff_check.stdout + diff_check.stderr))
+    secret_scan = offline_secret_scan(repo, manifest["baseline_head"], manifest["feature_head"])
+    if not secret_scan["passed"]:
+        locations = [f"{item['file']}:{item['line'] or '-'}:{item['category']}" for item in secret_scan["matches"]]
+        raise IntegrationError("independent offline secret scan failed: " + ", ".join(locations))
+    return {
+        "eligible": True, "repository": str(repo), "head": main_state["head"],
+        "feature_head": manifest["feature_head"], "actual_changed_files": actual,
+        "diff_check": "passed", "secret_scan": secret_scan, "main_state": main_state,
+        "feature_state": feature_state, "contract": contract,
+        "deployment_contract_path": manifest["deployment_contract_path"],
+        "deployment_contract_sha256": contract_digest,
+        "evidence_secret_scan": evidence_scan,
+    }
+
+
+def command_record(command, artifact: Path, *, cwd=None, timeout=300, env=None) -> dict:
+    started = now()
+    monotonic = time.monotonic()
+    try:
+        result = run(command, cwd=cwd, timeout=timeout, env=env)
+        code = result.returncode
+        output = redact(result.stdout + result.stderr)
+    except IntegrationError as exc:
+        code = 124
+        output = redact(str(exc)) + "\n"
+    write_artifact(artifact, output)
+    return {
+        "command": redact_argv(command), "started_at": started, "finished_at": now(),
+        "duration_seconds": round(time.monotonic() - monotonic, 3), "exit_code": code,
+        "passed": code == 0, "output_artifact": str(artifact), "bounded_output": bounded(output),
+        "cwd": str(Path(cwd).resolve()) if cwd is not None else None,
+    }
+
+
+def sqlite_integrity(path: Path) -> str:
+    connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        row = connection.execute("PRAGMA integrity_check").fetchone()
+        return row[0] if row else "missing result"
+    finally:
+        connection.close()
+
+
+def validate_declared_regular_file(path: Path, *, label: str, expected: dict | None = None) -> dict:
+    """Validate an absolute lexical path without following any symlink component."""
+    if not path.is_absolute() or ".." in path.parts:
+        raise IntegrationError(f"{label} must be a lexical absolute path")
+    current = Path(path.anchor)
+    for component in path.parts[1:]:
+        current = current / component
+        try:
+            metadata = current.lstat()
+        except OSError as exc:
+            raise IntegrationError(f"{label} path component is unavailable: {current}") from exc
+        if stat.S_ISLNK(metadata.st_mode):
+            raise IntegrationError(f"{label} path contains a symlink: {current}")
+    if not stat.S_ISREG(metadata.st_mode):
+        raise IntegrationError(f"{label} is not a regular file: {path}")
+    identity = {
+        "declared_source": str(path),
+        "canonical_source": str(path.resolve(strict=True)),
+        "source_device": metadata.st_dev,
+        "source_inode": metadata.st_ino,
+    }
+    if expected is not None and identity != {key: expected[key] for key in identity}:
+        raise IntegrationError(f"{label} identity changed since backup")
+    return identity
+
+
+def sqlite_backup(source: Path, destination: Path, *, services=None) -> dict:
+    identity = validate_declared_regular_file(source, label="SQLite source")
+    metadata = source.lstat()
+    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    source_connection = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
+    target_connection = sqlite3.connect(destination)
+    try:
+        source_connection.backup(target_connection)
+        row = target_connection.execute("PRAGMA integrity_check").fetchone()
+        if not row or row[0] != "ok":
+            raise IntegrationError(f"SQLite backup integrity check failed: {source}")
+    finally:
+        target_connection.close()
+        source_connection.close()
+    destination.chmod(0o600)
+    validate_declared_regular_file(source, label="SQLite source", expected=identity)
+    return {
+        "kind": "sqlite", "source": str(source), **identity, "backup": str(destination),
+        "services": list(services or []), "size": destination.stat().st_size,
+        "sha256": sha256(destination), "integrity_check": "ok",
+        "mode": stat.S_IMODE(metadata.st_mode), "uid": metadata.st_uid, "gid": metadata.st_gid,
+    }
+
+
+def config_backup(source: Path, destination: Path, *, services=None) -> dict:
+    identity = validate_declared_regular_file(source, label="configuration source")
+    metadata = source.lstat()
+    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    shutil.copy2(source, destination, follow_symlinks=False)
+    destination.chmod(0o600)
+    validate_declared_regular_file(source, label="configuration source", expected=identity)
+    return {
+        "kind": "configuration", "source": str(source), **identity, "backup": str(destination),
+        "services": list(services or []), "mode": stat.S_IMODE(metadata.st_mode),
+        "uid": metadata.st_uid, "gid": metadata.st_gid, "size": destination.stat().st_size,
+        "sha256": sha256(destination),
+    }
+
+
+def create_backups(contract: dict, backup_dir: Path) -> list[dict]:
+    records = []
+    for kind in ("sqlite", "configuration"):
+        for item in contract["backups"][kind]:
+            source = Path(item["path"])
+            identity = validate_declared_regular_file(source, label=f"declared {kind} backup source")
+            unique = hashlib.sha256(identity["declared_source"].encode()).hexdigest()[:12]
+            destination = backup_dir / kind / f"{unique}-{source.name}.backup"
+            if kind == "sqlite":
+                records.append(sqlite_backup(source, destination, services=item["services"]))
+            else:
+                records.append(config_backup(source, destination, services=item["services"]))
+    return records
+
+
+def verify_backup(record: dict) -> Path:
+    backup = Path(record["backup"])
+    if not backup.is_file() or backup.is_symlink():
+        raise IntegrationError(f"protected backup is missing or not regular: {backup}")
+    if backup.stat().st_size != record["size"] or sha256(backup) != record["sha256"]:
+        raise IntegrationError(f"protected backup checksum/size mismatch: {backup}")
+    if record["kind"] == "sqlite" and sqlite_integrity(backup) != "ok":
+        raise IntegrationError(f"protected SQLite backup integrity failed: {backup}")
+    return backup
+
+
+def service_state(manager: list[str], service: str, *, timeout=10) -> str:
+    result = run((*manager, "is-active", service), timeout=timeout)
+    value = (result.stdout.strip() or result.stderr.strip()).splitlines()[0] if (result.stdout.strip() or result.stderr.strip()) else "unknown"
+    if result.returncode == 0 and value == "active":
+        return "active"
+    if value == "inactive":
+        return "inactive"
+    return value or f"exit-{result.returncode}"
+
+
+def service_action(manager: list[str], action: str, service: str, *, timeout=60):
+    if service not in SERVICE_ALLOWLIST:
+        raise IntegrationError(f"service is not allowlisted: {service}")
+    result = run((*manager, action, service), timeout=timeout)
+    if result.returncode:
+        raise IntegrationError(f"service {action} failed for {service}: {bounded(result.stderr or result.stdout)}")
+    return result
+
+
+def wait_service_state(manager: list[str], service: str, intended: str, *, timeout=60.0, interval=0.1) -> None:
+    deadline = time.monotonic() + timeout
+    last = "unknown"
+    while time.monotonic() < deadline:
+        last = service_state(manager, service, timeout=max(1, min(10, int(timeout) or 1)))
+        if last == intended:
+            return
+        if last == "failed":
+            raise IntegrationError(f"service activation failed for {service}")
+        time.sleep(interval)
+    raise IntegrationError(f"service state timeout for {service}: expected {intended}, found {last}")
+
+
+def restart_count(manager: list[str], service: str, *, timeout=10) -> int:
+    result = run((*manager, "show", service, "--property=NRestarts", "--value"), timeout=timeout)
+    if result.returncode:
+        raise IntegrationError(f"restart count unavailable for {service}")
+    try:
+        value = int(result.stdout.strip())
+    except ValueError:
+        raise IntegrationError(f"restart count malformed for {service}") from None
+    if value < 0:
+        raise IntegrationError(f"restart count negative for {service}")
+    return value
+
+
+def restart_declared_service(manager: list[str], service: str, *, timeout=60, max_restart_delta=3) -> dict:
+    before = restart_count(manager, service)
+    service_action(manager, "restart", service, timeout=timeout)
+    wait_service_state(manager, service, "active", timeout=timeout)
+    after = restart_count(manager, service)
+    if after - before > max_restart_delta:
+        raise IntegrationError(f"rapid restart loop detected for {service}: {before}->{after}")
+    return {"service": service, "restarts_before": before, "restarts_after": after, "state": "active"}
+
+
+def ensure_services_stopped(records: list[dict], manager: list[str], timeout: float) -> None:
+    affected = sorted({service for record in records for service in record.get("services", [])})
+    for service in reversed(affected):
+        if service_state(manager, service) != "inactive":
+            service_action(manager, "stop", service, timeout=timeout)
+        wait_service_state(manager, service, "inactive", timeout=timeout)
+
+
+def _restore_metadata(path: Path, record: dict) -> None:
+    os.chmod(path, record["mode"])
+    os.chown(path, record["uid"], record["gid"])
+
+
+def restore_backups(records: list[dict], *, service_manager=None, service_timeout=60) -> list[dict]:
+    manager = service_manager or ["systemctl"]
+    ensure_services_stopped(records, manager, service_timeout)
+    results = []
+    for record in records:
+        backup = verify_backup(record)
+        source = Path(record["declared_source"])
+        validate_declared_regular_file(source, label="restore target", expected=record)
+        temporary = source.with_name(source.name + f".kven-restore-{os.getpid()}")
+        shutil.copy2(backup, temporary, follow_symlinks=False)
+        _restore_metadata(temporary, record)
+        moved_sidecars = []
+        if record["kind"] == "sqlite":
+            if sqlite_integrity(temporary) != "ok":
+                temporary.unlink(missing_ok=True)
+                raise IntegrationError(f"SQLite restore temporary integrity failed: {source}")
+            quarantine = backup.parent / "stale-sidecars"
+            quarantine.mkdir(mode=0o700, exist_ok=True)
+            for suffix in ("-wal", "-shm"):
+                sidecar = Path(str(source) + suffix)
+                if sidecar.exists():
+                    if sidecar.is_symlink() or not sidecar.is_file():
+                        raise IntegrationError(f"SQLite sidecar is not a regular file: {sidecar}")
+                    destination = quarantine / f"{hashlib.sha256(str(source).encode()).hexdigest()[:12]}{suffix}"
+                    os.replace(sidecar, destination)
+                    moved_sidecars.append(str(destination))
+        os.replace(temporary, source)
+        if record["kind"] == "sqlite" and sqlite_integrity(source) != "ok":
+            raise IntegrationError(f"restored SQLite integrity failed: {source}")
+        if sha256(source) != record["sha256"] or stat.S_IMODE(source.stat().st_mode) != record["mode"] or source.stat().st_uid != record["uid"] or source.stat().st_gid != record["gid"]:
+            raise IntegrationError(f"restored file metadata/checksum verification failed: {source}")
+        results.append({"source": str(source), "kind": record["kind"], "sha256": sha256(source), "moved_sidecars": moved_sidecars, "integrity_check": "ok" if record["kind"] == "sqlite" else None})
+    return results
+
+
+def validate_migrations(contract: dict, backups: list[dict], run_dir: Path, *, protected_work_dir: Path | None = None) -> list[dict]:
+    results = []
+    available = {x["source"]: x for x in backups if x["kind"] == "sqlite"}
+    for index, check in enumerate(contract["migration_checks"]):
+        source = str(Path(check["database"]))
+        if source not in available:
+            raise IntegrationError(f"migration database was not backed up: {source}")
+        protected = verify_backup(available[source])
+        disposable = (protected_work_dir or (run_dir / "migration-copies")) / f"{index}.sqlite"
+        disposable.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(protected, disposable)
+        env = os.environ.copy()
+        env[check.get("database_env", "KVEN_MIGRATION_DATABASE")] = str(disposable)
+        attempts = 2 if check.get("idempotent", True) else 1
+        executions = []
+        for attempt in range(attempts):
+            record = command_record(
+                check["command"], run_dir / "migration-logs" / f"{index}-{attempt + 1}.log",
+                cwd=check.get("cwd"), env=env, timeout=check.get("timeout", 300),
+            )
+            executions.append(record)
+            if not record["passed"]:
+                raise IntegrationError(f"migration validation failed; see {record['output_artifact']}")
+        connection = sqlite3.connect(disposable)
+        try:
+            integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
+            for sql in check.get("verification_sql", []):
+                connection.execute(sql).fetchall()
+        finally:
+            connection.close()
+        if integrity != "ok":
+            raise IntegrationError("migrated disposable database failed integrity check")
+        smoke = command_record(
+            check["application_smoke_command"], run_dir / "migration-logs" / f"{index}-application-smoke.log",
+            cwd=check.get("cwd"), env=env, timeout=check.get("timeout", 300),
+        )
+        if not smoke["passed"]:
+            raise IntegrationError(f"application migration smoke failed; see {smoke['output_artifact']}")
+        results.append({"database": source, "copy": str(disposable), "attempts": executions,
+                        "integrity_check": integrity, "application_smoke": smoke})
+    return results
+
+
+def require_repository_state(repo: Path, expected: dict, phase: str) -> None:
+    actual = repository_state(repo)
+    if expected.get("status") or actual != expected:
+        raise IntegrationError(f"repository changed during {phase}")
+
+
+def service_snapshot(manager: list[str], services: list[str], timeout: float) -> dict:
+    return {
+        service: {
+            "state": service_state(manager, service, timeout=timeout),
+            "restart_count": restart_count(manager, service, timeout=timeout),
+        }
+        for service in services
+    }
+
+
+def require_service_snapshot(manager: list[str], expected: dict, timeout: float, phase: str) -> dict:
+    actual = service_snapshot(manager, list(expected), timeout)
+    if actual != expected:
+        raise IntegrationError(f"service state or restart count changed during {phase}")
+    return actual
+
+
+def run_checks(items: list, run_dir: Path, category: str, *, cwd: Path,
+               expected_repository_state: dict | None = None) -> list[dict]:
+    records = []
+    for index, item in enumerate(items):
+        record = command_record(item["command"], run_dir / "logs" / f"{category}-{index}.log",
+                                cwd=cwd, timeout=item["timeout"])
+        records.append(record)
+        if expected_repository_state is not None:
+            require_repository_state(cwd, expected_repository_state, f"{category}[{index}]")
+        if not record["passed"]:
+            raise IntegrationError(f"{category} command failed; see {record['output_artifact']}")
+    return records
+
+
+def _symlink_fingerprint(repo: Path) -> list[dict]:
+    links = []
+    for root, directories, files in os.walk(repo, topdown=True, followlinks=False):
+        root_path = Path(root)
+        entries = list(directories) + list(files)
+        for name in entries:
+            path = root_path / name
+            if path == repo / ".git":
+                continue
+            try:
+                if path.is_symlink():
+                    target = os.readlink(path)
+                    links.append({
+                        "path": path.relative_to(repo).as_posix(),
+                        "target_sha256": hashlib.sha256(target.encode("utf-8", errors="surrogateescape")).hexdigest(),
+                    })
+            except OSError as exc:
+                raise IntegrationError("cannot fingerprint validation checkout symlinks") from exc
+        directories[:] = [
+            name for name in directories
+            if not (root_path / name).is_symlink() and (root_path / name) != repo / ".git"
+        ]
+    return sorted(links, key=lambda item: item["path"])
+
+
+def validation_checkout_state(checkout: Path) -> dict:
+    resolved = checkout.resolve(strict=True)
+    state = repository_state(resolved)
+    state.update({
+        "checkout_path": str(resolved),
+        "status_sha256": hashlib.sha256(state["status"].encode("utf-8", errors="surrogateescape")).hexdigest(),
+        "symlinks": _symlink_fingerprint(resolved),
+    })
+    return state
+
+
+def _validation_worktree_paths(repo: Path) -> list[Path]:
+    listing = git(repo, "worktree", "list", "--porcelain")
+    if listing.returncode:
+        raise IntegrationError("cannot list validation worktrees")
+    paths = []
+    for line in listing.stdout.splitlines():
+        if line.startswith("worktree "):
+            paths.append(Path(line.removeprefix("worktree ")).resolve())
+    return paths
+
+
+def create_validation_checkout(repo: Path, feature_head: str, run_id_value: str) -> tuple[Path, Path, dict]:
+    parent = Path(tempfile.mkdtemp(prefix=f".kven-validation-{run_id_value}-", dir=repo.parent))
+    checkout = parent / "checkout"
+    command = ["git", "-C", str(repo), "worktree", "add", "--detach", str(checkout), feature_head]
+    started = now()
+    monotonic = time.monotonic()
+    try:
+        result = run(command)
+    except Exception as exc:
+        result = subprocess.CompletedProcess(command, 125, "", redact(str(exc)))
+    record = {
+        "command": redact_argv(command), "cwd": str(repo), "started_at": started,
+        "finished_at": now(), "duration_seconds": round(time.monotonic() - monotonic, 3),
+        "exit_code": result.returncode, "passed": result.returncode == 0,
+        "bounded_output": bounded(result.stdout + result.stderr),
+    }
+    return parent, checkout, record
+
+
+def cleanup_validation_checkout(repo: Path, parent: Path, checkout: Path) -> dict:
+    started = now()
+    monotonic = time.monotonic()
+    initially_registered = checkout.resolve() in _validation_worktree_paths(repo)
+    if initially_registered:
+        remove = run(("git", "-C", repo, "worktree", "remove", "--force", checkout))
+    elif checkout.exists() and checkout.is_dir() and not checkout.is_symlink():
+        shutil.rmtree(checkout)
+        remove = subprocess.CompletedProcess([], 0, "", "")
+    elif checkout.exists() or checkout.is_symlink():
+        remove = subprocess.CompletedProcess([], 1, "", "unexpected validation checkout file type")
+    else:
+        remove = subprocess.CompletedProcess([], 0, "", "")
+    prune = run(("git", "-C", repo, "worktree", "prune"))
+    registered = checkout.resolve() in _validation_worktree_paths(repo)
+    path_exists = checkout.exists() or checkout.is_symlink()
+    parent_error = None
+    if not path_exists:
+        try:
+            parent.rmdir()
+        except OSError as exc:
+            parent_error = type(exc).__name__
+    passed = remove.returncode == 0 and prune.returncode == 0 and not registered and not path_exists and parent_error is None
+    record = {
+        "started_at": started, "finished_at": now(),
+        "duration_seconds": round(time.monotonic() - monotonic, 3),
+        "remove_exit_code": remove.returncode, "prune_exit_code": prune.returncode,
+        "registered_after_prune": registered, "checkout_exists_after_cleanup": path_exists,
+        "parent_cleanup_error": parent_error, "passed": passed,
+        "bounded_output": bounded(remove.stdout + remove.stderr + prune.stdout + prune.stderr),
+    }
+    return record
+
+
+def run_feature_validation(repo: Path, feature_head: str, items: list, run_dir: Path,
+                           run_id_value: str) -> tuple[list[dict], dict]:
+    evidence_path = run_dir / "validation-checkout.json"
+    evidence = {
+        "schema_version": SCHEMA_VERSION, "feature_head": feature_head,
+        "detached": True, "commands": [], "cleanup": None,
+    }
+    parent = checkout = None
+    failure = None
+    try:
+        parent, checkout, creation = create_validation_checkout(repo, feature_head, run_id_value)
+        evidence.update({"checkout_path": str(checkout.resolve()), "creation": creation})
+        atomic_json(evidence_path, evidence)
+        if not creation["passed"]:
+            raise IntegrationError("validation checkout creation failed")
+        initial = validation_checkout_state(checkout)
+        evidence["initial_fingerprint"] = initial
+        if initial["head"] != feature_head or initial["branch"] or initial["status"]:
+            raise IntegrationError("validation checkout is not the exact clean detached feature HEAD")
+        atomic_json(evidence_path, evidence)
+        for index, item in enumerate(items):
+            before = validation_checkout_state(checkout)
+            command_evidence = {
+                "name": item["name"], "argv": redact_argv(item["command"]),
+                "cwd": str(checkout.resolve()), "exact_feature_head": feature_head,
+                "before": before,
+            }
+            evidence["commands"].append(command_evidence)
+            atomic_json(evidence_path, evidence)
+            record = command_record(
+                item["command"], run_dir / "logs" / f"pre-merge-{index}.log",
+                cwd=checkout, timeout=item["timeout"],
+                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+            )
+            after = validation_checkout_state(checkout)
+            command_evidence.update({"command": record, "after": after, "fingerprint_unchanged": after == before})
+            atomic_json(evidence_path, evidence)
+            if after != before:
+                raise IntegrationError(f"validation checkout changed during pre-merge[{index}]")
+            if not record["passed"]:
+                raise IntegrationError(f"pre-merge command failed; see {record['output_artifact']}")
+    except Exception as exc:
+        failure = exc
+        evidence["failure"] = redact(str(exc))
+        atomic_json(evidence_path, evidence)
+    finally:
+        if parent is not None and checkout is not None:
+            try:
+                evidence["cleanup"] = cleanup_validation_checkout(repo, parent, checkout)
+                if not evidence["cleanup"]["passed"]:
+                    failure = IntegrationError("validation checkout cleanup or prune failed")
+            except Exception as exc:
+                evidence["cleanup"] = {"passed": False, "failure": redact(str(exc))}
+                failure = exc
+            atomic_json(evidence_path, evidence)
+    if failure is not None:
+        raise failure
+    return [item["command"] for item in evidence["commands"]], evidence
+
+
+def run_id(task_id: str) -> str:
+    safe = re.sub(r"[^a-z0-9]+", "-", task_id.lower()).strip("-")
+    return f"{safe}-{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
+
+
+def summary(run_dir: Path, state: dict) -> None:
+    commands = state.get("commands", {})
+    failures = state.get("failure") or state.get("rollback_failure") or "None"
+    text = f"""# Integration result: {state['task_id']}
+
+Status: **{state['status']}**
+Run ID: `{state['run_id']}`
+Phase: `{state.get('phase', 'unknown')}`
+Failure/refusal: {failures}
+Bound contract: `{state.get('deployment_contract_path', 'unavailable')}`
+Contract SHA-256: `{state.get('deployment_contract_sha256', 'unavailable')}`
+Pre-merge context: exact feature HEAD in a tool-created disposable detached checkout.
+Validation checkout: `{state.get('validation_checkout', {}).get('checkout_path', 'not created')}`
+Validation cleanup: `{state.get('validation_checkout', {}).get('cleanup', {}).get('passed', 'not run')}`
+Post-merge context: exact staged production main.
+Push trust boundary: `git push`, local push hooks, and post-push executable checks are reconciled before FINALIZED.
+
+## Acceptance
+
+{chr(10).join(f'- {x}' for x in state.get('acceptance_checklist', [])) or '- No manual steps declared.'}
+
+Finalize after PASS:
+
+```bash
+{commands.get('finalize', '')}
+```
+
+Rollback after FAIL:
+
+```bash
+{commands.get('rollback', '')}
+```
+"""
+    write_artifact(run_dir / "integration-summary.md", text)
+
+
+def persist(run_dir: Path, state: dict, phase: str, status: str | None = None) -> None:
+    state["phase"] = phase
+    state["updated_at"] = now()
+    if status:
+        state["status"] = status
+    atomic_json(run_dir / "integration-manifest.json", state)
+    summary(run_dir, state)
+    evidence = scan_tree(run_dir)
+    if not evidence["passed"]:
+        locations = ", ".join(
+            f"{item['file']}:{item['line'] or '-'}:{item['category']}" for item in evidence["matches"]
+        )
+        raise IntegrationError("user-readable integration evidence secret scan failed: " + locations)
+
+
+def load_run(value: str) -> tuple[Path, dict]:
+    path = Path(value).resolve()
+    if path.is_dir():
+        path = path / "integration-manifest.json"
+    if not path.is_file():
+        raise IntegrationError(f"integration run not found: {path}")
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise IntegrationError(f"integration run manifest is malformed: {exc}") from exc
+    return path.parent, validate_run_state(state)
+
+
+def validate_run_state(state: object) -> dict:
+    required = {
+        "schema_version", "run_id", "task_id", "status", "phase", "repository", "source_manifest",
+        "baseline_branch", "baseline_head", "origin_baseline_head", "feature_branch", "feature_head",
+        "contract", "deployment_contract_path", "deployment_contract_sha256",
+        "service_manager", "service_timeout", "acceptance_checklist",
+        "expected_repository_state", "commands",
+    }
+    if not isinstance(state, dict):
+        raise IntegrationError("integration run manifest must be an object")
+    missing = sorted(required - state.keys())
+    if missing:
+        raise IntegrationError("integration run manifest missing fields: " + ", ".join(missing))
+    if state["schema_version"] != SCHEMA_VERSION or state["status"] not in RUN_STATES:
+        raise IntegrationError("integration run schema/status is invalid")
+    for field in ("run_id", "task_id", "phase", "repository", "source_manifest", "baseline_branch", "feature_branch"):
+        if not _is_string(state[field]):
+            raise IntegrationError(f"integration run field {field} is invalid")
+    if not Path(state["repository"]).is_absolute() or not Path(state["source_manifest"]).is_absolute():
+        raise IntegrationError("integration run paths must be absolute")
+    for field in ("baseline_head", "origin_baseline_head", "feature_head"):
+        if not isinstance(state[field], str) or not SHA_RE.fullmatch(state[field]):
+            raise IntegrationError(f"integration run field {field} is not a commit SHA")
+    if "staged_head" in state and (not isinstance(state["staged_head"], str) or not SHA_RE.fullmatch(state["staged_head"])):
+        raise IntegrationError("integration run staged_head is invalid")
+    if state["deployment_contract_path"] != "deployment-contract.json" or not re.fullmatch(
+        r"[0-9a-f]{64}", state["deployment_contract_sha256"]
+    ):
+        raise IntegrationError("integration run contract binding is invalid")
+    if not isinstance(state["service_manager"], list) or not state["service_manager"] or not all(_is_string(x) for x in state["service_manager"]):
+        raise IntegrationError("integration run service_manager must be an argv array")
+    if not isinstance(state["service_timeout"], (int, float)) or isinstance(state["service_timeout"], bool) or state["service_timeout"] <= 0:
+        raise IntegrationError("integration run service_timeout is invalid")
+    if not isinstance(state["acceptance_checklist"], list) or not all(_is_string(x) for x in state["acceptance_checklist"]):
+        raise IntegrationError("integration run acceptance_checklist is invalid")
+    expected = _require_keys(state["expected_repository_state"], {"branch", "head", "index_tree", "status"}, "expected_repository_state")
+    if not all(isinstance(expected[x], str) for x in expected) or not SHA_RE.fullmatch(expected["head"]):
+        raise IntegrationError("integration run expected repository state is invalid")
+    if not isinstance(state["commands"], dict) or not all(_is_string(x) for x in state["commands"].values()):
+        raise IntegrationError("integration run commands are invalid")
+    normalized = validate_contract(state["contract"], {"baseline_head": state["baseline_head"], "feature_branch": state["feature_branch"]})
+    if canonical_contract_sha256(normalized) != state["deployment_contract_sha256"]:
+        raise IntegrationError("persisted integration contract was mutated")
+    if state["status"] in {
+        "AWAITING_ACCEPTANCE", "FINALIZING", "FINALIZE_RECOVERY_REQUIRED", "FINALIZED",
+    } and "staged_head" not in state:
+        raise IntegrationError("staged integration state is missing staged_head")
+    return state
+
+
+def verify_run_contract_binding(state: dict) -> tuple[dict, str]:
+    manifest = {
+        "baseline_head": state["baseline_head"],
+        "feature_branch": state["feature_branch"],
+        "feature_head": state["feature_head"],
+        "deployment_contract_path": state["deployment_contract_path"],
+        "deployment_contract_sha256": state["deployment_contract_sha256"],
+        "deployment_contract": state["contract"],
+    }
+    return verify_contract_binding(Path(state["repository"]), manifest)
+
+
+def git_common_dir(repo: Path) -> Path:
+    value = require_git(repo, "rev-parse", "--git-common-dir")
+    path = Path(value)
+    return (repo / path).resolve() if not path.is_absolute() else path.resolve()
+
+
+@contextmanager
+def repository_lock(repo: Path):
+    common = git_common_dir(repo)
+    handle = open(common / "kven-integration.lock", "a+", encoding="utf-8")
+    try:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise IntegrationError("another integration operation is active for this repository") from exc
+        yield common / "kven-integration-active.json"
+    finally:
+        handle.close()
+
+
+def claim_active(marker: Path, run_dir: Path, state: dict) -> None:
+    if marker.exists():
+        try:
+            existing = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise IntegrationError("active integration marker is malformed; recovery is required") from exc
+        if existing.get("run_id") != state["run_id"]:
+            raise IntegrationError(f"another integration run is active: {existing.get('run_id', 'unknown')}")
+    atomic_json(marker, {"run_id": state["run_id"], "run_dir": str(run_dir), "repository": state["repository"]}, mode=0o600)
+
+
+def clear_active(marker: Path, state: dict) -> None:
+    if not marker.exists():
+        return
+    existing = json.loads(marker.read_text(encoding="utf-8"))
+    if existing.get("run_id") != state["run_id"]:
+        raise IntegrationError("refusing to clear a different active integration marker")
+    marker.unlink()
+
+
+def restore_service_states(state: dict, run_dir: Path, contract: dict, args) -> dict:
+    desired = state.get("service_status_before", {})
+    records = {}
+    for service in contract["services"]:
+        target = desired[service]
+        current = service_state(args.service_manager, service)
+        if target == "active" and current != "active":
+            service_action(args.service_manager, "start", service, timeout=args.service_timeout)
+        elif target == "inactive" and current != "inactive":
+            service_action(args.service_manager, "stop", service, timeout=args.service_timeout)
+        wait_service_state(args.service_manager, service, target, timeout=args.service_timeout)
+        records[service] = service_state(args.service_manager, service)
+    if any(value == "active" for value in desired.values()) or not desired:
+        state["rollback_readiness"] = run_checks(
+            contract["readiness_checks"], run_dir, "rollback-readiness", cwd=Path(state["repository"]),
+            expected_repository_state=state["expected_repository_state"],
+        )
+        state["rollback_fatal_logs"] = run_checks(
+            contract["fatal_log_checks"], run_dir, "rollback-fatal-logs", cwd=Path(state["repository"]),
+            expected_repository_state=state["expected_repository_state"],
+        )
+    return records
+
+
+def rollback_state(run_dir: Path, state: dict, reason: str, *, marker: Path | None = None) -> dict:
+    verify_run_contract_binding(state)
+    if state.get("status") == "FINALIZE_RECOVERY_REQUIRED":
+        raise IntegrationError("ordinary rollback is refused after a completed push; recovery is required")
+    if state.get("status") in {"ROLLED_BACK", "FINALIZED"}:
+        if state["status"] == "ROLLED_BACK":
+            return state
+        raise IntegrationError("cannot roll back a finalized, pushed integration")
+    repo = Path(state["repository"])
+    contract = state["contract"]
+    args = argparse.Namespace(service_manager=state["service_manager"], service_timeout=state["service_timeout"])
+    expected = state.get("expected_repository_state")
+    actual = repository_state(repo)
+    if not expected or actual != expected:
+        state["status"] = "INTERNAL_ERROR"
+        state["rollback_failure"] = f"refusing rollback: repository differs from recorded state; expected={expected}, actual={actual}"
+        persist(run_dir, state, "ROLLBACK_REFUSED", "INTERNAL_ERROR")
+        raise IntegrationError(state["rollback_failure"])
+    persist(run_dir, state, "ROLLING_BACK", "ROLLING_BACK")
+    for service in reversed(contract["services"]):
+        if service_state(args.service_manager, service) != "inactive":
+            service_action(args.service_manager, "stop", service, timeout=args.service_timeout)
+        wait_service_state(args.service_manager, service, "inactive", timeout=args.service_timeout)
+    if actual["head"] != state["baseline_head"]:
+        reset = git(repo, "reset", "--hard", state["baseline_head"])
+        if reset.returncode:
+            raise IntegrationError("guarded Git rollback failed")
+    state["expected_repository_state"] = repository_state(repo)
+    persist(run_dir, state, "RESTORING_BACKUPS")
+    state["backup_restoration"] = restore_backups(
+        state.get("backups", []), service_manager=args.service_manager, service_timeout=args.service_timeout,
+    )
+    state["service_status_after_rollback"] = restore_service_states(state, run_dir, contract, args)
+    final = repository_state(repo)
+    origin = require_git(repo, "rev-parse", "refs/remotes/origin/main")
+    index_clean = git(repo, "diff", "--cached", "--quiet").returncode == 0
+    if (final["branch"] != state["baseline_branch"] or final["head"] != state["baseline_head"]
+            or final["status"] or not index_clean or origin != state["baseline_head"]):
+        raise IntegrationError("post-rollback Git verification failed")
+    state.update({"status": "ROLLED_BACK", "phase": "COMPLETE", "rollback_reason": reason,
+                  "rolled_back_at": now(), "expected_repository_state": final})
+    atomic_json(run_dir / "rollback-result.json", {"status": "passed", "reason": reason, "at": now(),
+                                                    "git": final, "services": state["service_status_after_rollback"],
+                                                    "backups": state["backup_restoration"]})
+    persist(run_dir, state, "COMPLETE", "ROLLED_BACK")
+    if marker:
+        clear_active(marker, state)
+    return state
+
+
+def stage(manifest_path: Path, manifest: dict, args) -> tuple[Path, dict]:
+    repo = Path(args.repository).resolve()
+    with repository_lock(repo) as marker:
+        preflight = inspect_manifest(manifest, manifest_path=manifest_path, expected_repository=repo)
+        identifier = run_id(manifest["task_id"])
+        run_dir = Path(args.result_root).resolve() / manifest["task_id"] / identifier
+        backup_dir = Path(args.backup_root).resolve() / identifier
+        run_dir.mkdir(parents=True, mode=0o755)
+        contract = preflight["contract"]
+        state = {
+            "schema_version": SCHEMA_VERSION, "run_id": identifier, "task_id": manifest["task_id"],
+            "status": "INTERNAL_ERROR", "phase": "CREATED", "created_at": now(),
+            "repository": str(repo), "source_manifest": str(manifest_path),
+            "baseline_branch": manifest["baseline_branch"], "baseline_head": manifest["baseline_head"],
+            "origin_baseline_head": manifest["origin_main_head"], "feature_branch": manifest["feature_branch"],
+            "feature_head": manifest["feature_head"], "contract": contract,
+            "deployment_contract_path": preflight["deployment_contract_path"],
+            "deployment_contract_sha256": preflight["deployment_contract_sha256"],
+            "service_manager": args.service_manager, "service_timeout": args.service_timeout,
+            "acceptance_checklist": contract["acceptance_checklist"],
+            "expected_repository_state": preflight["main_state"],
+            "live_mutation_started": False,
+            "commands": {
+                "finalize": f"{repo}/scripts/kven-integrate-task finalize {run_dir} --accept PASS --repository {repo}",
+                "rollback": f"{repo}/scripts/kven-integrate-task rollback {run_dir} --repository {repo}",
+            },
+        }
+        atomic_json(run_dir / "preflight.json", preflight)
+        atomic_json(run_dir / "git-before.json", preflight["main_state"])
+        persist(run_dir, state, "CREATED", "INTERNAL_ERROR")
+        claim_active(marker, run_dir, state)
+        try:
+            state["service_status_before"] = {service: service_state(args.service_manager, service) for service in contract["services"]}
+            if any(value not in {"active", "inactive"} for value in state["service_status_before"].values()):
+                raise IntegrationError("declared service has an unsupported pre-stage state")
+            state["service_snapshot_before"] = service_snapshot(
+                args.service_manager, contract["services"], args.service_timeout,
+            )
+            atomic_json(run_dir / "services-before.json", state["service_status_before"])
+            persist(run_dir, state, "PRE_MERGE_TESTING", "PRE_MERGE_TESTING")
+            state["pre_merge_tests"], state["validation_checkout"] = run_feature_validation(
+                repo, manifest["feature_head"], contract["pre_merge_tests"], run_dir, identifier,
+            )
+            atomic_json(run_dir / "pre-merge-tests.json", state["pre_merge_tests"])
+            atomic_json(run_dir / "validation-checkout.json", state["validation_checkout"])
+            # Production must still be the exact baseline after validation checkout cleanup.
+            after_validation = inspect_manifest(
+                manifest, manifest_path=manifest_path, expected_repository=repo,
+            )
+            if after_validation["main_state"] != state["expected_repository_state"]:
+                raise IntegrationError("production repository changed during feature validation")
+            backup_dir.mkdir(parents=True, mode=0o700)
+            persist(run_dir, state, "BACKING_UP", "BACKING_UP")
+            state["backups"] = create_backups(contract, backup_dir)
+            atomic_json(run_dir / "backup-manifest.json", state["backups"])
+            persist(run_dir, state, "MIGRATING", "MIGRATING")
+            state["migration_validation"] = validate_migrations(
+                contract, state["backups"], run_dir, protected_work_dir=backup_dir / "migration-copies",
+            )
+            atomic_json(run_dir / "migration-validation.json", state["migration_validation"])
+            # This is the last preflight before the first repository mutation.
+            immediate = inspect_manifest(manifest, manifest_path=manifest_path, expected_repository=repo)
+            if immediate["main_state"] != state["expected_repository_state"]:
+                raise IntegrationError("repository changed between initial and immediate pre-mutation preflight")
+            if (immediate["deployment_contract_sha256"] != state["deployment_contract_sha256"]
+                    or immediate["contract"] != state["contract"]):
+                raise IntegrationError("deployment contract binding changed before mutation")
+            persist(run_dir, state, "MERGING", "MERGING")
+            state["live_mutation_started"] = True
+            merge = git(repo, "merge", "--no-ff", "--no-edit", manifest["feature_head"])
+            write_artifact(run_dir / "merge.log", redact(merge.stdout + merge.stderr))
+            if merge.returncode:
+                git(repo, "merge", "--abort")
+                state["expected_repository_state"] = repository_state(repo)
+                raise IntegrationError("local merge failed; no conflict resolution attempted")
+            state["staged_head"] = require_git(repo, "rev-parse", "HEAD")
+            clean_staged_state = repository_state(repo)
+            if clean_staged_state["status"]:
+                raise IntegrationError("merge did not produce an exact clean staged repository state")
+            state["expected_repository_state"] = clean_staged_state
+            atomic_json(run_dir / "git-after-merge.json", state["expected_repository_state"])
+            persist(run_dir, state, "POST_MERGE_TESTING", "POST_MERGE_TESTING")
+            state["post_merge_tests"] = run_checks(
+                contract["post_merge_tests"], run_dir, "post-merge", cwd=repo,
+                expected_repository_state=clean_staged_state,
+            )
+            atomic_json(run_dir / "post-merge-tests.json", state["post_merge_tests"])
+            if contract["deployment_steps"]:
+                persist(run_dir, state, "DEPLOYING", "DEPLOYING")
+                state["deployment_steps"] = run_checks(
+                    contract["deployment_steps"], run_dir, "deployment", cwd=repo,
+                    expected_repository_state=clean_staged_state,
+                )
+            require_repository_state(repo, clean_staged_state, "post-deployment guard")
+            persist(run_dir, state, "RESTARTING_SERVICES", "RESTARTING_SERVICES")
+            state["service_restart_evidence"] = []
+            for service in contract["services"]:
+                if state["service_status_before"][service] == "active":
+                    state["service_restart_evidence"].append(
+                        restart_declared_service(args.service_manager, service, timeout=args.service_timeout)
+                    )
+                else:
+                    wait_service_state(args.service_manager, service, "inactive", timeout=args.service_timeout)
+                require_repository_state(repo, clean_staged_state, f"service restart group for {service}")
+            state["service_snapshot_after_activation"] = service_snapshot(
+                args.service_manager, contract["services"], args.service_timeout,
+            )
+            persist(run_dir, state, "VERIFYING", "VERIFYING")
+            state["readiness"] = run_checks(
+                contract["readiness_checks"], run_dir, "readiness", cwd=repo,
+                expected_repository_state=clean_staged_state,
+            )
+            require_service_snapshot(
+                args.service_manager, state["service_snapshot_after_activation"], args.service_timeout,
+                "readiness checks",
+            )
+            state["fatal_log_checks"] = run_checks(
+                contract["fatal_log_checks"], run_dir, "fatal-logs", cwd=repo,
+                expected_repository_state=clean_staged_state,
+            )
+            require_service_snapshot(
+                args.service_manager, state["service_snapshot_after_activation"], args.service_timeout,
+                "fatal-log checks",
+            )
+            state["expected_service_state"] = {service: service_state(args.service_manager, service) for service in contract["services"]}
+            if state["expected_service_state"] != state["service_status_before"]:
+                raise IntegrationError("service state differs from the pre-stage active/inactive contract")
+            require_repository_state(repo, clean_staged_state, "AWAITING_ACCEPTANCE guard")
+            state["expected_service_snapshot"] = service_snapshot(
+                args.service_manager, contract["services"], args.service_timeout,
+            )
+            if state["expected_service_snapshot"] != state["service_snapshot_after_activation"]:
+                raise IntegrationError("service restart count drifted before acceptance")
+            state["staged_at"] = now()
+            atomic_json(run_dir / "services-after.json", state["expected_service_state"])
+            atomic_json(run_dir / "readiness.json", state["readiness"])
+            atomic_json(run_dir / "fatal-log-checks.json", state["fatal_log_checks"])
+            atomic_json(run_dir / "acceptance-checklist.json", contract["acceptance_checklist"])
+            persist(run_dir, state, "AWAITING_ACCEPTANCE", "AWAITING_ACCEPTANCE")
+        except KeyboardInterrupt:
+            state["failure"] = "stage interrupted"
+            persist(run_dir, state, "INTERRUPTED", "INTERRUPTED")
+        except Exception as exc:
+            validation_evidence_path = run_dir / "validation-checkout.json"
+            if validation_evidence_path.is_file():
+                try:
+                    state["validation_checkout"] = json.loads(
+                        validation_evidence_path.read_text(encoding="utf-8")
+                    )
+                    state["pre_merge_tests"] = [
+                        item["command"] for item in state["validation_checkout"].get("commands", [])
+                        if "command" in item
+                    ]
+                except (OSError, json.JSONDecodeError):
+                    state["validation_checkout_evidence_error"] = "validation evidence could not be reloaded"
+            state["failure"] = redact(str(exc))
+            persist(run_dir, state, "AUTOMATED_CHECK_FAILED", "AUTOMATED_CHECK_FAILED")
+            if not state.get("live_mutation_started"):
+                clear_active(marker, state)
+            else:
+                try:
+                    rollback_state(run_dir, state, state["failure"], marker=marker)
+                except Exception as rollback_exc:
+                    state["status"] = "INTERNAL_ERROR"
+                    state["rollback_failure"] = redact(str(rollback_exc))
+                    persist(run_dir, state, "ROLLBACK_FAILED", "INTERNAL_ERROR")
+        return run_dir, state
+
+
+def verify_staged_state(run_dir: Path, state: dict) -> None:
+    repo = Path(state["repository"])
+    verify_run_contract_binding(state)
+    require_repository_state(repo, state["expected_repository_state"], "finalize pre-check")
+    if state["expected_repository_state"]["head"] != state.get("staged_head"):
+        raise IntegrationError("recorded staged repository HEAD is inconsistent")
+    origin = require_git(repo, "rev-parse", "refs/remotes/origin/main")
+    if origin != state["origin_baseline_head"]:
+        raise IntegrationError("origin/main changed after stage")
+    require_service_snapshot(
+        state["service_manager"], state.get("expected_service_snapshot", {}), state["service_timeout"],
+        "finalize pre-check",
+    )
+    state["finalize_readiness"] = run_checks(
+        state["contract"]["readiness_checks"], run_dir, "finalize-readiness", cwd=repo,
+        expected_repository_state=state["expected_repository_state"],
+    )
+    state["finalize_fatal_logs"] = run_checks(
+        state["contract"]["fatal_log_checks"], run_dir, "finalize-fatal-logs", cwd=repo,
+        expected_repository_state=state["expected_repository_state"],
+    )
+    require_repository_state(repo, state["expected_repository_state"], "finalize post-check")
+    require_service_snapshot(
+        state["service_manager"], state.get("expected_service_snapshot", {}), state["service_timeout"],
+        "finalize post-check",
+    )
+
+
+def bounded_repository_evidence(repo: Path) -> dict:
+    """Describe repository drift without persisting an unbounded status listing."""
+    actual = repository_state(repo)
+    status = redact(actual.pop("status"))
+    actual.update({
+        "status_bounded": bounded(status),
+        "status_sha256": hashlib.sha256(status.encode("utf-8")).hexdigest(),
+        "status_entries": len(status.splitlines()) if status else 0,
+    })
+    return actual
+
+
+def reconcile_final_state(run_dir: Path, state: dict, *, category: str) -> dict:
+    """Prove exact local, service, check, contract, and remote state after push."""
+    started = now()
+    monotonic = time.monotonic()
+    repo = Path(state["repository"])
+    verify_run_contract_binding(state)
+    require_repository_state(repo, state["expected_repository_state"], f"{category} reconciliation pre-check")
+    if state["expected_repository_state"]["head"] != state["staged_head"]:
+        raise IntegrationError("recorded staged repository HEAD is inconsistent")
+    require_service_snapshot(
+        state["service_manager"], state.get("expected_service_snapshot", {}), state["service_timeout"],
+        f"{category} reconciliation pre-check",
+    )
+    readiness = run_checks(
+        state["contract"]["readiness_checks"], run_dir, f"{category}-readiness", cwd=repo,
+        expected_repository_state=state["expected_repository_state"],
+    )
+    fatal_logs = run_checks(
+        state["contract"]["fatal_log_checks"], run_dir, f"{category}-fatal-logs", cwd=repo,
+        expected_repository_state=state["expected_repository_state"],
+    )
+    require_repository_state(repo, state["expected_repository_state"], f"{category} reconciliation post-check")
+    services = require_service_snapshot(
+        state["service_manager"], state.get("expected_service_snapshot", {}), state["service_timeout"],
+        f"{category} reconciliation post-check",
+    )
+    if require_git(repo, "rev-parse", "refs/remotes/origin/main") != state["staged_head"]:
+        raise IntegrationError(f"origin/main changed during {category} reconciliation")
+    return {
+        "status": "PASSED", "started_at": started, "finished_at": now(),
+        "duration_seconds": round(time.monotonic() - monotonic, 3),
+        "contract_sha256": state["deployment_contract_sha256"],
+        "repository_state": state["expected_repository_state"],
+        "service_snapshot": services, "readiness": readiness, "fatal_log_checks": fatal_logs,
+        "origin_main": state["staged_head"],
+    }
+
+
+def persist_push_evidence(run_dir: Path, state: dict) -> None:
+    atomic_json(run_dir / "push-evidence.json", state["push_evidence"])
+
+
+def recovery_required_after_push(run_dir: Path, state: dict, marker: Path, exc: Exception) -> None:
+    repo = Path(state["repository"])
+    failure = redact(str(exc))
+    reconciliation = state["push_evidence"].setdefault("post_push_reconciliation", {})
+    reconciliation.update({"status": "FAILED", "finished_at": now(), "failure": bounded(failure)})
+    state["reconciliation_failure"] = bounded(failure)
+    state["recovery_evidence"] = {
+        "remote_push_completed": True,
+        "origin_main": state["push_evidence"].get("origin_main_after"),
+        "staged_head": state["staged_head"],
+        "repository_state": bounded_repository_evidence(repo),
+        "failure": bounded(failure), "checked_at": now(),
+        "ordinary_rollback_permitted": False, "remote_history_rewrite_permitted": False,
+    }
+    persist_push_evidence(run_dir, state)
+    persist(run_dir, state, "FINALIZE_RECOVERY_REQUIRED", "FINALIZE_RECOVERY_REQUIRED")
+    clear_active(marker, state)
+
+
+def finalize_run(run_dir: Path, state: dict, args, marker: Path) -> dict:
+    repo = Path(state["repository"])
+    if repo.resolve() != Path(args.repository).resolve():
+        raise IntegrationError("run repository differs from explicit repository boundary")
+    if state["status"] == "FINALIZE_RECOVERY_REQUIRED":
+        raise IntegrationError(
+            "remote push completed but exact final state is unproven; automatic finalize and ordinary rollback "
+            "are refused until the operator restores the recorded state and follows the documented recovery path"
+        )
+    if state["status"] == "FINALIZED":
+        verify_run_contract_binding(state)
+        require_repository_state(repo, state["expected_repository_state"], "already-finalized verification")
+        require_service_snapshot(
+            state["service_manager"], state.get("expected_service_snapshot", {}), state["service_timeout"],
+            "already-finalized verification",
+        )
+        origin = require_git(repo, "rev-parse", "refs/remotes/origin/main")
+        if origin != state["staged_head"]:
+            raise IntegrationError("finalized run no longer matches origin/main")
+        return state
+    if state["status"] == "FINALIZING":
+        origin = require_git(repo, "rev-parse", "refs/remotes/origin/main")
+        if origin == state["staged_head"]:
+            claim_active(marker, run_dir, state)
+            push_evidence = state.setdefault("push_evidence", {
+                "command": redact_argv([
+                    "git", "-C", str(repo), "push", "origin", f"{state['staged_head']}:refs/heads/main",
+                ]),
+                "outcome": "INTERRUPTED_OUTCOME_UNKNOWN",
+                "origin_main_before": state["origin_baseline_head"],
+            })
+            push_evidence.update({
+                "origin_main_after": origin, "remote_known_updated": True,
+                "post_push_reconciliation": {"status": "PENDING", "started_at": now()},
+            })
+            persist_push_evidence(run_dir, state)
+            persist(run_dir, state, "POST_PUSH_RECONCILING", "FINALIZING")
+            try:
+                result = reconcile_final_state(run_dir, state, category="post-push")
+            except Exception as exc:
+                recovery_required_after_push(run_dir, state, marker, exc)
+                raise IntegrationError(
+                    "remote push completed but post-push reconciliation failed; recovery is required"
+                ) from exc
+            push_evidence["post_push_reconciliation"] = result
+            persist_push_evidence(run_dir, state)
+            persist(run_dir, state, "POST_PUSH_RECONCILED", "FINALIZING")
+            state.update({"status": "FINALIZED", "phase": "COMPLETE", "origin_main": origin, "finalized_at": now()})
+            persist(run_dir, state, "COMPLETE", "FINALIZED")
+            clear_active(marker, state)
+            return state
+        if origin != state["origin_baseline_head"]:
+            claim_active(marker, run_dir, state)
+            state["remote_state_failure"] = {
+                "origin_main_before": state["origin_baseline_head"], "origin_main_after": origin,
+                "staged_head": state["staged_head"], "push_exit_code": None,
+            }
+            persist(run_dir, state, "FINALIZE_REMOTE_STATE_UNEXPECTED", "INTERNAL_ERROR")
+            clear_active(marker, state)
+            raise IntegrationError("interrupted finalize found an unexpected origin/main; automatic retry is unsafe")
+    elif state["status"] != "AWAITING_ACCEPTANCE":
+        raise IntegrationError("integration is not awaiting acceptance")
+    if args.accept != "PASS":
+        raise IntegrationError("finalize requires --accept PASS")
+    claim_active(marker, run_dir, state)
+    verify_staged_state(run_dir, state)
+    acceptance = {"result": "PASS", "notes": args.notes, "at": now()}
+    atomic_json(run_dir / "acceptance-result.json", acceptance)
+    state["acceptance"] = acceptance
+    persist(run_dir, state, "FINALIZING", "FINALIZING")
+    push_command = ["git", "-C", str(repo), "push", "origin", f"{state['staged_head']}:refs/heads/main"]
+    if state.get("push_evidence"):
+        state.setdefault("push_attempts", []).append(state["push_evidence"])
+    origin_before = require_git(repo, "rev-parse", "refs/remotes/origin/main")
+    state["push_evidence"] = {
+        "command": redact_argv(push_command), "outcome": "PENDING",
+        "origin_main_before": origin_before, "remote_known_updated": False,
+        "post_push_reconciliation": {"status": "NOT_STARTED"},
+    }
+    persist_push_evidence(run_dir, state)
+    persist(run_dir, state, "PUSHING", "FINALIZING")
+    push = command_record(push_command, run_dir / "push.log", timeout=300)
+    origin = require_git(repo, "rev-parse", "refs/remotes/origin/main")
+    push.update({
+        "outcome": "PASSED" if push["passed"] else "FAILED",
+        "origin_main_before": origin_before, "origin_main_after": origin,
+        "remote_known_updated": origin == state["staged_head"],
+        "local_repository_state_after": bounded_repository_evidence(repo),
+        "post_push_reconciliation": {"status": "NOT_STARTED"},
+    })
+    state["push_evidence"] = push
+    persist_push_evidence(run_dir, state)
+    persist(run_dir, state, "PUSH_OUTCOME_RECORDED", "FINALIZING")
+    if origin == state["staged_head"]:
+        push["post_push_reconciliation"] = {"status": "PENDING", "started_at": now()}
+        persist_push_evidence(run_dir, state)
+        persist(run_dir, state, "POST_PUSH_RECONCILING", "FINALIZING")
+        try:
+            result = reconcile_final_state(run_dir, state, category="post-push")
+        except Exception as exc:
+            recovery_required_after_push(run_dir, state, marker, exc)
+            raise IntegrationError(
+                "remote push completed but post-push reconciliation failed; recovery is required"
+            ) from exc
+        push["post_push_reconciliation"] = result
+        persist_push_evidence(run_dir, state)
+        persist(run_dir, state, "POST_PUSH_RECONCILED", "FINALIZING")
+    elif origin == state["origin_baseline_head"] and not push["passed"]:
+        push["post_push_reconciliation"] = {"status": "NOT_REQUIRED_REMOTE_UNCHANGED"}
+        persist_push_evidence(run_dir, state)
+        persist(run_dir, state, "FINALIZING", "FINALIZING")
+        raise IntegrationError("push failed and origin/main remains at the baseline; finalize is retryable")
+    else:
+        push["post_push_reconciliation"] = {"status": "NOT_RUN_UNEXPECTED_REMOTE_STATE"}
+        state["remote_state_failure"] = {
+            "origin_main_before": origin_before, "origin_main_after": origin,
+            "staged_head": state["staged_head"], "push_exit_code": push["exit_code"],
+        }
+        persist_push_evidence(run_dir, state)
+        persist(run_dir, state, "FINALIZE_REMOTE_STATE_UNEXPECTED", "INTERNAL_ERROR")
+        clear_active(marker, state)
+        raise IntegrationError("push produced an unexpected origin/main state; automatic retry is unsafe")
+    state.update({"status": "FINALIZED", "phase": "COMPLETE", "origin_main": origin, "finalized_at": now()})
+    persist(run_dir, state, "COMPLETE", "FINALIZED")
+    clear_active(marker, state)
+    return state
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("command", choices=("inspect", "dry-run", "stage", "status", "finalize", "rollback"))
+    parser.add_argument("target")
+    parser.add_argument("--repository", default=str(DEFAULT_REPOSITORY),
+                        help="trusted repository boundary; override only for explicit operator/test fixtures")
+    parser.add_argument("--result-root", default=os.environ.get("KVEN_INTEGRATION_RESULT_ROOT", DEFAULT_RESULT_ROOT))
+    parser.add_argument("--backup-root", default=os.environ.get("KVEN_INTEGRATION_BACKUP_ROOT", DEFAULT_BACKUP_ROOT))
+    parser.add_argument("--service-manager", nargs="+", default=["systemctl"])
+    parser.add_argument("--service-timeout", type=float, default=60)
+    parser.add_argument("--accept", choices=("PASS", "FAIL"))
+    parser.add_argument("--notes", default="")
+    return parser.parse_args(argv)
+
+
+def main(argv=None) -> int:
+    args = parse_args(argv)
+    try:
+        if not isinstance(args.service_manager, list) or not args.service_manager or not all(_is_string(x) for x in args.service_manager):
+            raise IntegrationError("service manager must be a non-empty argv array")
+        trusted_repo = Path(args.repository).resolve()
+        if args.command in {"inspect", "dry-run", "stage"}:
+            path, manifest = load_manifest(args.target)
+            report = inspect_manifest(manifest, manifest_path=path, expected_repository=trusted_repo)
+            if args.command == "inspect":
+                print(json.dumps(report, indent=2, sort_keys=True))
+                return 0
+            if args.command == "dry-run":
+                contract = report["contract"]
+                print(json.dumps({
+                    "dry_run": True, "repository": str(trusted_repo),
+                    "would_backup": contract["backups"], "would_merge_exact_commit": manifest["feature_head"],
+                    "would_test": {
+                        "pre_merge": {
+                            "context": "disposable detached checkout of exact feature HEAD",
+                            "feature_head": manifest["feature_head"],
+                            "commands": contract["pre_merge_tests"],
+                        },
+                        "post_merge": {
+                            "context": "exact staged production main",
+                            "commands": contract["post_merge_tests"],
+                        },
+                    },
+                    "would_restart": [x for x in contract["services"]],
+                    "would_check": contract["readiness_checks"], "would_check_logs": contract["fatal_log_checks"],
+                }, indent=2, sort_keys=True))
+                return 0
+            run_dir, state = stage(path, manifest, args)
+            print(f"integration result: {run_dir}")
+            print(f"status: {state['status']}")
+            return {
+                "AWAITING_ACCEPTANCE": 0,
+                "AUTOMATED_CHECK_FAILED": 3,
+                "ROLLED_BACK": 4,
+                "INTERNAL_ERROR": 5,
+            }.get(state["status"], 5)
+        run_dir, state = load_run(args.target)
+        if Path(state["repository"]).resolve() != trusted_repo:
+            raise IntegrationError("run repository differs from trusted repository boundary")
+        verify_run_contract_binding(state)
+        if args.command == "status":
+            print(json.dumps(state, indent=2, sort_keys=True))
+            return 0
+        with repository_lock(trusted_repo) as marker:
+            if args.command == "rollback" or (args.command == "finalize" and args.accept == "FAIL"):
+                claim_active(marker, run_dir, state)
+                rollback_state(run_dir, state, args.notes or "operator requested rollback", marker=marker)
+                print("status: ROLLED_BACK")
+                return 0
+            finalize_run(run_dir, state, args, marker)
+            print("status: FINALIZED")
+            return 0
+    except (IntegrationError, OSError, KeyError, TypeError, ValueError) as exc:
+        print(f"error: {redact(str(exc))}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
