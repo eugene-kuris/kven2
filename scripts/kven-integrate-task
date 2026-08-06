@@ -295,7 +295,7 @@ def validate_manifest_types(data: object) -> dict:
     data = _require_keys(data, required, "result manifest", {
         "codex_model", "summary", "deployment_contract_error",
         "requested_deployment_services", "requested_backup_targets", "requested_migration_checks",
-        "result_package_path",
+        "result_package_path", "evidence_provenance",
     })
     if data["schema_version"] != SCHEMA_VERSION:
         raise IntegrationError(f"unsupported result manifest schema: {data['schema_version']}")
@@ -306,8 +306,10 @@ def validate_manifest_types(data: object) -> dict:
     for field in ("baseline_head", "origin_main_head", "feature_head"):
         if not SHA_RE.fullmatch(data[field]):
             raise IntegrationError(f"result manifest field {field} must be a commit SHA")
-    if not isinstance(data["codex_runtime_seconds"], (int, float)) or isinstance(data["codex_runtime_seconds"], bool):
-        raise IntegrationError("codex_runtime_seconds must be numeric")
+    if (data["codex_runtime_seconds"] is not None
+            and (not isinstance(data["codex_runtime_seconds"], (int, float))
+                 or isinstance(data["codex_runtime_seconds"], bool))):
+        raise IntegrationError("codex_runtime_seconds must be numeric or null when unavailable")
     if type(data["exit_code"]) is not int or data["final_codex_status"] not in {"PASS", "FAIL"}:
         raise IntegrationError("result status fields are invalid")
     if data["requested_model"] is not None and not _is_string(data["requested_model"]):
@@ -325,6 +327,16 @@ def validate_manifest_types(data: object) -> dict:
         raise IntegrationError("network_use evidence is invalid")
     if network["allowed"] is False and network["used"] is not False:
         raise IntegrationError("prohibited network use must be recorded as false")
+    provenance = data.get("evidence_provenance")
+    if provenance is not None:
+        provenance = _require_keys(
+            provenance, {"method", "runner_contained_manifest_features", "description"},
+            "evidence_provenance",
+        )
+        if (provenance["method"] not in {"automatic_runner", "bootstrap_postprocessing"}
+                or type(provenance["runner_contained_manifest_features"]) is not bool
+                or not _is_string(provenance["description"])):
+            raise IntegrationError("evidence_provenance is invalid")
     if not isinstance(data["changed_files"], list) or len(data["changed_files"]) != len(set(data["changed_files"])) or not all(_is_string(x) for x in data["changed_files"]):
         raise IntegrationError("changed_files must be a unique string array")
     commits = data["commits_created"]

@@ -190,6 +190,7 @@ raise SystemExit(int(os.environ.get('FAKE_CODEX_EXIT','0')))
         self.assertEqual(manifest["actual_reasoning_effort"], "high")
         self.assertEqual(manifest["token_usage"], 1234)
         self.assertFalse(manifest["network_use"]["used"])
+        self.assertEqual(manifest["evidence_provenance"]["method"], "automatic_runner")
         self.assertEqual(stat.S_IMODE(package.stat().st_mode), 0o755)
         self.assertTrue(all(stat.S_IMODE(p.stat().st_mode) == 0o644 for p in package.iterdir() if p.is_file()))
         branches = command("git", "-C", str(self.repo), "branch", "--format=%(refname:short)").stdout

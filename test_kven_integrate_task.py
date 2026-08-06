@@ -118,6 +118,7 @@ class RepositoryFixture(unittest.TestCase):
             "requested_model": None, "actual_runtime_model": "fixture-model",
             "actual_reasoning_effort": "high", "token_usage": None,
             "network_use": {"allowed": False, "used": False, "observation": "network prohibited"},
+            "evidence_provenance": {"method": "bootstrap_postprocessing", "runner_contained_manifest_features": False, "description": "fixture"},
             "exit_code": 0, "final_codex_status": "PASS", "repository_path": str(self.repo),
             "baseline_branch": "main", "baseline_head": self.base, "origin_main_head": self.base,
             "feature_branch": "feature", "feature_head": self.feature,
