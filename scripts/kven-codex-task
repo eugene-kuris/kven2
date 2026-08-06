@@ -256,7 +256,7 @@ def make_result_summary(manifest: dict) -> str:
     )
     commits = "\n".join(f"- `{item['sha']}` {item['subject']}" for item in manifest["commits_created"]) or "- None"
     changed = "\n".join(f"- `{item}`" for item in manifest["changed_files"]) or "- None"
-    next_command = f"scripts/kven-integrate-task inspect {manifest['result_package_path']} --repository /opt/kven2"
+    next_command = f"/opt/kven2/scripts/kven-integrate-task inspect {manifest['result_package_path']} --repository /opt/kven2"
     return f"""# Codex result: {manifest['task_id']}
 
 Status: **{manifest['final_codex_status']}**

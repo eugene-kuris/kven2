@@ -824,8 +824,8 @@ def stage(manifest_path: Path, manifest: dict, args) -> tuple[Path, dict]:
             "acceptance_checklist": contract["acceptance_checklist"],
             "expected_repository_state": preflight["main_state"],
             "commands": {
-                "finalize": f"scripts/kven-integrate-task finalize {run_dir} --accept PASS --repository {repo}",
-                "rollback": f"scripts/kven-integrate-task rollback {run_dir} --repository {repo}",
+                "finalize": f"{repo}/scripts/kven-integrate-task finalize {run_dir} --accept PASS --repository {repo}",
+                "rollback": f"{repo}/scripts/kven-integrate-task rollback {run_dir} --repository {repo}",
             },
         }
         atomic_json(run_dir / "preflight.json", preflight)

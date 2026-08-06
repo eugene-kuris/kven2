@@ -21,12 +21,12 @@ A command item is an object containing a non-empty argv-array `command`, plus op
 ## Commands
 
 ```bash
-scripts/kven-integrate-task inspect /path/to/codex-result --repository /opt/kven2
-scripts/kven-integrate-task dry-run /path/to/codex-result --repository /opt/kven2
-scripts/kven-integrate-task stage /path/to/codex-result --repository /opt/kven2
-scripts/kven-integrate-task status /path/to/integration-run
-scripts/kven-integrate-task finalize /path/to/integration-run --accept PASS --notes "accepted"
-scripts/kven-integrate-task rollback /path/to/integration-run --notes "acceptance failed"
+/opt/kven2/scripts/kven-integrate-task inspect /path/to/codex-result --repository /opt/kven2
+/opt/kven2/scripts/kven-integrate-task dry-run /path/to/codex-result --repository /opt/kven2
+/opt/kven2/scripts/kven-integrate-task stage /path/to/codex-result --repository /opt/kven2
+/opt/kven2/scripts/kven-integrate-task status /path/to/integration-run --repository /opt/kven2
+/opt/kven2/scripts/kven-integrate-task finalize /path/to/integration-run --accept PASS --notes "accepted" --repository /opt/kven2
+/opt/kven2/scripts/kven-integrate-task rollback /path/to/integration-run --notes "acceptance failed" --repository /opt/kven2
 ```
 
 Inspect and dry-run are read-only. Production defaults to the trusted `/opt/kven2` boundary and rejects any manifest redirect. `--repository` is an explicit operator/test-fixture override, not a value inferred from the manifest. Inspect independently recomputes the exact baseline-to-feature commit set and changed paths, compares them to the manifest, reruns `git diff --check`, scans exact changed content offline, and verifies the feature worktree is clean at the recorded branch/head. Dry-run prints intended backups, exact merge commit, tests, restarts, readiness, and fatal-log checks.

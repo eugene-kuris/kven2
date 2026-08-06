@@ -72,6 +72,7 @@ class UnitTests(unittest.TestCase):
             "deployment_contract_error": None,
         }
         self.assertIn("Eligible for integration: **no**", runner.make_result_summary(manifest))
+        self.assertIn("/opt/kven2/scripts/kven-integrate-task inspect", runner.make_result_summary(manifest))
 
     def test_command_argv_secrets_are_redacted(self):
         command = ["tool", "--" + "token", "synthetic-secret-value", "api_" + "key=" + "another-secret-value"]
