@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import time
+from typing import Any
 
 DEFAULT_REPOSITORY = Path("/opt/kven2")
 DEFAULT_RESULT_ROOT = Path("/home/eugene/kven-codex-results")
@@ -107,8 +108,112 @@ def write_result(path: Path, content: str):
     path.chmod(0o644)
 
 
+def _json_result(path: Path, value: Any):
+    write_result(path, json.dumps(value, indent=2, sort_keys=True) + "\n")
+
+
+def _changed_files(worktree: Path, baseline: str) -> list[str]:
+    return git(worktree, "diff", "--name-only", baseline, check=False).stdout.splitlines()
+
+
+def _commits(worktree: Path, baseline: str) -> list[dict[str, str]]:
+    rows = git(worktree, "log", "--format=%H%x09%s", f"{baseline}..HEAD", check=False).stdout.splitlines()
+    return [{"sha": row.split("\t", 1)[0], "subject": row.split("\t", 1)[1]} for row in rows if "\t" in row]
+
+
+def make_result_manifest(*, task_id: str, started: dt.datetime, finished: dt.datetime,
+                         duration: float, model: str | None, exit_code: int,
+                         summary: str, repository: Path, baseline: str,
+                         origin_main: str, branch: str, worktree: Path,
+                         result_dir: Path, network_allowed: bool,
+                         diff_check: int, secret_scan: dict) -> dict:
+    feature_head = git(worktree, "rev-parse", "HEAD", check=False).stdout.strip()
+    changed = _changed_files(worktree, baseline)
+    contract_path = worktree / "deployment-contract.json"
+    contract = None
+    contract_error = None
+    if contract_path.is_file():
+        try:
+            contract = json.loads(contract_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            contract_error = str(exc)
+    clean = not git(worktree, "status", "--porcelain", check=False).stdout
+    final_status = "PASS" if exit_code == 0 and clean and diff_check == 0 and not secret_scan["matches"] else "FAIL"
+    return {
+        "schema_version": "1.0",
+        "task_id": task_id,
+        "started_at": started.isoformat(),
+        "finished_at": finished.isoformat(),
+        "codex_runtime_seconds": round(duration, 3),
+        "codex_model": model,
+        "token_usage": None,
+        "exit_code": exit_code,
+        "final_codex_status": final_status,
+        "summary": summary,
+        "repository_path": str(repository),
+        "baseline_branch": "main",
+        "baseline_head": baseline,
+        "origin_main_head": origin_main,
+        "feature_branch": branch,
+        "feature_head": feature_head,
+        "worktree_path": str(worktree),
+        "commits_created": _commits(worktree, baseline),
+        "changed_files": changed,
+        "tests": [],
+        "git_diff_check": {"exit_code": diff_check, "passed": diff_check == 0},
+        "secret_scan": {"passed": not secret_scan["matches"], **secret_scan},
+        "network_use": {"allowed": network_allowed, "used": None},
+        "deployment_contract": contract,
+        "deployment_contract_error": contract_error,
+        "requested_deployment_services": (contract or {}).get("services", []),
+        "requested_backup_targets": (contract or {}).get("backups", {}),
+        "requested_migration_checks": (contract or {}).get("migration_checks", []),
+        "result_package_path": str(result_dir),
+    }
+
+
+def make_result_summary(manifest: dict) -> str:
+    eligible = (
+        manifest["final_codex_status"] == "PASS"
+        and manifest["deployment_contract"] is not None
+        and all(test.get("passed") for test in manifest["tests"])
+    )
+    commits = "\n".join(f"- `{item['sha']}` {item['subject']}" for item in manifest["commits_created"]) or "- None"
+    changed = "\n".join(f"- `{item}`" for item in manifest["changed_files"]) or "- None"
+    next_command = f"scripts/kven-integrate-task inspect {manifest['result_package_path']}"
+    return f"""# Codex result: {manifest['task_id']}
+
+Status: **{manifest['final_codex_status']}**
+Eligible for integration: **{'yes' if eligible else 'no'}**
+
+## Commits
+
+{commits}
+
+## Changed files
+
+{changed}
+
+## Tests
+
+{'Recorded in result-manifest.json' if manifest['tests'] else 'No machine-readable test executions were reported.'}
+
+## Unresolved issues
+
+{manifest.get('deployment_contract_error') or ('None reported.' if eligible else 'A complete deployment contract and passing recorded tests are required.')}
+
+## Next command
+
+```bash
+{next_command}
+```
+"""
+
+
 def obvious_secret_scan(worktree: Path, baseline: str) -> dict:
     changed = git(worktree, "diff", "--name-only", baseline).stdout.splitlines()
+    untracked = git(worktree, "ls-files", "--others", "--exclude-standard").stdout.splitlines()
+    changed = sorted(set(changed + untracked))
     matches = []
     for relative in changed:
         path = worktree / relative
@@ -166,6 +271,10 @@ def main(argv=None, stdin=None) -> int:
     exit_code = 1
     summary = "runner failed before execution"
     lock_handle = None
+    baseline = origin_main = None
+    raw_task_id = None
+    integrity_code = 1
+    secret_scan = {"files_scanned": [], "matches": []}
     try:
         task = read_task(args.task_file, stdin)
         raw_task_id = task_id_from(task, args.task_file)
@@ -230,6 +339,7 @@ def main(argv=None, stdin=None) -> int:
         names = git(worktree, "diff", "--name-status", baseline, check=False)
         diffstat = git(worktree, "diff", "--stat", baseline, check=False)
         integrity = git(worktree, "diff", "--check", baseline, check=False)
+        integrity_code = integrity.returncode
         secret_scan = obvious_secret_scan(worktree, baseline)
         write_result(result_dir / "final-git-state.txt", final_state.stdout + final_state.stderr)
         write_result(result_dir / "commits.txt", commits.stdout + commits.stderr)
@@ -270,10 +380,22 @@ def main(argv=None, stdin=None) -> int:
         finished = dt.datetime.now(dt.timezone.utc)
         if result_dir is not None:
             try:
+                duration = time.monotonic() - monotonic_start
                 write_result(result_dir / "finished-at.txt", finished.isoformat() + "\n")
-                write_result(result_dir / "duration-seconds.txt", f"{time.monotonic() - monotonic_start:.3f}\n")
+                write_result(result_dir / "duration-seconds.txt", f"{duration:.3f}\n")
                 write_result(result_dir / "exit-code.txt", f"{exit_code}\n")
                 write_result(result_dir / "summary.txt", summary + "\n")
+                if all((raw_task_id, baseline, origin_main, branch, worktree)) and Path(worktree).exists():
+                    manifest = make_result_manifest(
+                        task_id=raw_task_id, started=started, finished=finished,
+                        duration=duration, model=args.model, exit_code=exit_code,
+                        summary=summary, repository=repository, baseline=baseline,
+                        origin_main=origin_main, branch=branch, worktree=worktree,
+                        result_dir=result_dir, network_allowed=args.allow_network,
+                        diff_check=integrity_code, secret_scan=secret_scan,
+                    )
+                    _json_result(result_dir / "result-manifest.json", manifest)
+                    write_result(result_dir / "result-summary.md", make_result_summary(manifest))
             except OSError as exc:
                 print(f"error: result-package failure: {exc}", file=sys.stderr)
                 exit_code = 1

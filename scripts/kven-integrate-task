@@ -1,0 +1,495 @@
+#!/usr/bin/env python3
+"""Deterministically inspect, stage, finalize, or roll back a Codex result."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import sqlite3
+import stat
+import subprocess
+import sys
+import time
+import uuid
+
+SCHEMA_VERSION = "1.0"
+DEFAULT_REPOSITORY = Path("/opt/kven2")
+DEFAULT_RESULT_ROOT = Path("/home/eugene/kven-integration-results")
+DEFAULT_BACKUP_ROOT = Path("/var/backups/kven2")
+SERVICE_ALLOWLIST = {
+    "agent-sandbox.service", "kven2-main.service",
+    "kven2-telegram-gateway.service", "kven-client-gateway.service",
+    "email-agent.service",
+}
+SECRET_RE = re.compile(r"(?i)(password|secret|token|api[_-]?key)\s*[:=]\s*\S+")
+STATES = {"AWAITING_ACCEPTANCE", "AUTOMATED_CHECK_FAILED", "ROLLED_BACK", "INTERNAL_ERROR", "FINALIZED"}
+
+
+class IntegrationError(RuntimeError):
+    pass
+
+
+def now() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def run(command, *, cwd=None, timeout=300, check=False):
+    try:
+        return subprocess.run([str(x) for x in command], cwd=cwd, text=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              timeout=timeout, check=check)
+    except subprocess.TimeoutExpired as exc:
+        raise IntegrationError(f"command timed out after {timeout}s: {' '.join(map(str, command))}") from exc
+
+
+def git(repo: Path, *args: str):
+    return run(("git", "-C", repo, *args))
+
+
+def atomic_json(path: Path, value) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.chmod(0o644)
+    os.replace(temporary, path)
+
+
+def write_artifact(path: Path, text: str, *, mode=0o644) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+    path.write_text(text, encoding="utf-8")
+    path.chmod(mode)
+
+
+def redact(text: str) -> str:
+    return SECRET_RE.sub(lambda m: f"{m.group(1)}=[REDACTED]", text)
+
+
+def bounded(text: str, limit=4000) -> str:
+    clean = redact(text)
+    if len(clean) <= limit:
+        return clean
+    return clean[:limit] + f"\n... truncated ({len(clean) - limit} characters retained in artifact)\n"
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def resolve_manifest(value: str) -> Path:
+    path = Path(value).resolve()
+    if path.is_dir():
+        path = path / "result-manifest.json"
+    if not path.is_file():
+        raise IntegrationError(f"result manifest does not exist: {path}")
+    return path
+
+
+def load_manifest(value: str) -> tuple[Path, dict]:
+    path = resolve_manifest(value)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise IntegrationError(f"malformed result manifest: {exc}") from exc
+    required = {"schema_version", "task_id", "final_codex_status", "repository_path",
+                "baseline_branch", "baseline_head", "origin_main_head", "feature_branch",
+                "feature_head", "changed_files", "commits_created", "tests",
+                "git_diff_check", "secret_scan", "deployment_contract"}
+    missing = sorted(required - data.keys())
+    if missing:
+        raise IntegrationError("result manifest missing fields: " + ", ".join(missing))
+    if data["schema_version"] != SCHEMA_VERSION:
+        raise IntegrationError(f"unsupported result manifest schema: {data['schema_version']}")
+    return path, data
+
+
+def validate_contract(contract: object, manifest: dict) -> dict:
+    if not isinstance(contract, dict):
+        raise IntegrationError("deployment contract is missing")
+    required = {"schema_version", "expected_baseline", "feature_branch", "allowed_paths",
+                "services", "backups", "migration_checks", "pre_merge_tests",
+                "post_merge_tests", "readiness_checks", "acceptance_checklist", "rollback"}
+    missing = sorted(required - contract.keys())
+    if missing:
+        raise IntegrationError("deployment contract missing fields: " + ", ".join(missing))
+    if contract["schema_version"] != SCHEMA_VERSION:
+        raise IntegrationError("unsupported deployment contract schema")
+    if contract["expected_baseline"] != manifest["baseline_head"]:
+        raise IntegrationError("contract expected baseline differs from result baseline")
+    if contract["feature_branch"] != manifest["feature_branch"]:
+        raise IntegrationError("contract feature branch differs from result feature branch")
+    services = set(contract["services"])
+    refused = sorted(services - SERVICE_ALLOWLIST)
+    if refused:
+        raise IntegrationError("services are not allowlisted: " + ", ".join(refused))
+    allowed = contract["allowed_paths"]
+    if not isinstance(allowed, list) or not allowed:
+        raise IntegrationError("contract allowed_paths must be non-empty")
+    unexpected = [p for p in manifest["changed_files"] if not any(p == a or (a.endswith("/") and p.startswith(a)) for a in allowed)]
+    if unexpected:
+        raise IntegrationError("changed paths outside contract: " + ", ".join(unexpected))
+    return contract
+
+
+def inspect_manifest(manifest: dict, *, expected_repository: Path | None = None) -> dict:
+    repo = Path(manifest["repository_path"]).resolve()
+    if expected_repository and repo != expected_repository.resolve():
+        raise IntegrationError(f"unexpected repository path: {repo}")
+    if not repo.is_dir():
+        raise IntegrationError(f"repository does not exist: {repo}")
+    if manifest["final_codex_status"] != "PASS" or manifest.get("exit_code", 1) != 0:
+        raise IntegrationError("Codex result is not successful")
+    if not manifest["git_diff_check"].get("passed"):
+        raise IntegrationError("required git diff check failed")
+    if not manifest["secret_scan"].get("passed"):
+        raise IntegrationError("required secret scan failed")
+    failed = [x.get("command", "unknown") for x in manifest["tests"] if not x.get("passed")]
+    if failed:
+        raise IntegrationError("required tests failed: " + ", ".join(failed))
+    contract = validate_contract(manifest["deployment_contract"], manifest)
+    branch = git(repo, "branch", "--show-current").stdout.strip()
+    if branch != manifest["baseline_branch"]:
+        raise IntegrationError(f"baseline worktree must be on {manifest['baseline_branch']}, found {branch}")
+    if git(repo, "status", "--porcelain").stdout:
+        raise IntegrationError("baseline worktree is dirty")
+    head = git(repo, "rev-parse", "HEAD").stdout.strip()
+    if head != manifest["baseline_head"]:
+        raise IntegrationError(f"baseline HEAD mismatch: expected {manifest['baseline_head']}, found {head}")
+    origin = git(repo, "rev-parse", "refs/remotes/origin/main")
+    if origin.returncode or origin.stdout.strip() != head:
+        raise IntegrationError("main/origin-main mismatch")
+    feature = git(repo, "rev-parse", f"refs/heads/{manifest['feature_branch']}")
+    if feature.returncode:
+        raise IntegrationError("feature branch is missing")
+    if feature.stdout.strip() != manifest["feature_head"]:
+        raise IntegrationError("feature HEAD mismatch")
+    ancestry = git(repo, "merge-base", "--is-ancestor", head, manifest["feature_head"])
+    if ancestry.returncode:
+        raise IntegrationError("feature branch is not based on accepted baseline")
+    actual_commits = git(repo, "rev-list", "--reverse", f"{head}..{manifest['feature_head']}").stdout.splitlines()
+    recorded = [x["sha"] for x in reversed(manifest["commits_created"])]
+    if actual_commits != recorded:
+        raise IntegrationError("feature branch contains commits not recorded by the result")
+    return {"eligible": True, "repository": str(repo), "head": head,
+            "feature_head": feature.stdout.strip(), "contract": contract}
+
+
+def command_record(command, artifact: Path, *, cwd=None, timeout=300) -> dict:
+    started = now()
+    result = run(command, cwd=cwd, timeout=timeout)
+    output = redact(result.stdout + result.stderr)
+    write_artifact(artifact, output)
+    return {"command": [str(x) for x in command], "started_at": started, "finished_at": now(),
+            "exit_code": result.returncode, "passed": result.returncode == 0,
+            "output_artifact": str(artifact), "bounded_output": bounded(output)}
+
+
+def sqlite_backup(source: Path, destination: Path) -> dict:
+    if not source.is_file():
+        raise IntegrationError(f"SQLite source does not exist: {source}")
+    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    source_connection = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
+    target_connection = sqlite3.connect(destination)
+    try:
+        source_connection.backup(target_connection)
+        row = target_connection.execute("PRAGMA integrity_check").fetchone()
+        if not row or row[0] != "ok":
+            raise IntegrationError(f"SQLite backup integrity check failed: {source}")
+    finally:
+        target_connection.close()
+        source_connection.close()
+    destination.chmod(0o600)
+    return {"kind": "sqlite", "source": str(source), "backup": str(destination),
+            "size": destination.stat().st_size, "sha256": sha256(destination), "integrity_check": "ok"}
+
+
+def config_backup(source: Path, destination: Path) -> dict:
+    if not source.is_file() or source.is_symlink():
+        raise IntegrationError(f"configuration source is not a regular file: {source}")
+    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    shutil.copy2(source, destination)
+    return {"kind": "configuration", "source": str(source), "backup": str(destination),
+            "mode": stat.S_IMODE(source.stat().st_mode), "uid": source.stat().st_uid,
+            "gid": source.stat().st_gid, "size": destination.stat().st_size, "sha256": sha256(destination)}
+
+
+def create_backups(contract: dict, backup_dir: Path) -> list[dict]:
+    records = []
+    for item in contract["backups"].get("sqlite", []):
+        source = Path(item).resolve()
+        unique = hashlib.sha256(str(source).encode()).hexdigest()[:12]
+        records.append(sqlite_backup(source, backup_dir / "sqlite" / f"{unique}-{source.name}.backup"))
+    for item in contract["backups"].get("configuration", []):
+        source = Path(item).resolve()
+        unique = hashlib.sha256(str(source).encode()).hexdigest()[:12]
+        records.append(config_backup(source, backup_dir / "configuration" / f"{unique}-{source.name}"))
+    return records
+
+
+def validate_migrations(contract: dict, backups: list[dict], run_dir: Path) -> list[dict]:
+    results = []
+    sqlite_backups = {x["source"]: x["backup"] for x in backups if x["kind"] == "sqlite"}
+    for index, check in enumerate(contract["migration_checks"]):
+        source = str(Path(check["database"]).resolve())
+        if source not in sqlite_backups:
+            raise IntegrationError(f"migration database was not backed up: {source}")
+        disposable = run_dir / "migration-copies" / f"{index}.sqlite"
+        disposable.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(sqlite_backups[source], disposable)
+        env = os.environ.copy(); env[check.get("database_env", "KVEN_MIGRATION_DATABASE")] = str(disposable)
+        attempts = 2 if check.get("idempotent", True) else 1
+        executions = []
+        for attempt in range(attempts):
+            command = check["command"]
+            result = subprocess.run(command, cwd=check.get("cwd"), env=env, text=True,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    timeout=check.get("timeout", 300))
+            artifact = run_dir / "migration-logs" / f"{index}-{attempt + 1}.log"
+            write_artifact(artifact, redact(result.stdout + result.stderr))
+            executions.append({"exit_code": result.returncode, "artifact": str(artifact)})
+            if result.returncode:
+                raise IntegrationError(f"migration validation failed; see {artifact}")
+        connection = sqlite3.connect(disposable)
+        try:
+            integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
+            for sql in check.get("verification_sql", []):
+                connection.execute(sql).fetchall()
+            connection.execute("BEGIN")
+            connection.execute("CREATE TEMP TABLE kven_integration_smoke(value INTEGER)")
+            connection.execute("INSERT INTO kven_integration_smoke VALUES (1)")
+            connection.rollback()
+        finally:
+            connection.close()
+        if integrity != "ok":
+            raise IntegrationError("migrated disposable database failed integrity check")
+        results.append({"database": source, "copy": str(disposable), "attempts": executions,
+                        "integrity_check": integrity, "application_smoke": "passed"})
+    return results
+
+
+def run_checks(items: list, run_dir: Path, category: str, *, cwd: Path) -> list[dict]:
+    records = []
+    for index, item in enumerate(items):
+        command = item["command"] if isinstance(item, dict) else item
+        timeout = item.get("timeout", 300) if isinstance(item, dict) else 300
+        record = command_record(command, run_dir / "logs" / f"{category}-{index}.log", cwd=cwd, timeout=timeout)
+        records.append(record)
+        if not record["passed"]:
+            raise IntegrationError(f"{category} command failed; see {record['output_artifact']}")
+    return records
+
+
+def service_action(service_manager: list[str], action: str, service: str, *, timeout=60):
+    if service not in SERVICE_ALLOWLIST:
+        raise IntegrationError(f"service is not allowlisted: {service}")
+    result = run((*service_manager, action, service), timeout=timeout)
+    if result.returncode:
+        raise IntegrationError(f"service {action} failed for {service}: {bounded(result.stderr or result.stdout)}")
+    return result
+
+
+def restore_backups(records: list[dict]) -> None:
+    for record in records:
+        source, backup = Path(record["source"]), Path(record["backup"])
+        temporary = source.with_name(source.name + ".kven-restore")
+        shutil.copy2(backup, temporary)
+        if record["kind"] == "configuration":
+            os.chmod(temporary, record["mode"])
+            try: os.chown(temporary, record["uid"], record["gid"])
+            except PermissionError: pass
+        os.replace(temporary, source)
+
+
+def run_id(task_id: str) -> str:
+    safe = re.sub(r"[^a-z0-9]+", "-", task_id.lower()).strip("-")
+    return f"{safe}-{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
+
+
+def summary(run_dir: Path, state: dict) -> None:
+    commands = state.get("commands", {})
+    text = f"""# Integration result: {state['task_id']}
+
+Status: **{state['status']}**
+Run ID: `{state['run_id']}`
+
+## Acceptance
+
+{chr(10).join(f'- {x}' for x in state.get('acceptance_checklist', [])) or '- No manual steps declared.'}
+
+Finalize after PASS:
+
+```bash
+{commands.get('finalize', '')}
+```
+
+Rollback after FAIL:
+
+```bash
+{commands.get('rollback', '')}
+```
+"""
+    write_artifact(run_dir / "integration-summary.md", text)
+
+
+def load_run(value: str) -> tuple[Path, dict]:
+    path = Path(value).resolve()
+    if path.is_dir(): path = path / "integration-manifest.json"
+    if not path.is_file(): raise IntegrationError(f"integration run not found: {path}")
+    return path.parent, json.loads(path.read_text(encoding="utf-8"))
+
+
+def rollback_state(run_dir: Path, state: dict, reason: str) -> dict:
+    repo = Path(state["repository"])
+    current = git(repo, "rev-parse", "HEAD").stdout.strip()
+    allowed = {state["baseline_head"], state.get("staged_head")}
+    if current not in allowed:
+        raise IntegrationError("refusing rollback: repository HEAD changed unexpectedly")
+    for service in reversed(state.get("services", [])):
+        service_action(state["service_manager"], "stop", service)
+    reset = git(repo, "reset", "--hard", state["baseline_head"])
+    if reset.returncode: raise IntegrationError("guarded Git rollback failed")
+    restore_backups(state.get("backups", []))
+    for service in state.get("services", []):
+        service_action(state["service_manager"], "start", service)
+        service_action(state["service_manager"], "is-active", service)
+    state["rollback_readiness"] = run_checks(
+        state.get("readiness_checks", []), run_dir, "rollback-readiness", cwd=repo
+    )
+    state.update({"status": "ROLLED_BACK", "rollback_reason": reason, "rolled_back_at": now()})
+    atomic_json(run_dir / "rollback-result.json", {"status": "passed", "reason": reason, "at": now()})
+    atomic_json(run_dir / "integration-manifest.json", state); summary(run_dir, state)
+    return state
+
+
+def stage(manifest_path: Path, manifest: dict, args) -> tuple[Path, dict]:
+    preflight = inspect_manifest(manifest, expected_repository=Path(args.repository) if args.repository else None)
+    contract, repo = preflight["contract"], Path(preflight["repository"])
+    identifier = run_id(manifest["task_id"])
+    run_dir = Path(args.result_root).resolve() / manifest["task_id"] / identifier
+    backup_dir = Path(args.backup_root).resolve() / identifier
+    run_dir.mkdir(parents=True, mode=0o755); backup_dir.mkdir(parents=True, mode=0o700)
+    state = {"schema_version": SCHEMA_VERSION, "run_id": identifier, "task_id": manifest["task_id"],
+             "status": "INTERNAL_ERROR", "created_at": now(), "repository": str(repo),
+             "source_manifest": str(manifest_path), "baseline_head": manifest["baseline_head"],
+             "feature_head": manifest["feature_head"], "services": contract["services"],
+             "service_manager": args.service_manager, "readiness_checks": contract["readiness_checks"],
+             "acceptance_checklist": contract["acceptance_checklist"],
+             "commands": {"finalize": f"scripts/kven-integrate-task finalize {run_dir} --accept PASS",
+                          "rollback": f"scripts/kven-integrate-task rollback {run_dir}"}}
+    atomic_json(run_dir / "preflight.json", preflight); atomic_json(run_dir / "integration-manifest.json", state)
+    try:
+        state["backups"] = create_backups(contract, backup_dir)
+        atomic_json(run_dir / "backup-manifest.json", state["backups"])
+        state["migration_validation"] = validate_migrations(contract, state["backups"], run_dir)
+        atomic_json(run_dir / "migration-validation.json", state["migration_validation"])
+        state["pre_merge_tests"] = run_checks(contract["pre_merge_tests"], run_dir, "pre-merge", cwd=repo)
+        merge_args = ["merge", "--no-ff", "--no-edit", manifest["feature_branch"]]
+        merge = git(repo, *merge_args)
+        write_artifact(run_dir / "merge.log", merge.stdout + merge.stderr)
+        if merge.returncode:
+            git(repo, "merge", "--abort")
+            raise IntegrationError("local merge failed; no conflict resolution attempted")
+        state["staged_head"] = git(repo, "rev-parse", "HEAD").stdout.strip()
+        state["post_merge_tests"] = run_checks(contract["post_merge_tests"], run_dir, "post-merge", cwd=repo)
+        if contract.get("deployment_steps"):
+            state["deployment_steps"] = run_checks(contract["deployment_steps"], run_dir, "deployment", cwd=repo)
+        state["service_status_before"] = {}
+        state["service_evidence"] = []
+        for service in contract["services"]:
+            before = run((*args.service_manager, "is-active", service))
+            state["service_status_before"][service] = before.stdout.strip() or before.stderr.strip()
+            service_action(args.service_manager, "restart", service, timeout=args.service_timeout)
+            service_action(args.service_manager, "is-active", service, timeout=args.service_timeout)
+            status_record = command_record(
+                (*args.service_manager, "status", service),
+                run_dir / "logs" / f"service-{service}-status.log",
+                timeout=args.service_timeout,
+            )
+            state["service_evidence"].append(status_record)
+            if args.service_manager == ["systemctl"] and shutil.which("journalctl"):
+                log_record = command_record(
+                    ("journalctl", "--unit", service, "--since", state.get("staged_at", state["created_at"]),
+                     "--lines", "100", "--no-pager"),
+                    run_dir / "logs" / f"service-{service}-journal.log",
+                    timeout=args.service_timeout,
+                )
+                state["service_evidence"].append(log_record)
+        state["readiness"] = run_checks(contract["readiness_checks"], run_dir, "readiness", cwd=repo)
+        state.update({"status": "AWAITING_ACCEPTANCE", "staged_at": now()})
+        atomic_json(run_dir / "acceptance-checklist.json", contract["acceptance_checklist"])
+    except Exception as exc:
+        state["failure"] = str(exc); state["status"] = "AUTOMATED_CHECK_FAILED"
+        atomic_json(run_dir / "integration-manifest.json", state)
+        try: rollback_state(run_dir, state, str(exc))
+        except Exception as rollback_exc:
+            state["status"] = "INTERNAL_ERROR"; state["rollback_failure"] = str(rollback_exc)
+    atomic_json(run_dir / "integration-manifest.json", state); summary(run_dir, state)
+    return run_dir, state
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("command", choices=("inspect", "dry-run", "stage", "status", "finalize", "rollback"))
+    parser.add_argument("target")
+    parser.add_argument("--repository")
+    parser.add_argument("--result-root", default=os.environ.get("KVEN_INTEGRATION_RESULT_ROOT", DEFAULT_RESULT_ROOT))
+    parser.add_argument("--backup-root", default=os.environ.get("KVEN_INTEGRATION_BACKUP_ROOT", DEFAULT_BACKUP_ROOT))
+    parser.add_argument("--service-manager", nargs="+", default=["systemctl"])
+    parser.add_argument("--service-timeout", type=int, default=60)
+    parser.add_argument("--accept", choices=("PASS", "FAIL"))
+    parser.add_argument("--notes", default="")
+    return parser.parse_args(argv)
+
+
+def main(argv=None) -> int:
+    args = parse_args(argv)
+    try:
+        if args.command in {"inspect", "dry-run", "stage"}:
+            path, manifest = load_manifest(args.target)
+            report = inspect_manifest(manifest, expected_repository=Path(args.repository) if args.repository else None)
+            if args.command == "inspect": print(json.dumps(report, indent=2, sort_keys=True)); return 0
+            if args.command == "dry-run":
+                contract = report["contract"]
+                print(json.dumps({"dry_run": True, "would_backup": contract["backups"],
+                                  "would_merge": manifest["feature_branch"],
+                                  "would_test": contract["pre_merge_tests"] + contract["post_merge_tests"],
+                                  "would_restart": contract["services"],
+                                  "would_check": contract["readiness_checks"]}, indent=2, sort_keys=True)); return 0
+            run_dir, state = stage(path, manifest, args)
+            print(f"integration result: {run_dir}"); print(f"status: {state['status']}")
+            return 0 if state["status"] == "AWAITING_ACCEPTANCE" else 1
+        run_dir, state = load_run(args.target)
+        if args.command == "status": print(json.dumps(state, indent=2, sort_keys=True)); return 0
+        if args.command == "rollback" or (args.command == "finalize" and args.accept == "FAIL"):
+            rollback_state(run_dir, state, args.notes or "operator requested rollback"); print("status: ROLLED_BACK"); return 0
+        if args.accept != "PASS": raise IntegrationError("finalize requires --accept PASS or --accept FAIL")
+        if state["status"] == "FINALIZED": print("status: FINALIZED (already complete)"); return 0
+        if state["status"] != "AWAITING_ACCEPTANCE": raise IntegrationError("integration is not awaiting acceptance")
+        repo = Path(state["repository"])
+        if git(repo, "status", "--porcelain").stdout or git(repo, "rev-parse", "HEAD").stdout.strip() != state["staged_head"]:
+            raise IntegrationError("repository changed after stage")
+        push = git(repo, "push", "origin", "main")
+        write_artifact(run_dir / "push.log", push.stdout + push.stderr)
+        if push.returncode: raise IntegrationError("push failed; see push.log")
+        origin = git(repo, "rev-parse", "refs/remotes/origin/main").stdout.strip()
+        if origin != state["staged_head"]: raise IntegrationError("origin/main verification failed")
+        state.update({"status": "FINALIZED", "accepted_at": now(), "acceptance_notes": args.notes,
+                      "origin_main": origin, "finalized_at": now()})
+        atomic_json(run_dir / "acceptance-result.json", {"result": "PASS", "notes": args.notes, "at": now()})
+        atomic_json(run_dir / "integration-manifest.json", state); summary(run_dir, state)
+        print("status: FINALIZED"); return 0
+    except (IntegrationError, OSError, KeyError, TypeError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr); return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

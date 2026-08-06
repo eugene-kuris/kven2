@@ -1,0 +1,41 @@
+{
+  "acceptance_checklist": [
+    "Confirm inspect and dry-run report only the declared operations.",
+    "Confirm no production feature behavior changed."
+  ],
+  "allowed_paths": [
+    "AGENTS.md",
+    "deployment-contract.json",
+    "docs/",
+    "scripts/",
+    "test_kven_codex_task.py",
+    "test_kven_integrate_task.py"
+  ],
+  "backups": {
+    "configuration": [],
+    "sqlite": []
+  },
+  "expected_baseline": "91ca8fb8ed1f6aa60c366d032995e03ca9acce54",
+  "feature_branch": "codex/work-kven-ops-002a-20260806T113432Z-990766",
+  "migration_checks": [],
+  "post_merge_tests": [
+    {
+      "command": ["/opt/kven2/venv/bin/python", "-m", "unittest", "discover"],
+      "timeout": 1800
+    }
+  ],
+  "pre_merge_tests": [
+    {
+      "command": ["/opt/kven2/venv/bin/python", "-m", "unittest", "test_kven_codex_task", "test_kven_integrate_task"],
+      "timeout": 600
+    }
+  ],
+  "readiness_checks": [],
+  "rollback": {
+    "restore_backups": true,
+    "restore_git": true,
+    "verify_readiness": true
+  },
+  "schema_version": "1.0",
+  "services": []
+}

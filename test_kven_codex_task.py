@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import json
 
 
 SCRIPT = Path(__file__).parent / "scripts" / "kven-codex-task"
@@ -123,6 +124,11 @@ raise SystemExit(int(os.environ.get('FAKE_CODEX_EXIT','0')))
         package = dirs[0]
         self.assertTrue((package / "final-response.txt").is_file())
         self.assertTrue((package / "service-state.json").is_file())
+        self.assertTrue((package / "result-manifest.json").is_file())
+        self.assertTrue((package / "result-summary.md").is_file())
+        manifest = json.loads((package / "result-manifest.json").read_text())
+        self.assertEqual(manifest["schema_version"], "1.0")
+        self.assertEqual(manifest["final_codex_status"], "PASS")
         self.assertEqual(stat.S_IMODE(package.stat().st_mode), 0o755)
         self.assertTrue(all(stat.S_IMODE(p.stat().st_mode) == 0o644 for p in package.iterdir() if p.is_file()))
         branches = command("git", "-C", str(self.repo), "branch", "--format=%(refname:short)").stdout
