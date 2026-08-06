@@ -79,6 +79,17 @@ class UnitTests(unittest.TestCase):
         self.assertNotIn("synthetic-secret-value", json.dumps(redacted))
         self.assertNotIn("another-secret-value", json.dumps(redacted))
 
+    def test_validation_evidence_directory_is_retry_safe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            contract = {"result_validation_tests": [{
+                "name": "retry-safe", "command": [sys.executable, "-c", "pass"], "timeout": 30,
+            }]}
+            first = runner.run_validation_tests(contract, root, root / "result")
+            second = runner.run_validation_tests(contract, root, root / "result")
+            self.assertTrue(first[0]["passed"])
+            self.assertTrue(second[0]["passed"])
+
 
 class IntegrationTests(unittest.TestCase):
     def setUp(self):

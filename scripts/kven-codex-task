@@ -172,7 +172,7 @@ def validation_commands(contract: object) -> list[dict]:
 def run_validation_tests(contract: object, worktree: Path, result_dir: Path) -> list[dict]:
     records = []
     artifact_dir = result_dir / "test-artifacts"
-    artifact_dir.mkdir(mode=0o755)
+    artifact_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
     for index, item in enumerate(validation_commands(contract)):
         started = dt.datetime.now(dt.timezone.utc)
         monotonic = time.monotonic()
