@@ -91,6 +91,21 @@ class UnitTests(unittest.TestCase):
             self.assertTrue(first[0]["passed"])
             self.assertTrue(second[0]["passed"])
 
+    def test_canonical_contract_includes_optional_empty_deployment_steps(self):
+        command = {"command": [sys.executable, "-c", "pass"]}
+        contract = {
+            "schema_version": "2.0", "expected_baseline": "0" * 40,
+            "feature_branch": "feature", "allowed_paths": ["feature.txt"], "services": [],
+            "backups": {"sqlite": [], "configuration": []}, "migration_checks": [],
+            "result_validation_tests": [command], "pre_merge_tests": [command],
+            "post_merge_tests": [command], "readiness_checks": [], "fatal_log_checks": [],
+            "acceptance_checklist": ["Synthetic acceptance"],
+            "rollback": {"restore_git": True, "restore_backups": True, "verify_readiness": True},
+        }
+        normalized, digest = runner.canonical_contract(contract)
+        self.assertEqual(normalized["deployment_steps"], [])
+        self.assertEqual(len(digest), 64)
+
     def test_runtime_model_reasoning_and_token_header_parsing(self):
         stderr = """OpenAI Codex v0.test
 --------

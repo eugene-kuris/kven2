@@ -324,6 +324,7 @@ def canonical_contract(contract: object) -> tuple[dict, str]:
     if not all(value is True for value in contract["rollback"].values()):
         raise RunnerError("deployment contract rollback safety is disabled")
     normalized = json.loads(json.dumps(contract))
+    normalized.setdefault("deployment_steps", [])
     for field in ("result_validation_tests", "pre_merge_tests", "post_merge_tests", "readiness_checks", "fatal_log_checks", "deployment_steps"):
         items = normalized.get(field, [])
         if not isinstance(items, list) or (field in {"result_validation_tests", "pre_merge_tests", "post_merge_tests"} and not items):
