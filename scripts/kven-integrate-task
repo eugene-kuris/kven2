@@ -350,8 +350,8 @@ def validate_manifest_types(data: object) -> dict:
     if data["requested_model"] is not None and not _is_string(data["requested_model"]):
         raise IntegrationError("requested_model must be null or a non-empty string")
     if not all(_is_string(data[field]) for field in (
-        "actual_runtime_model", "actual_runtime_provider", "actual_reasoning_effort", "runtime_session_id",
-    )):
+        "actual_runtime_model", "actual_runtime_provider", "actual_reasoning_effort",
+    )) or (data["runtime_session_id"] is not None and not _is_string(data["runtime_session_id"])):
         raise IntegrationError("actual runtime startup metadata is required")
     if data["requested_model"] is not None and data["requested_model"] != data["actual_runtime_model"]:
         raise IntegrationError("requested and actual runtime model conflict")
