@@ -454,6 +454,7 @@ class TelegramStore:
 
     @staticmethod
     def _migrate_relationship_rows(connection: sqlite3.Connection) -> None:
+        TelegramStore._backfill_update_metadata(connection)
         connection.execute(
             """INSERT OR IGNORE INTO telegram_streams(chat_id, user_id)
                SELECT DISTINCT chat_id, user_id FROM telegram_updates"""
@@ -478,6 +479,76 @@ class TelegramStore:
                    WHERE j.update_id = telegram_messages.source_update_id)
                WHERE stream_id IS NULL"""
         )
+        connection.execute(
+            """UPDATE telegram_messages
+               SET telegram_date = (
+                       SELECT COALESCE(
+                           telegram_messages.telegram_date,
+                           u.message_date
+                       )
+                       FROM telegram_updates AS u
+                       WHERE u.update_id = telegram_messages.source_update_id
+                   ),
+                   reply_to_message_id = (
+                       SELECT COALESCE(
+                           telegram_messages.reply_to_message_id,
+                           u.reply_to_message_id
+                       )
+                       FROM telegram_updates AS u
+                       WHERE u.update_id = telegram_messages.source_update_id
+                   )
+               WHERE role = 'user'
+                 AND (telegram_date IS NULL OR reply_to_message_id IS NULL)"""
+        )
+
+    @staticmethod
+    def _backfill_update_metadata(connection: sqlite3.Connection) -> None:
+        rows = connection.execute(
+            """SELECT update_id, message_id, raw_json
+               FROM telegram_updates
+               WHERE message_date IS NULL OR reply_to_message_id IS NULL"""
+        ).fetchall()
+        for row in rows:
+            try:
+                raw = json.loads(str(row["raw_json"]))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(raw, dict):
+                continue
+            message = raw.get("message")
+            if not isinstance(message, dict):
+                message = raw.get("edited_message")
+            if not isinstance(message, dict):
+                continue
+            raw_message_id = message.get("message_id")
+            if (
+                not isinstance(raw_message_id, int)
+                or isinstance(raw_message_id, bool)
+                or raw_message_id != int(row["message_id"])
+            ):
+                continue
+            message_date = message.get("date")
+            if (
+                not isinstance(message_date, int)
+                or isinstance(message_date, bool)
+                or message_date < 0
+            ):
+                message_date = None
+            reply = message.get("reply_to_message")
+            reply_id = reply.get("message_id") if isinstance(reply, dict) else None
+            if (
+                not isinstance(reply_id, int)
+                or isinstance(reply_id, bool)
+                or reply_id <= 0
+            ):
+                reply_id = None
+            connection.execute(
+                """UPDATE telegram_updates
+                   SET message_date = COALESCE(message_date, ?),
+                       reply_to_message_id = COALESCE(reply_to_message_id, ?)
+                   WHERE update_id = ?""",
+                (message_date, reply_id, row["update_id"]),
+            )
 
     @staticmethod
     def _advance_offset_sync(
@@ -1376,13 +1447,27 @@ class TelegramStore:
                 reply_id = row["reply_to_message_id"]
                 if row["source_update_id"] in batch_ids and reply_id is not None:
                     referenced = connection.execute(
-                        """SELECT id, role, content, source_update_id,
-                                  telegram_message_id, created_at, telegram_date,
-                                  reply_to_message_id
-                           FROM telegram_messages
-                           WHERE stream_id = ? AND telegram_message_id = ?
-                           ORDER BY id LIMIT 1""",
-                        (job.stream_id, reply_id),
+                        """SELECT m.id, m.role, m.content, m.source_update_id,
+                                  m.telegram_message_id, m.created_at,
+                                  m.telegram_date, m.reply_to_message_id
+                           FROM telegram_messages AS m
+                           WHERE m.stream_id = ?
+                             AND (
+                                 m.telegram_message_id = ?
+                                 OR (
+                                     m.role = 'assistant'
+                                     AND EXISTS (
+                                         SELECT 1
+                                         FROM telegram_jobs AS j
+                                         JOIN telegram_delivery_chunks AS c
+                                           ON c.job_id = j.id
+                                         WHERE j.update_id = m.source_update_id
+                                           AND c.telegram_message_id = ?
+                                     )
+                                 )
+                             )
+                           ORDER BY m.id LIMIT 1""",
+                        (job.stream_id, reply_id, reply_id),
                     ).fetchone()
                     if referenced is not None:
                         references[int(referenced["id"])] = referenced
@@ -1414,7 +1499,15 @@ class TelegramStore:
         for row_id, row in sorted(references.items()):
             if row_id not in included_ids:
                 output.append(project(row, referenced=True))
-        output.extend(project(row) for row in current)
+        for row in current:
+            metadata = project(row)["content"].split("\n", 1)[0]
+            output.append(
+                {
+                    "role": "system",
+                    "content": f"Telegram transport metadata for the next user message: {metadata}",
+                }
+            )
+            output.append({"role": "user", "content": str(row["content"])})
         return output
 
     def _recover_incomplete_jobs_sync(
