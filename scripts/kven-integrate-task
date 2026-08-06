@@ -315,8 +315,11 @@ def repository_state(repo: Path) -> dict:
     branch = require_git(repo, "branch", "--show-current")
     head = require_git(repo, "rev-parse", "HEAD")
     status = require_git(repo, "status", "--porcelain=v1", "--untracked-files=all")
-    index_tree = require_git(repo, "write-tree")
-    return {"branch": branch, "head": head, "index_tree": index_tree, "status": status}
+    index = git(repo, "ls-files", "--stage", "-z")
+    if index.returncode:
+        raise IntegrationError("cannot fingerprint repository index")
+    index_fingerprint = hashlib.sha256(index.stdout.encode("utf-8", errors="surrogateescape")).hexdigest()
+    return {"branch": branch, "head": head, "index_tree": index_fingerprint, "status": status}
 
 
 def verify_feature_worktree(manifest: dict) -> dict:
@@ -785,9 +788,9 @@ def rollback_state(run_dir: Path, state: dict, reason: str, *, marker: Path | No
     state["service_status_after_rollback"] = restore_service_states(state, run_dir, contract, args)
     final = repository_state(repo)
     origin = require_git(repo, "rev-parse", "refs/remotes/origin/main")
-    expected_final = {"branch": state["baseline_branch"], "head": state["baseline_head"],
-                      "index_tree": require_git(repo, "rev-parse", f"{state['baseline_head']}^{{tree}}"), "status": ""}
-    if final != expected_final or origin != state["baseline_head"]:
+    index_clean = git(repo, "diff", "--cached", "--quiet").returncode == 0
+    if (final["branch"] != state["baseline_branch"] or final["head"] != state["baseline_head"]
+            or final["status"] or not index_clean or origin != state["baseline_head"]):
         raise IntegrationError("post-rollback Git verification failed")
     state.update({"status": "ROLLED_BACK", "phase": "COMPLETE", "rollback_reason": reason,
                   "rolled_back_at": now(), "expected_repository_state": final})

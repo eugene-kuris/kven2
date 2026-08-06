@@ -243,11 +243,13 @@ class RepositoryFixture(unittest.TestCase):
 
     def test_dry_run_is_read_only(self):
         before = integration.repository_state(self.repo)
+        objects_before = cmd("git", "-C", str(self.repo), "count-objects", "-v").stdout
         result = cmd(sys.executable, str(SCRIPT), "dry-run", str(self.path), "--repository", str(self.repo))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('"dry_run": true', result.stdout)
         self.assertIn(self.feature, result.stdout)
         self.assertEqual(before, integration.repository_state(self.repo))
+        self.assertEqual(objects_before, cmd("git", "-C", str(self.repo), "count-objects", "-v").stdout)
 
     def test_end_to_end_stage_record_no_push_rollback(self):
         result = self.stage_cli()
