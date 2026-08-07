@@ -1033,6 +1033,16 @@ def main(argv=None, stdin=None) -> int:
             post_errors.append("feature-worktree-not-clean")
         if not commits.stdout.strip():
             post_errors.append("no-feature-commit")
+        if correction_context:
+            correction_commits = git(
+                worktree, "rev-list", "--count",
+                f"{correction_context['previous_feature_sha']}..{feature_head_before_validation}",
+                check=False,
+            )
+            if (feature_head_before_validation == correction_context["previous_feature_sha"]
+                    or correction_commits.returncode
+                    or correction_commits.stdout.strip() == "0"):
+                post_errors.append("correction-created-no-new-commit")
         if git(worktree, "branch", "--show-current", check=False).stdout.strip() != branch:
             post_errors.append("unexpected-feature-branch")
         if runtime_metadata["actual_model"] is None:

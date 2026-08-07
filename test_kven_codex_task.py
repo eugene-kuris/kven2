@@ -189,9 +189,10 @@ contract={'schema_version':'2.0','expected_baseline':base,'feature_branch':branc
  'readiness_checks':[],'fatal_log_checks':[],'acceptance_checklist':['Synthetic acceptance'],
  'rollback':{'restore_git':True,'restore_backups':True,'verify_readiness':True}}
 if os.environ.get('CONTRACT_LITERAL'): contract['result_validation_tests'][0]['command'] += ['--'+'token', os.environ['CONTRACT_LITERAL']]
-(work/'deployment-contract.json').write_text(json.dumps(contract))
-subprocess.run(['git','add','agent.txt','deployment-contract.json'],cwd=work,check=True)
-subprocess.run(['git','-c','user.name=Test','-c','user.email=test@example.invalid','commit','-m','agent work'],cwd=work,check=True,stdout=subprocess.DEVNULL)
+if not os.environ.get('NO_CORRECTION_COMMIT'):
+ (work/'deployment-contract.json').write_text(json.dumps(contract))
+ subprocess.run(['git','add','agent.txt','deployment-contract.json'],cwd=work,check=True)
+ subprocess.run(['git','-c','user.name=Test','-c','user.email=test@example.invalid','commit','-m','agent work'],cwd=work,check=True,stdout=subprocess.DEVNULL)
 if os.environ.get('DIRTY_CONTRACT_AFTER_COMMIT'): (work/'deployment-contract.json').write_text(json.dumps(contract)+' ')
 head=subprocess.run(['git','-C',str(work),'rev-parse','HEAD'],text=True,stdout=subprocess.PIPE,check=True).stdout.strip()
 commit={'sha':head,'subject':'agent work'}; changed=['agent.txt','deployment-contract.json']
@@ -406,6 +407,33 @@ raise SystemExit(int(os.environ.get('FAKE_CODEX_EXIT','0')))
         text = runner.read_task(str(path))
         self.assertEqual(runner.task_sha256(str(path), text), __import__("hashlib").sha256(raw).hexdigest())
         self.assertEqual(runner.task_sha256("-", text), __import__("hashlib").sha256(text.encode()).hexdigest())
+
+    def test_correction_requires_commit_after_previous_feature_sha(self):
+        self.assertEqual(self.invoke().returncode, 0)
+        package = next(self.results.glob("demo-*"))
+        manifest = json.loads((package / "result-manifest.json").read_text())
+        finding = {
+            "schema_version": "1.0", "task_id": "DEMO", "findings": [{
+                "finding_id": "REV-016", "severity": "major", "status": "open",
+                "claim_or_requirement": "new correction commit", "observed": "none",
+                "evidence": ["fixture"], "required_correction": "commit",
+                "must_preserve": ["history"], "verification_required": ["test"],
+                "expected_behavior": "new commit", "suspected_component": "runner",
+                "reproduction_exists": "yes", "required_regression_test": "test",
+                "reviewer_confidence": "high"
+            }], "reviewed_run": {"feature_sha": manifest["feature_head"],
+                                  "result_package": str(package)}
+        }
+        source = Path(self.temp.name) / "noop-findings.json"
+        source.write_text(json.dumps(finding), encoding="utf-8")
+        env = self.env.copy(); env["NO_CORRECTION_COMMIT"] = "1"
+        result = self.invoke(
+            "--previous-result", str(package), "--previous-feature-sha", manifest["feature_head"],
+            "--review-findings", str(source), "--no-resume", env=env,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        correction = max(self.results.glob("demo-*"), key=lambda item: item.stat().st_mtime_ns)
+        self.assertIn("correction-created-no-new-commit", (correction / "summary.txt").read_text())
 
     def test_malformed_and_unsafe_review_findings_are_rejected(self):
         malformed = Path(self.temp.name) / "malformed.json"; malformed.write_text("{")
