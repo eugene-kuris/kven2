@@ -65,8 +65,10 @@ class HandoffValidationTests(unittest.TestCase):
     def test_evidence_scanner_ignores_safe_examples_but_rejects_real_material(self):
         self.assertEqual(evidence_security.detect_line('api_key=[REDACTED]'), [])
         self.assertEqual(evidence_security.detect_line('handoff-secret tests'), [])
+        self.assertEqual(evidence_security.detect_line('the bearer token is supplied by an environment variable'), [])
         self.assertIn("credential_assignment", evidence_security.detect_line('api_' + 'key=' + 'realvalue123456'))
         self.assertIn("credential_option_value", evidence_security.detect_line('--' + 'token realvalue123456'))
+        self.assertIn("bearer_value", evidence_security.detect_line('Bearer realvalue123456'))
 
     def test_valid_and_explicit_empty_lists(self):
         self.assertEqual(validate(valid_handoff())["known_weak_points"], [])
