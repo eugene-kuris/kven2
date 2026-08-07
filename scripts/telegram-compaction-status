@@ -1,0 +1,34 @@
+#!/opt/kven2/venv/bin/python
+"""Print content-free Telegram checkpoint status from a database."""
+import argparse
+import json
+import sqlite3
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("database")
+    args = parser.parse_args()
+    connection = sqlite3.connect(f"file:{args.database}?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    try:
+        rows = connection.execute("""
+            SELECT s.id AS stream_id, c.id AS checkpoint_id,
+                   c.coverage_start_id, c.coverage_end_id, c.status,
+                   c.validation_status, c.token_count, c.retry_count,
+                   c.failure_code
+            FROM telegram_streams s
+            LEFT JOIN telegram_compaction_checkpoints c ON c.id = (
+                SELECT id FROM telegram_compaction_checkpoints x
+                WHERE x.stream_id=s.id ORDER BY x.id DESC LIMIT 1)
+            ORDER BY s.id
+        """).fetchall()
+        print(json.dumps([{key: row[key] for key in row.keys()} for row in rows],
+                         sort_keys=True, separators=(",", ":")))
+    finally:
+        connection.close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

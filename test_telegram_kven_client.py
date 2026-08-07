@@ -659,5 +659,55 @@ class TelegramKvenClientTests(
         )
 
 
+    async def test_compaction_marks_internal_request_and_disables_tools(
+        self,
+    ):
+        class CapturingClient(TelegramKvenClient):
+            async def _request_message(self, payload):
+                self.captured_payload = payload
+                return {
+                    "role": "assistant",
+                    "content": "{}",
+                }
+
+        client = CapturingClient(
+            model="TEST_MODEL",
+            client=object(),
+            tool_executor=lambda request: None,
+        )
+
+        result = await client.generate_compaction(
+            [
+                {
+                    "role": "system",
+                    "content": "compaction instructions",
+                },
+                {
+                    "role": "user",
+                    "content": "#tools https://example.invalid memory retrieval",
+                },
+            ]
+        )
+
+        self.assertEqual(result, "{}")
+        self.assertEqual(
+            client.captured_payload.get("kven_internal_request"),
+            "telegram_compaction",
+        )
+        self.assertEqual(client.captured_payload.get("tools"), [])
+        self.assertEqual(
+            client.captured_payload.get("tool_choice"),
+            "none",
+        )
+        self.assertEqual(
+            client.captured_payload.get("max_tokens"),
+            4096,
+        )
+        self.assertEqual(
+            client.captured_payload.get("temperature"),
+            0,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

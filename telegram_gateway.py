@@ -29,6 +29,10 @@ DEFAULT_TELEGRAM_IDLE_DELAY = 0.1
 DEFAULT_TELEGRAM_ERROR_DELAY = 5.0
 DEFAULT_TELEGRAM_BATCH_DEBOUNCE = 1.5
 DEFAULT_TELEGRAM_EXACT_TAIL_TOKENS = 4096
+DEFAULT_TELEGRAM_COMPACTION_TRIGGER_TOKENS = 8192
+DEFAULT_TELEGRAM_COMPACTION_TAIL_RESERVE = 4096
+DEFAULT_TELEGRAM_COMPACTION_TARGET_TOKENS = 1536
+DEFAULT_TELEGRAM_COMPACTION_MIN_ENTRIES = 4
 DEFAULT_TELEGRAM_LOG_LEVEL = "INFO"
 
 _ALLOWED_LOG_LEVELS = {
@@ -59,6 +63,11 @@ class TelegramGatewayConfig:
     )
     batch_debounce_seconds: float = DEFAULT_TELEGRAM_BATCH_DEBOUNCE
     exact_tail_token_budget: int = DEFAULT_TELEGRAM_EXACT_TAIL_TOKENS
+    compaction_enabled: bool = True
+    compaction_trigger_token_threshold: int = DEFAULT_TELEGRAM_COMPACTION_TRIGGER_TOKENS
+    compaction_exact_tail_reserve: int = DEFAULT_TELEGRAM_COMPACTION_TAIL_RESERVE
+    compaction_target_token_budget: int = DEFAULT_TELEGRAM_COMPACTION_TARGET_TOKENS
+    compaction_min_entries: int = DEFAULT_TELEGRAM_COMPACTION_MIN_ENTRIES
     log_level: str = DEFAULT_TELEGRAM_LOG_LEVEL
 
     def __repr__(self) -> str:
@@ -76,6 +85,11 @@ class TelegramGatewayConfig:
             f"error_delay={self.error_delay!r}, "
             f"batch_debounce_seconds={self.batch_debounce_seconds!r}, "
             f"exact_tail_token_budget={self.exact_tail_token_budget!r}, "
+            f"compaction_enabled={self.compaction_enabled!r}, "
+            f"compaction_trigger_token_threshold={self.compaction_trigger_token_threshold!r}, "
+            f"compaction_exact_tail_reserve={self.compaction_exact_tail_reserve!r}, "
+            f"compaction_target_token_budget={self.compaction_target_token_budget!r}, "
+            f"compaction_min_entries={self.compaction_min_entries!r}, "
             f"log_level={self.log_level!r}"
             ")"
         )
@@ -201,6 +215,18 @@ def _finite_float(
     return value
 
 
+def _boolean(environment: Mapping[str, str], name: str, *, default: bool) -> bool:
+    raw = environment.get(name)
+    if raw is None:
+        return default
+    value = str(raw).strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Environment variable must be a boolean: {name}")
+
+
 def load_telegram_gateway_config(
     environ: Mapping[str, str] | None = None,
 ) -> TelegramGatewayConfig:
@@ -267,6 +293,11 @@ def load_telegram_gateway_config(
         "TELEGRAM_EXACT_TAIL_TOKEN_BUDGET",
         default=DEFAULT_TELEGRAM_EXACT_TAIL_TOKENS,
     )
+    compaction_enabled = _boolean(environment, "TELEGRAM_COMPACTION_ENABLED", default=True)
+    compaction_trigger_token_threshold = _positive_integer(environment, "TELEGRAM_COMPACTION_TRIGGER_TOKEN_THRESHOLD", default=DEFAULT_TELEGRAM_COMPACTION_TRIGGER_TOKENS)
+    compaction_exact_tail_reserve = _positive_integer(environment, "TELEGRAM_COMPACTION_EXACT_TAIL_RESERVE", default=DEFAULT_TELEGRAM_COMPACTION_TAIL_RESERVE)
+    compaction_target_token_budget = _positive_integer(environment, "TELEGRAM_COMPACTION_TARGET_TOKEN_BUDGET", default=DEFAULT_TELEGRAM_COMPACTION_TARGET_TOKENS)
+    compaction_min_entries = _positive_integer(environment, "TELEGRAM_COMPACTION_MIN_ENTRIES", default=DEFAULT_TELEGRAM_COMPACTION_MIN_ENTRIES)
     log_level = _optional_text(
         environment,
         "TELEGRAM_LOG_LEVEL",
@@ -291,6 +322,11 @@ def load_telegram_gateway_config(
         error_delay=error_delay,
         batch_debounce_seconds=batch_debounce_seconds,
         exact_tail_token_budget=exact_tail_token_budget,
+        compaction_enabled=compaction_enabled,
+        compaction_trigger_token_threshold=compaction_trigger_token_threshold,
+        compaction_exact_tail_reserve=compaction_exact_tail_reserve,
+        compaction_target_token_budget=compaction_target_token_budget,
+        compaction_min_entries=compaction_min_entries,
         log_level=log_level,
     )
 
@@ -320,6 +356,11 @@ def build_telegram_gateway_runtime(
             exact_tail_token_budget=(
                 config.exact_tail_token_budget
             ),
+            compaction_enabled=config.compaction_enabled,
+            compaction_trigger_token_threshold=config.compaction_trigger_token_threshold,
+            compaction_exact_tail_reserve=config.compaction_exact_tail_reserve,
+            compaction_target_token_budget=config.compaction_target_token_budget,
+            compaction_min_entries=config.compaction_min_entries,
         )
     else:
         store = store_factory(config.db_path)

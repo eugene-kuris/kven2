@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from typing import Any, Protocol
 
 from telegram_store import (
@@ -39,6 +41,8 @@ class KvenReplyClient(Protocol):
         ...
 
 
+logger = logging.getLogger(__name__)
+
 async def run_generation_once(
     store: GenerationStore,
     kven_client: KvenReplyClient,
@@ -46,7 +50,29 @@ async def run_generation_once(
     job = await store.claim_next_job()
 
     if job is None:
-        return False
+        claim = getattr(store, "claim_next_compaction", None)
+        if claim is None:
+            return False
+        compaction = await claim()
+        if compaction is None:
+            return False
+        try:
+            generator = getattr(kven_client, "generate_compaction", kven_client.generate_reply)
+            raw = await generator(compaction.messages)
+            await store.complete_compaction(
+                compaction.checkpoint_id, raw,
+                model_id=getattr(kven_client, "_model", None),
+            )
+        except Exception as exc:
+            logger.warning(
+                "[TELEGRAM_COMPACTION] status=failed checkpoint_id=%s "
+                "error_type=%s error=%s",
+                compaction.checkpoint_id,
+                type(exc).__name__,
+                str(exc),
+            )
+            await store.fail_compaction(compaction.checkpoint_id, exc)
+        return True
 
     context_builder = getattr(store, "build_generation_context", None)
     if context_builder is not None:

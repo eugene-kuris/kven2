@@ -5457,7 +5457,14 @@ async def handle_chat(request: Request):
         logger.info("[ROUTE] >>> Incoming request to /chat/completions")
         logger.info(f"[ROUTE_VERSION] {ROUTES_TOOLS_PROBE_VERSION}")
         body = await request.json()
-        _debug_log_incoming_payload(body)
+        internal_kven_request = body.pop("kven_internal_request", None)
+        if internal_kven_request == "telegram_compaction":
+            logger.info(
+                "[KVEN_INTERNAL] kind=telegram_compaction "
+                "payload_debug_suppressed=True"
+            )
+        else:
+            _debug_log_incoming_payload(body)
 
         # OWUI is the read-only library layer. Remove only mutation tools from
         # the model-visible catalogue; Knowledge and memory read tools remain.
@@ -5490,29 +5497,45 @@ async def handle_chat(request: Request):
         )
         tool_loop_log_incoming_tool_request(body)
 
-        # Detect and sanitize OWUI RAG before native tool routing. OWUI 0.10.2
-        # advertises its full tools catalog on ordinary Knowledge/RAG requests;
-        # `tools` alone therefore cannot mean "bypass all Kven context".
-        write_path_messages, owui_rag_meta = _sanitize_messages_for_write_path(messages)
-        if owui_rag_meta.get("detected"):
-            logger.info(
-                "[OWUI_RAG_CONTEXT] detected=True rag_message_indices=%s source_count=%s "
-                "sources=%s original_chars=%s sanitized_chars=%s "
-                "tool_protocol_messages_removed=%s",
-                owui_rag_meta.get("rag_message_indices"),
-                owui_rag_meta.get("source_count"),
-                _json_preview(owui_rag_meta.get("sources"), limit=1200),
-                owui_rag_meta.get("original_chars"),
-                owui_rag_meta.get("sanitized_chars"),
-                owui_rag_meta.get("tool_protocol_messages_removed", 0),
-            )
+        # Telegram compaction is a trusted internal generation request.
+        # Its transcript must not enter OWUI RAG detection/logging or any
+        # conversational memory/tool path.
+        if internal_kven_request == "telegram_compaction":
+            write_path_messages = messages
+            owui_rag_meta = {"detected": False}
+        else:
+            # Detect and sanitize OWUI RAG before native tool routing. OWUI 0.10.2
+            # advertises its full tools catalog on ordinary Knowledge/RAG requests;
+            # `tools` alone therefore cannot mean "bypass all Kven context".
+            write_path_messages, owui_rag_meta = _sanitize_messages_for_write_path(messages)
+            if owui_rag_meta.get("detected"):
+                logger.info(
+                    "[OWUI_RAG_CONTEXT] detected=True rag_message_indices=%s source_count=%s "
+                    "sources=%s original_chars=%s sanitized_chars=%s "
+                    "tool_protocol_messages_removed=%s",
+                    owui_rag_meta.get("rag_message_indices"),
+                    owui_rag_meta.get("source_count"),
+                    _json_preview(owui_rag_meta.get("sources"), limit=1200),
+                    owui_rag_meta.get("original_chars"),
+                    owui_rag_meta.get("sanitized_chars"),
+                    owui_rag_meta.get("tool_protocol_messages_removed", 0),
+                )
 
         # Classify OWUI service prompts before native-tool routing. Ordinary
         # user-facing native-tool requests must receive the same Kven profile,
         # semantic/project context and vector retrieval as the normal route.
         # Only OWUI's own title/tag/summary requests remain transparent.
-        internal_request, internal_reason = detect_internal_owui_request(messages)
-        if internal_request and owui_rag_meta.get("detected"):
+        if internal_kven_request == "telegram_compaction":
+            internal_request = True
+            internal_reason = "telegram_compaction"
+        else:
+            internal_request, internal_reason = detect_internal_owui_request(messages)
+
+        if (
+            internal_request
+            and internal_reason != "telegram_compaction"
+            and owui_rag_meta.get("detected")
+        ):
             logger.info(
                 "[OWUI_FILTER] override_internal_false reason=owui_rag_context original_reason=%s",
                 internal_reason,

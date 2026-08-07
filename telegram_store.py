@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import contextmanager
 import json
+import logging
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -13,6 +14,12 @@ from zoneinfo import ZoneInfo
 
 from telegram_bot_api import split_telegram_text
 from context_window import estimate_tokens_from_chars
+from telegram_compaction import (
+    SCHEMA_VERSION, build_prompt, parse_and_validate_payload,
+    render_payload, source_digest,
+)
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -67,6 +74,16 @@ class TelegramDelivery:
         return self.attempts
 
 
+@dataclass(frozen=True)
+class TelegramCompaction:
+    checkpoint_id: int
+    stream_id: int
+    coverage_start_id: int
+    coverage_end_id: int
+    source_digest: str
+    messages: list[dict[str, str]]
+
+
 class TelegramStore:
     def __init__(
         self,
@@ -74,6 +91,11 @@ class TelegramStore:
         *,
         batch_debounce_seconds: float = 0.0,
         exact_tail_token_budget: int = 4096,
+        compaction_enabled: bool = False,
+        compaction_trigger_token_threshold: int = 8192,
+        compaction_exact_tail_reserve: int = 4096,
+        compaction_target_token_budget: int = 1536,
+        compaction_min_entries: int = 4,
     ):
         self.db_path = db_path
         if batch_debounce_seconds < 0:
@@ -87,6 +109,17 @@ class TelegramStore:
             )
         self.batch_debounce_seconds = float(batch_debounce_seconds)
         self.exact_tail_token_budget = int(exact_tail_token_budget)
+        for name, value in (("trigger threshold", compaction_trigger_token_threshold),
+                            ("exact-tail reserve", compaction_exact_tail_reserve),
+                            ("target budget", compaction_target_token_budget),
+                            ("minimum entries", compaction_min_entries)):
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"Telegram compaction {name} must be positive")
+        self.compaction_enabled = bool(compaction_enabled)
+        self.compaction_trigger_token_threshold = compaction_trigger_token_threshold
+        self.compaction_exact_tail_reserve = compaction_exact_tail_reserve
+        self.compaction_target_token_budget = compaction_target_token_budget
+        self.compaction_min_entries = compaction_min_entries
 
     async def init(self) -> None:
         await asyncio.to_thread(self._init_sync)
@@ -210,6 +243,18 @@ class TelegramStore:
         return await asyncio.to_thread(
             self._recover_incomplete_jobs_sync
         )
+
+    async def claim_next_compaction(self) -> TelegramCompaction | None:
+        return await asyncio.to_thread(self._claim_next_compaction_sync)
+
+    async def complete_compaction(self, checkpoint_id: int, raw: str, *, model_id: str | None = None) -> bool:
+        return await asyncio.to_thread(self._complete_compaction_sync, checkpoint_id, raw, model_id)
+
+    async def fail_compaction(self, checkpoint_id: int, error: Exception) -> None:
+        await asyncio.to_thread(self._fail_compaction_sync, checkpoint_id, type(error).__name__)
+
+    async def compaction_status(self) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(self._compaction_status_sync)
 
     @contextmanager
     def _connection(self):
@@ -421,6 +466,36 @@ class TelegramStore:
                     FOREIGN KEY(job_id) REFERENCES telegram_jobs(id),
                     FOREIGN KEY(update_id) REFERENCES telegram_updates(update_id)
                 );
+
+                CREATE TABLE IF NOT EXISTS telegram_compaction_checkpoints (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    stream_id INTEGER NOT NULL,
+                    coverage_start_id INTEGER NOT NULL,
+                    coverage_end_id INTEGER NOT NULL,
+                    source_digest TEXT NOT NULL,
+                    prior_checkpoint_id INTEGER,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                    generated_at TEXT,
+                    activated_at TEXT,
+                    model_id TEXT,
+                    schema_version TEXT NOT NULL,
+                    payload_json TEXT,
+                    token_count INTEGER,
+                    status TEXT NOT NULL CHECK(status IN ('pending','generated','active','rejected','superseded','failed')),
+                    validation_status TEXT NOT NULL DEFAULT 'pending',
+                    superseded_by_id INTEGER,
+                    failure_code TEXT,
+                    retry_count INTEGER NOT NULL DEFAULT 0,
+                    duration_ms INTEGER,
+                    UNIQUE(stream_id, coverage_end_id),
+                    FOREIGN KEY(stream_id) REFERENCES telegram_streams(id),
+                    FOREIGN KEY(prior_checkpoint_id) REFERENCES telegram_compaction_checkpoints(id),
+                    FOREIGN KEY(superseded_by_id) REFERENCES telegram_compaction_checkpoints(id)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_telegram_one_active_checkpoint
+                    ON telegram_compaction_checkpoints(stream_id) WHERE status = 'active';
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_telegram_one_pending_compaction
+                    ON telegram_compaction_checkpoints(stream_id) WHERE status = 'pending';
 
                 """
             )
@@ -1453,6 +1528,10 @@ class TelegramStore:
                 (job.stream_id, cutoff),
             ).fetchall()
             references = {}
+            checkpoint = connection.execute(
+                "SELECT * FROM telegram_compaction_checkpoints WHERE stream_id=? AND status='active' ORDER BY coverage_end_id DESC LIMIT 1",
+                (job.stream_id,),
+            ).fetchone()
             for row in rows:
                 reply_id = row["reply_to_message_id"]
                 if row["source_update_id"] in batch_ids and reply_id is not None:
@@ -1492,7 +1571,8 @@ class TelegramStore:
             return {"role": str(row["role"]), "content": f"{prefix}\n{row['content']}"}
 
         current = [row for row in rows if row["source_update_id"] in batch_ids and row["role"] == "user"]
-        ordinary = [row for row in rows if row not in current and int(row["id"]) not in references]
+        covered_end = int(checkpoint["coverage_end_id"]) if checkpoint is not None else 0
+        ordinary = [row for row in rows if row not in current and int(row["id"]) not in references and int(row["id"]) > covered_end]
         selected = []
         used = sum(estimate_tokens_from_chars(len(project(row)["content"])) for row in current)
         used += sum(estimate_tokens_from_chars(len(project(row, referenced=True)["content"])) for row in references.values())
@@ -1505,7 +1585,12 @@ class TelegramStore:
                 break
         selected.reverse()
         included_ids = {int(row["id"]) for row in selected + current}
-        output = [project(row) for row in selected]
+        output = []
+        if checkpoint is not None:
+            payload = json.loads(str(checkpoint["payload_json"]))
+            compacted, _ = render_payload(payload, self.compaction_target_token_budget)
+            output.append({"role": "system", "content": compacted})
+        output.extend(project(row) for row in selected)
         for row_id, row in sorted(references.items()):
             if row_id not in included_ids:
                 output.append(project(row, referenced=True))
@@ -1519,6 +1604,94 @@ class TelegramStore:
             )
             output.append({"role": "user", "content": str(row["content"])})
         return output
+
+    def _claim_next_compaction_sync(self) -> TelegramCompaction | None:
+        if not self.compaction_enabled:
+            return None
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                stream = connection.execute(
+                    """SELECT s.id FROM telegram_streams s
+                       WHERE NOT EXISTS (SELECT 1 FROM telegram_jobs j WHERE j.stream_id=s.id AND j.status IN ('queued','processing'))
+                         AND NOT EXISTS (SELECT 1 FROM telegram_compaction_checkpoints c WHERE c.stream_id=s.id AND c.status='pending')
+                       ORDER BY s.id LIMIT 1""").fetchone()
+                if stream is None:
+                    connection.execute("COMMIT"); return None
+                rows = connection.execute(
+                    "SELECT id,role,content,source_update_id FROM telegram_messages WHERE stream_id=? ORDER BY id",
+                    (stream["id"],)).fetchall()
+                total = sum(estimate_tokens_from_chars(len(str(row["content"]))) for row in rows)
+                if total < self.compaction_trigger_token_threshold:
+                    connection.execute("COMMIT"); return None
+                reserve = 0; frontier = len(rows)
+                for index in range(len(rows) - 1, -1, -1):
+                    reserve += estimate_tokens_from_chars(len(str(rows[index]["content"])))
+                    if reserve >= self.compaction_exact_tail_reserve:
+                        frontier = index; break
+                prefix = rows[:frontier]
+                if len(prefix) < self.compaction_min_entries:
+                    connection.execute("COMMIT"); return None
+                start_id, end_id = int(prefix[0]["id"]), int(prefix[-1]["id"])
+                digest = source_digest(prefix)
+                prior = connection.execute(
+                    "SELECT id FROM telegram_compaction_checkpoints WHERE stream_id=? AND status='active'",
+                    (stream["id"],)).fetchone()
+                connection.execute(
+                    """INSERT OR IGNORE INTO telegram_compaction_checkpoints
+                       (stream_id,coverage_start_id,coverage_end_id,source_digest,prior_checkpoint_id,schema_version,status)
+                       VALUES(?,?,?,?,?,?, 'pending')""",
+                    (stream["id"], start_id, end_id, digest, prior["id"] if prior else None, SCHEMA_VERSION))
+                connection.execute(
+                    """UPDATE telegram_compaction_checkpoints
+                       SET status='pending',validation_status='pending',failure_code=NULL,
+                           source_digest=?,prior_checkpoint_id=?
+                       WHERE stream_id=? AND coverage_end_id=? AND status IN ('failed','rejected')""",
+                    (digest, prior["id"] if prior else None, stream["id"], end_id))
+                row = connection.execute(
+                    "SELECT id FROM telegram_compaction_checkpoints WHERE stream_id=? AND coverage_end_id=? AND status='pending'",
+                    (stream["id"], end_id)).fetchone()
+                connection.execute("COMMIT")
+                if row is None: return None
+                return TelegramCompaction(int(row["id"]), int(stream["id"]), start_id, end_id, digest, build_prompt(prefix))
+            except Exception:
+                connection.execute("ROLLBACK"); raise
+
+    def _complete_compaction_sync(self, checkpoint_id: int, raw: str, model_id: str | None) -> bool:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                cp = connection.execute("SELECT * FROM telegram_compaction_checkpoints WHERE id=?", (checkpoint_id,)).fetchone()
+                if cp is None: raise KeyError(f"Telegram checkpoint not found: {checkpoint_id}")
+                if cp["status"] == "active": connection.execute("COMMIT"); return True
+                if cp["status"] != "pending": connection.execute("COMMIT"); return False
+                rows = connection.execute(
+                    "SELECT id,role,content,source_update_id FROM telegram_messages WHERE stream_id=? AND id BETWEEN ? AND ? ORDER BY id",
+                    (cp["stream_id"], cp["coverage_start_id"], cp["coverage_end_id"])).fetchall()
+                expected_ids = [int(row["id"]) for row in rows]
+                if (not expected_ids or expected_ids[0] != int(cp["coverage_start_id"])
+                        or expected_ids[-1] != int(cp["coverage_end_id"])
+                        or source_digest(rows) != cp["source_digest"]):
+                    raise ValueError("compaction source digest or contiguous coverage mismatch")
+                payload = parse_and_validate_payload(raw, set(expected_ids))
+                rendered, tokens = render_payload(payload, self.compaction_target_token_budget)
+                if not rendered.strip(): raise ValueError("compaction rendered payload is empty")
+                connection.execute("UPDATE telegram_compaction_checkpoints SET status='superseded',superseded_by_id=? WHERE stream_id=? AND status='active'", (checkpoint_id, cp["stream_id"]))
+                connection.execute(
+                    """UPDATE telegram_compaction_checkpoints SET status='active',validation_status='valid',payload_json=?,token_count=?,model_id=?,generated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'),activated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?""",
+                    (json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")), tokens, model_id, checkpoint_id))
+                connection.execute("COMMIT"); return True
+            except Exception:
+                connection.execute("ROLLBACK"); raise
+
+    def _fail_compaction_sync(self, checkpoint_id: int, failure_code: str) -> None:
+        with self._connection() as connection:
+            connection.execute("UPDATE telegram_compaction_checkpoints SET status='failed',validation_status='invalid',failure_code=?,retry_count=retry_count+1 WHERE id=? AND status='pending'", (failure_code[:80], checkpoint_id))
+
+    def _compaction_status_sync(self) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute("""SELECT s.id AS stream_id,c.id AS checkpoint_id,c.coverage_start_id,c.coverage_end_id,c.status,c.validation_status,c.token_count,c.retry_count,c.failure_code FROM telegram_streams s LEFT JOIN telegram_compaction_checkpoints c ON c.id=(SELECT id FROM telegram_compaction_checkpoints x WHERE x.stream_id=s.id ORDER BY x.id DESC LIMIT 1) ORDER BY s.id""").fetchall()
+        return [{key: row[key] for key in row.keys()} for row in rows]
 
     def _recover_incomplete_jobs_sync(
         self,
@@ -1548,6 +1721,9 @@ class TelegramStore:
                         )
                     WHERE status = 'processing'
                     """
+                )
+                compaction_cursor = connection.execute(
+                    "UPDATE telegram_compaction_checkpoints SET status='failed',validation_status='interrupted',failure_code='restart',retry_count=retry_count+1 WHERE status='pending'"
                 )
 
                 connection.execute(
@@ -1579,6 +1755,7 @@ class TelegramStore:
                 recovered = (
                     int(generation_cursor.rowcount)
                     + delivery_jobs
+                    + int(compaction_cursor.rowcount)
                 )
 
                 connection.execute("COMMIT")

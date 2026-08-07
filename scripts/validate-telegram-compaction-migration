@@ -1,0 +1,32 @@
+#!/opt/kven2/venv/bin/python
+"""Apply and verify the Telegram schema on an integration-provided copy."""
+import asyncio
+import os
+import sqlite3
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from telegram_store import TelegramStore
+
+
+async def run() -> None:
+    path = os.environ["KVEN_TELEGRAM_MIGRATION_DB"]
+    store = TelegramStore(path)
+    await store.init()
+    await store.init()
+    connection = sqlite3.connect(path)
+    try:
+        if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            raise RuntimeError("SQLite integrity check failed")
+        names = {row[0] for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        if "telegram_compaction_checkpoints" not in names:
+            raise RuntimeError("checkpoint schema missing")
+    finally:
+        connection.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(run())

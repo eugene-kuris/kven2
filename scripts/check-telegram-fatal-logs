@@ -1,0 +1,16 @@
+#!/opt/kven2/venv/bin/python
+"""Fail on recent priority 0..3 gateway logs without printing log text."""
+import subprocess
+
+
+result = subprocess.run(
+    ["journalctl", "-u", "kven2-telegram-gateway.service", "--since",
+     "-2 minutes", "--priority", "0..3", "--no-pager", "--quiet"],
+    check=False, capture_output=True, text=True, timeout=25,
+)
+if result.returncode != 0:
+    print("telegram fatal-log query failed")
+    raise SystemExit(2)
+lines = sum(1 for line in result.stdout.splitlines() if line.strip())
+print(f"telegram_recent_fatal_log_lines={lines}")
+raise SystemExit(1 if lines else 0)
