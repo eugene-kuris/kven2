@@ -92,6 +92,12 @@ def read_task(source: str, stdin=None) -> str:
     return text
 
 
+def task_sha256(source: str, text: str) -> str:
+    """Hash exact file bytes; stdin is defined as the UTF-8 encoding of its text."""
+    raw = text.encode("utf-8") if source == "-" else Path(source).read_bytes()
+    return hashlib.sha256(raw).hexdigest()
+
+
 def run(command, *, cwd=None, input_text=None, check=True):
     completed = subprocess.run(
         [str(item) for item in command], cwd=cwd, input=input_text, text=True,
@@ -131,17 +137,68 @@ def load_correction_context(previous_result: Path, *, task: str, task_path: str,
     package = previous_result.resolve(strict=True)
     if previous_result.is_symlink() or not package.is_dir() or str(package).startswith("/agent/data/"):
         raise RunnerError("unsafe previous result path")
-    manifest = load_json(package / "result-manifest.json", "previous result manifest")
     handoff = load_json(package / "handoff-to-reviewer.json", "previous developer handoff")
+    manifest_path = package / "result-manifest.json"
+    prior_context_path = package / "reviewer-context.json"
+    if manifest_path.is_file():
+        manifest = load_json(manifest_path, "previous result manifest")
+        prior_context = (validate_reviewer_context(load_json(prior_context_path, "previous reviewer context"))
+                         if prior_context_path.is_file() else {})
+        source_kind = "result-manifest"
+    else:
+        if not prior_context_path.is_file() or prior_context_path.is_symlink():
+            raise RunnerError("bootstrap previous result requires reviewer-context.json")
+        try:
+            prior_context = validate_reviewer_context(
+                load_json(prior_context_path, "previous reviewer context")
+            )
+        except HandoffError as exc:
+            raise RunnerError(str(exc)) from exc
+        required = ("feature_branch", "feature_sha", "worktree", "commit_list", "test_results",
+                    "review_status", "codex_run_id", "original_task_sha256")
+        if any(prior_context.get(field) in (None, "") for field in required):
+            raise RunnerError("bootstrap reviewer context has incomplete lineage or evidence")
+        manifest = {
+            "feature_head": prior_context["feature_sha"],
+            "feature_branch": prior_context["feature_branch"],
+            "worktree_path": prior_context["worktree"],
+            "commits_created": prior_context["commit_list"],
+            "tests": prior_context["test_results"],
+            "final_codex_status": prior_context["review_status"],
+            "runtime_session_id": prior_context.get("codex_session_id_if_available"),
+        }
+        source_kind = "bootstrap-reviewer-context"
     identity = handoff.get("task_identity", {})
     task_id = task_id_from(task, task_path)
     if findings.get("task_id") != task_id or identity.get("task_id") != task_id:
         raise RunnerError("task, findings, and previous handoff identity mismatch")
+    if identity.get("result_package") != str(package):
+        raise RunnerError("previous handoff result package mismatch")
+    if source_kind == "bootstrap-reviewer-context":
+        if (prior_context["task_id"] != task_id
+                or prior_context["feature_branch"] != identity.get("feature_branch")
+                or prior_context["feature_sha"] != identity.get("feature_head")
+                or prior_context["worktree"] != manifest["worktree_path"]):
+            raise RunnerError("bootstrap reviewer context and handoff disagree")
+        markdown_path = package / "handoff-to-reviewer.md"
+        if not markdown_path.is_file() or markdown_path.is_symlink():
+            raise RunnerError("bootstrap previous result requires handoff-to-reviewer.md")
+        try:
+            validate_handoff(
+                handoff, markdown_path.read_text(encoding="utf-8"), task_id=task_id,
+                baseline=prior_context["baseline_sha"], branch=prior_context["feature_branch"],
+                feature_head=prior_context["feature_sha"], commits=prior_context["commit_list"],
+                changed_files=prior_context["changed_paths"], result_package=str(package),
+            )
+        except HandoffError as exc:
+            raise RunnerError(f"invalid bootstrap handoff: {exc}") from exc
     if manifest.get("feature_head") != previous_feature_sha or identity.get("feature_head") != previous_feature_sha:
         raise RunnerError("previous result feature SHA is stale or incorrect")
     reviewed = findings.get("reviewed_run", {})
     if reviewed and reviewed.get("feature_sha") != previous_feature_sha:
         raise RunnerError("review findings reference a stale feature SHA")
+    if reviewed.get("result_package") not in (None, str(package)):
+        raise RunnerError("review findings reference a different previous result")
     branch = manifest.get("feature_branch")
     worktree = Path(manifest.get("worktree_path", "")).resolve()
     if not branch or not worktree.is_dir():
@@ -153,9 +210,7 @@ def load_correction_context(previous_result: Path, *, task: str, task_path: str,
         raise RunnerError("correction worktree is not at the reviewed SHA")
     if repository_state(worktree)["status"]:
         raise RunnerError("correction worktree must be clean")
-    prior_context_path = package / "reviewer-context.json"
-    prior_context = load_json(prior_context_path, "previous reviewer context") if prior_context_path.is_file() else {}
-    task_digest = hashlib.sha256(task.encode("utf-8")).hexdigest()
+    task_digest = task_sha256(task_path, task)
     recorded_digest = prior_context.get("original_task_sha256")
     if recorded_digest is not None and recorded_digest != task_digest:
         raise RunnerError("original task hash differs from previous reviewer context")
@@ -181,6 +236,7 @@ def load_correction_context(previous_result: Path, *, task: str, task_path: str,
         "previous_handoff": handoff,
         "review_findings": findings,
         "previous_session_id": manifest.get("runtime_session_id"),
+        "previous_result_source": source_kind,
     }
 
 
@@ -1038,7 +1094,7 @@ def main(argv=None, stdin=None) -> int:
                     reviewer_context = make_reviewer_context(
                         artifact_context, manifest, handoff_data,
                         task_path=str(Path(args.task_file).resolve()) if args.task_file != "-" else "stdin",
-                        task_sha256=hashlib.sha256(task.encode("utf-8")).hexdigest(),
+                        task_sha256=task_sha256(args.task_file, task),
                     )
                     _json_result(result_dir / "reviewer-context.json", reviewer_context)
                     review_status = make_review_status(artifact_context, manifest)
@@ -1060,7 +1116,7 @@ def main(argv=None, stdin=None) -> int:
                     reviewer_context = make_reviewer_context(
                         artifact_context, manifest, handoff_data,
                         task_path=str(Path(args.task_file).resolve()) if args.task_file != "-" else "stdin",
-                        task_sha256=hashlib.sha256(task.encode("utf-8")).hexdigest(),
+                        task_sha256=task_sha256(args.task_file, task),
                     )
                     _json_result(result_dir / "reviewer-context.json", reviewer_context)
                     review_status = make_review_status(artifact_context, manifest)
@@ -1071,8 +1127,25 @@ def main(argv=None, stdin=None) -> int:
                     evidence_secret_scan = scan_tree(result_dir)
                     if not evidence_secret_scan["passed"]:
                         manifest["evidence_secret_scan"] = evidence_secret_scan
+                        exit_code = exit_code or 1
+                        manifest["exit_code"] = exit_code
                         manifest["final_codex_status"] = "FAIL"
+                        manifest["summary"] = "result evidence secret scan failed"
+                        write_result(result_dir / "exit-code.txt", f"{exit_code}\n")
+                        write_result(result_dir / "summary.txt", manifest["summary"] + "\n")
                         _json_result(result_dir / "result-manifest.json", manifest)
+                        write_result(result_dir / "result-summary.md", make_result_summary(manifest))
+                        reviewer_context = make_reviewer_context(
+                            artifact_context, manifest, handoff_data,
+                            task_path=str(Path(args.task_file).resolve()) if args.task_file != "-" else "stdin",
+                            task_sha256=task_sha256(args.task_file, task),
+                        )
+                        _json_result(result_dir / "reviewer-context.json", reviewer_context)
+                        review_status = make_review_status(artifact_context, manifest)
+                        _json_result(result_dir / "review-status.json", review_status)
+                        write_result(result_dir / "chatgpt-review-bundle.md", render_review_bundle(
+                            manifest, handoff_data, review_status, artifact_context.get("delta")
+                        ))
             except (OSError, HandoffError) as exc:
                 print(f"error: result-package failure: {exc}", file=sys.stderr)
                 exit_code = 1

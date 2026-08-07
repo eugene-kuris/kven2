@@ -70,6 +70,13 @@ class HandoffValidationTests(unittest.TestCase):
         self.assertIn("credential_option_value", evidence_security.detect_line('--' + 'token realvalue123456'))
         self.assertIn("bearer_value", evidence_security.detect_line('Bear' + 'er realvalue123456'))
 
+    def test_safe_sentinels_are_exact_not_substrings(self):
+        for value in ("[REDACTED]", "placeholder", "synthetic-non-secret"):
+            self.assertEqual(evidence_security.detect_line("pass" + "word=" + value), [])
+        for value in ("exampleActualSecret123", "redactedButRealLooking123"):
+            self.assertIn("credential_assignment", evidence_security.detect_line("pass" + "word=" + value))
+        self.assertIn("bearer_value", evidence_security.detect_line("Bear" + "er documentationXYZ"))
+
     def test_valid_and_explicit_empty_lists(self):
         self.assertEqual(validate(valid_handoff())["known_weak_points"], [])
         for section in ("existing_architecture_reused", "runtime_path_changes",

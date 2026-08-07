@@ -29,6 +29,24 @@ _PRIVATE_BEGIN = re.compile(r"(?i)-----" + r"BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
 _PRIVATE_BLOCK = re.compile(
     r"(?is)-----" + r"BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----"
 )
+_SAFE_VALUES = {
+    "[redacted]", "<redacted>", "redacted", "placeholder", "example",
+    "synthetic-non-secret", "fixture-non-secret",
+}
+
+
+def _safe_value(category: str, match: re.Match[str], text: str) -> bool:
+    if category == "private_key_marker":
+        return False
+    value = match.group(2 if category in {"credential_option_value", "authorization_header", "bearer_value"} else 3)
+    normalized = value.strip("'\".,;:(){}").lower()
+    if normalized in _SAFE_VALUES:
+        return True
+    if category == "bearer_value" and normalized == "token" and re.search(
+            r"(?i)\b(?:the|a)\s+bearer\s+token\s+(?:is|value)\b", text):
+        return True
+    # Source-level detector assertions describe syntax but never exempt arbitrary values.
+    return "detect_line(" in text and normalized in _SAFE_VALUES
 
 
 def detect_line(text: str) -> list[str]:
@@ -43,16 +61,7 @@ def detect_line(text: str) -> list[str]:
     )
     for category, pattern in checks:
         matches = list(pattern.finditer(text))
-        safe_only = bool(matches) and all(
-            any(marker in match.group(0).lower() for marker in (
-                "[redacted]", "redacted", "placeholder", "example", "synthetic-non-secret",
-                "fixture-non-secret",
-            ))
-            or (category == "bearer_value" and re.sub(r"[^a-z]", "", match.group(2).lower())
-                in {"token", "value", "credential", "material", "detection", "lines", "documentation"})
-            or "detect_line(" in text
-            for match in matches
-        )
+        safe_only = bool(matches) and all(_safe_value(category, match, text) for match in matches)
         if matches and not safe_only and category not in categories:
             categories.append(category)
     return categories

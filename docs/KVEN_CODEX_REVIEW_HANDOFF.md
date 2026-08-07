@@ -73,6 +73,18 @@ fallback. `correction_results` must map every supplied finding exactly once to r
 cause, correction, changed files/symbols, tests, verification, remaining risk,
 and `FIXED`, `PARTIAL`, `NOT_FIXED`, or `REJECTED_WITH_REASON` status.
 
+The canonical source is `result-manifest.json`. A bootstrap correction package
+created while this capability was introduced may omit that manifest only when it
+has a schema-valid `reviewer-context.json` and matching complete JSON/Markdown
+handoff. The runner validates the package path, task digest, branch, worktree,
+feature SHA, commits, changed paths, tests, decisions, requirements, review state,
+and live Git before execution. Missing or conflicting facts fail closed; none are
+guessed. The new `correction-context.json` records `previous_result_source` as
+either `result-manifest` or `bootstrap-reviewer-context`.
+
+File-backed task SHA-256 values cover the exact bytes on disk, including CRLF.
+For stdin, the canonical bytes are the UTF-8 encoding of the received text.
+
 Every correction also produces `delta-handoff.json` and Markdown. The delta
 binds the previous run/SHA and new SHA, changed paths, tests added/run, preserved
 decisions, invalidated assumptions, deployment/migration/restart deltas, new
@@ -95,6 +107,11 @@ scripts/kven-review-handoff RESULT status --json
 Status reports run number, before/after SHA, runtime/tokens, commits/tests,
 received/closed/open findings, latest handoff/bundle, resumability, and final
 evidence-scan result.
+
+If either evidence scan changes the final outcome, the runner rewrites the
+manifest, result summary, reviewer context, review status, standalone bundle,
+exit code, and plain summary to FAIL before returning. A terminal scan therefore
+cannot leave a stale PASS claim on another status surface.
 
 ## Roles and workflow
 

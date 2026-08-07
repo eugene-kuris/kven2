@@ -336,16 +336,76 @@ raise SystemExit(int(os.environ.get('FAKE_CODEX_EXIT','0')))
             "reviewer_confidence": "high"}],
             "reviewed_run": {"feature_sha": manifest["feature_head"]}}
         task = "TASK ID: DEMO\nDo work\n"
+        task_path = Path(self.temp.name) / "task.txt"
         context = runner.load_correction_context(
-            package, task=task, task_path="/task.md", findings=findings,
+            package, task=task, task_path=str(task_path), findings=findings,
             previous_feature_sha=manifest["feature_head"], repository=self.repo,
         )
         self.assertEqual(context["original_task_sha256"], __import__("hashlib").sha256(task.encode()).hexdigest())
         self.assertEqual(context["previous_feature_sha"], manifest["feature_head"])
         self.assertEqual(context["previous_requirement_map"][0]["requirement_id"], "REQ-1")
         with self.assertRaisesRegex(runner.RunnerError, "stale or incorrect"):
-            runner.load_correction_context(package, task=task, task_path="/task.md", findings=findings,
+            runner.load_correction_context(package, task=task, task_path=str(task_path), findings=findings,
                                            previous_feature_sha="0" * 40, repository=self.repo)
+
+    def test_bootstrap_context_without_manifest_is_fail_closed_and_immutable(self):
+        self.assertEqual(self.invoke().returncode, 0)
+        package = next(self.results.glob("demo-*"))
+        manifest = json.loads((package / "result-manifest.json").read_text())
+        findings = {"schema_version": "1.0", "task_id": "DEMO", "findings": [],
+                    "reviewed_run": {"feature_sha": manifest["feature_head"],
+                                     "result_package": str(package)}}
+        (package / "result-manifest.json").unlink()
+        before = {p.name: p.read_bytes() for p in package.iterdir() if p.is_file()}
+        context = runner.load_correction_context(
+            package, task="TASK ID: DEMO\nDo work\n", task_path=str(Path(self.temp.name) / "task.txt"),
+            findings=findings, previous_feature_sha=manifest["feature_head"], repository=self.repo,
+        )
+        self.assertEqual(context["previous_result_source"], "bootstrap-reviewer-context")
+        self.assertEqual(context["previous_test_evidence"], json.loads(
+            (package / "reviewer-context.json").read_text())["test_results"])
+        self.assertEqual(before, {p.name: p.read_bytes() for p in package.iterdir() if p.is_file()})
+        context_path = package / "reviewer-context.json"
+        valid_context = json.loads(context_path.read_text())
+        for field, value, message in (
+            ("feature_branch", "wrong-branch", "disagree"),
+            ("original_task_sha256", "0" * 64, "hash differs"),
+        ):
+            broken = dict(valid_context); broken[field] = value
+            context_path.write_text(json.dumps(broken), encoding="utf-8")
+            with self.assertRaisesRegex(runner.RunnerError, message):
+                runner.load_correction_context(
+                    package, task="TASK ID: DEMO\nDo work\n",
+                    task_path=str(Path(self.temp.name) / "task.txt"), findings=findings,
+                    previous_feature_sha=manifest["feature_head"], repository=self.repo)
+        context_path.write_text(json.dumps(valid_context), encoding="utf-8")
+        saved = context_path.read_bytes()
+        context_path.unlink()
+        with self.assertRaisesRegex(runner.RunnerError, "requires reviewer-context"):
+            runner.load_correction_context(
+                package, task="TASK ID: DEMO\nDo work\n", task_path=str(Path(self.temp.name) / "task.txt"),
+                findings=findings, previous_feature_sha=manifest["feature_head"], repository=self.repo)
+        context_path.write_bytes(saved)
+        findings_path = Path(self.temp.name) / "bootstrap-findings.json"
+        findings_path.write_text(json.dumps(findings), encoding="utf-8")
+        correction = self.invoke(
+            "--previous-result", str(package), "--previous-feature-sha", manifest["feature_head"],
+            "--review-findings", str(findings_path), "--no-resume",
+        )
+        # The synthetic agent's contract deliberately assumes a fresh branch, but the
+        # ordinary runner must still reconstruct context before invoking that agent.
+        self.assertNotEqual(correction.returncode, 0)
+        new_package = max(self.results.glob("demo-*"), key=lambda item: item.stat().st_mtime_ns)
+        generated = json.loads((new_package / "correction-context.json").read_text())
+        self.assertEqual(generated["previous_result_source"], "bootstrap-reviewer-context")
+
+    def test_task_sha256_uses_exact_crlf_file_bytes(self):
+        path = Path(self.temp.name) / "crlf.task.md"
+        raw = b"TASK ID: DEMO\r\nDo work\r\n"
+        path.write_bytes(raw)
+        text = runner.read_task(str(path))
+        self.assertEqual(runner.task_sha256(str(path), text), __import__("hashlib").sha256(raw).hexdigest())
+        self.assertEqual(runner.task_sha256("-", text), __import__("hashlib").sha256(text.encode()).hexdigest())
 
     def test_malformed_and_unsafe_review_findings_are_rejected(self):
         malformed = Path(self.temp.name) / "malformed.json"; malformed.write_text("{")
