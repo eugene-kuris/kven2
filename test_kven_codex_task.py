@@ -192,6 +192,21 @@ if os.environ.get('CONTRACT_LITERAL'): contract['result_validation_tests'][0]['c
 subprocess.run(['git','add','agent.txt','deployment-contract.json'],cwd=work,check=True)
 subprocess.run(['git','-c','user.name=Test','-c','user.email=test@example.invalid','commit','-m','agent work'],cwd=work,check=True,stdout=subprocess.DEVNULL)
 if os.environ.get('DIRTY_CONTRACT_AFTER_COMMIT'): (work/'deployment-contract.json').write_text(json.dumps(contract)+' ')
+head=subprocess.run(['git','-C',str(work),'rev-parse','HEAD'],text=True,stdout=subprocess.PIPE,check=True).stdout.strip()
+commit={'sha':head,'subject':'agent work'}; changed=['agent.txt','deployment-contract.json']
+handoff={'schema_version':'1.0','task_identity':{'task_id':'DEMO','task_title':'Synthetic task','baseline_sha':base,'feature_branch':branch,'feature_head':head,'commits':[commit],'result_package':str(out.parent),'codex_model':os.environ.get('ACTUAL_MODEL') or 'unit-model','started_at':'2026-01-01T00:00:00Z','finished_at':'2026-01-01T00:00:01Z'},
+ 'task_understood_as':{'implementation':'Synthetic runner fixture','why':'Exercise packaging','non_goals':[],'constraints_preserved':[]},
+ 'implementation_map':[{'path':p,'why_changed':'Synthetic evidence','symbols':['fixture'],'responsibility':'Runner test fixture','interaction':'Test only','requirement_ids':['REQ-1']} for p in changed],
+ 'important_design_decisions':[],'rejected_alternatives':[],'architecture_deviations':{'status':'none','reason':'Not applicable','consequence':'None','approval_required':False},'data_schema_migration_changes':[],'runtime_behavior_changed':[],'existing_behavior_intentionally_preserved':[],'known_weak_points':[],'uncertainties':[],
+ 'requirement_evidence_map':[{'requirement_id':'REQ-1','requirement':'Synthetic success','implementation_locations':['agent.txt'],'exact_test_names':['synthetic-validation'],'log_result_artifact':'test-artifacts/01-synthetic-validation.log','result':'PASS','notes':'fixture'}],
+ 'tests':[],'exact_git_state':{'baseline':base,'commits':[commit],'feature_head':head,'changed_files':changed,'diff_check':'passed','worktree_status':'clean','feature_worktree_clean':True},'recommended_reviewer_checks':[],'do_not_spend_time_rediscovering':[],'unresolved_issues':[],'correction_routing_metadata':{'requirement_ids':['REQ-1'],'decision_ids':[],'implementation_area_ids':[]}}
+if os.environ.get('HANDOFF_SECRET'): handoff['unresolved_issues']=[os.environ['HANDOFF_SECRET']]
+if (out.parent/'review-findings.json').is_file():
+ findings=json.loads((out.parent/'review-findings.json').read_text())
+ handoff['correction_results']=[{'finding_id':f['finding_id'],'root_cause':'fixture cause','exact_correction':'fixture fix','files_symbols_changed':['agent.txt:fixture'],'tests_added_run':['synthetic-validation'],'verification_result':'PASS','remaining_risk':'none','status':'FIXED'} for f in findings['findings']]
+mode=os.environ.get('HANDOFF_MODE','valid')
+if mode!='missing-json': (out.parent/'handoff-to-reviewer.json').write_text('{' if mode=='malformed-json' else json.dumps(handoff))
+if mode!='missing-markdown': (out.parent/'handoff-to-reviewer.md').write_text('# DEMO reviewer handoff\\n\\nFeature HEAD: '+(('0'*40) if mode=='wrong-markdown' else head)+'\\n')
 out.write_text('final report --'+'token '+os.environ['CONTRACT_LITERAL'] if os.environ.get('CONTRACT_LITERAL') else 'final report')
 model=os.environ.get('ACTUAL_MODEL') or (args[args.index('--model')+1] if '--model' in args else 'default-fixture-model')
 print('fake stdout'+((' --'+'token '+os.environ['CONTRACT_LITERAL']) if os.environ.get('CONTRACT_LITERAL') else ''))
@@ -229,9 +244,11 @@ raise SystemExit(int(os.environ.get('FAKE_CODEX_EXIT','0')))
         self.assertTrue((package / "service-state.json").is_file())
         self.assertTrue((package / "result-manifest.json").is_file())
         self.assertTrue((package / "result-summary.md").is_file())
+        self.assertTrue((package / "handoff-to-reviewer.json").is_file())
         manifest = json.loads((package / "result-manifest.json").read_text())
         self.assertEqual(manifest["schema_version"], "2.0")
         self.assertEqual(manifest["final_codex_status"], "PASS")
+        self.assertTrue(manifest["reviewer_handoff"]["passed"])
         self.assertEqual(len(manifest["tests"]), 1)
         record = manifest["tests"][0]
         self.assertTrue(record["passed"])
@@ -263,6 +280,44 @@ raise SystemExit(int(os.environ.get('FAKE_CODEX_EXIT','0')))
         self.assertEqual(len(list(self.worktrees.glob("demo-*"))), 1)
         prompt = next(self.worktrees.glob("demo-*")) / "agent.txt"
         self.assertIn("Network access is prohibited", prompt.read_text(encoding="utf-8"))
+        self.assertIn("handoff-to-reviewer.json", prompt.read_text(encoding="utf-8"))
+
+    def test_missing_malformed_and_disagreeing_handoffs_fail(self):
+        for mode in ("missing-json", "missing-markdown", "malformed-json", "wrong-markdown"):
+            with self.subTest(mode=mode):
+                env = self.env.copy(); env["HANDOFF_MODE"] = mode
+                result = self.invoke(env=env)
+                self.assertNotEqual(result.returncode, 0)
+                package = sorted(self.results.glob("demo-*"))[-1]
+                manifest = json.loads((package / "result-manifest.json").read_text())
+                self.assertFalse(manifest["reviewer_handoff"]["passed"])
+
+    def test_review_findings_are_copied_prompted_preserved_and_corrected(self):
+        findings = {"schema_version": "1.0", "task_id": "DEMO", "findings": [{
+            "finding_id": "REV-001", "severity": "major", "status": "open",
+            "claim_or_requirement": "REQ-1", "observed": "problem", "evidence": ["agent.txt"],
+            "required_correction": "fix", "must_preserve": ["existing behavior"],
+            "verification_required": ["synthetic-validation"]}]}
+        source = Path(self.temp.name) / "review-findings.json"
+        original = json.dumps(findings, sort_keys=True); source.write_text(original, encoding="utf-8")
+        result = self.invoke("--review-findings", str(source))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(source.read_text(encoding="utf-8"), original)
+        package = next(self.results.glob("demo-*"))
+        self.assertEqual(json.loads((package / "review-findings.json").read_text()), findings)
+        prompt = (next(self.worktrees.glob("demo-*")) / "agent.txt").read_text()
+        self.assertIn("REV-001", prompt); self.assertIn("existing behavior", prompt)
+        rendered = json.loads((package / "handoff-to-reviewer.json").read_text())
+        self.assertEqual(rendered["correction_results"][0]["finding_id"], "REV-001")
+
+    def test_malformed_and_unsafe_review_findings_are_rejected(self):
+        malformed = Path(self.temp.name) / "malformed.json"; malformed.write_text("{")
+        result = self.invoke("--review-findings", str(malformed))
+        self.assertNotEqual(result.returncode, 0); self.assertIn("malformed", result.stderr)
+        target = Path(self.temp.name) / "target.json"; target.write_text("{}")
+        unsafe = Path(self.temp.name) / "unsafe.json"; unsafe.symlink_to(target)
+        result = self.invoke("--review-findings", str(unsafe))
+        self.assertNotEqual(result.returncode, 0); self.assertIn("unsafe", result.stderr)
 
     def test_runner_refuses_worktree_contract_different_from_committed_blob(self):
         env = self.env.copy()
@@ -369,6 +424,14 @@ raise SystemExit(int(os.environ.get('FAKE_CODEX_EXIT','0')))
         for path in package.rglob("*"):
             if path.is_file():
                 self.assertNotIn(literal, path.read_text(encoding="utf-8", errors="replace"), str(path))
+
+    def test_secret_like_handoff_content_fails_evidence_scan(self):
+        env = self.env.copy(); env["HANDOFF_SECRET"] = "api_" + "key=" + ("z" * 24)
+        result = self.invoke(env=env)
+        self.assertNotEqual(result.returncode, 0)
+        manifest = json.loads((next(self.results.glob("demo-*")) / "result-manifest.json").read_text())
+        self.assertEqual(manifest["final_codex_status"], "FAIL")
+        self.assertFalse(manifest["evidence_secret_scan"]["passed"])
 
 
 if __name__ == "__main__":

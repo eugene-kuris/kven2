@@ -1,0 +1,59 @@
+#!/usr/bin/env python3
+"""Read a Codex reviewer handoff without modifying its result package."""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from kven_handoff import HandoffError, load_json  # noqa: E402
+
+
+VIEWS = {
+    "summary": ("task_identity", "task_understood_as", "implementation_map", "unresolved_issues"),
+    "recommended-review-checks": ("recommended_reviewer_checks",),
+    "requirement-evidence": ("requirement_evidence_map", "tests"),
+    "uncertainties-weak-points": ("uncertainties", "known_weak_points"),
+    "correction-results": ("correction_results",),
+}
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("result", help="result package directory or handoff-to-reviewer.json")
+    parser.add_argument("view", choices=tuple(VIEWS), nargs="?", default="summary")
+    parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    return parser.parse_args(argv)
+
+
+def selected(data: dict, view: str) -> dict:
+    return {key: data.get(key, []) for key in VIEWS[view]}
+
+
+def main(argv=None) -> int:
+    args = parse_args(argv)
+    path = Path(args.result).resolve()
+    if path.is_dir():
+        path = path / "handoff-to-reviewer.json"
+    try:
+        if path.is_symlink() or not path.is_file():
+            raise HandoffError(f"handoff does not exist or is unsafe: {path}")
+        output = selected(load_json(path, "handoff-to-reviewer.json"), args.view)
+    except (OSError, HandoffError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(output, indent=2, sort_keys=True))
+    else:
+        print(f"# Reviewer handoff: {args.view}\n")
+        for key, value in output.items():
+            print(f"## {key.replace('_', ' ').title()}\n")
+            print(json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

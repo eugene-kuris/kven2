@@ -20,6 +20,10 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from kven_evidence_security import redact as redact_evidence  # noqa: E402
 from kven_evidence_security import scan_git_range, scan_tree  # noqa: E402
+from kven_handoff import (  # noqa: E402
+    HANDOFF_SCHEMA_VERSION, HandoffError, load_json, validate_handoff,
+    validate_review_findings,
+)
 
 DEFAULT_REPOSITORY = Path("/opt/kven2")
 DEFAULT_RESULT_ROOT = Path("/home/eugene/kven-codex-results")
@@ -106,15 +110,29 @@ def make_codex_command(codex: str, worktree: Path, output_file: Path, model: str
     return command
 
 
-def execution_contract(task: str, allow_network: bool) -> str:
+def execution_contract(task: str, allow_network: bool, *, result_dir: Path | None = None,
+                       findings: dict | None = None) -> str:
     network = (
         "Network access is permitted only where the supplied task explicitly requires it."
         if allow_network else
         "Network access is prohibited. Do not use any network-capable command or tool."
     )
+    handoff = ""
+    if result_dir is not None:
+        handoff = f"""
+Before finishing, write schema {HANDOFF_SCHEMA_VERSION} handoff-to-reviewer.json and handoff-to-reviewer.md directly into {result_dir}. JSON is authoritative and Markdown must render the same content, including the task ID and exact feature HEAD. Cover every requirement and every changed file with concrete symbol/test/artifact evidence. Explicitly include empty lists for non-applicable sections. Do not include secrets or protected data.
+"""
+    correction = ""
+    if findings is not None:
+        finding_ids = [item["finding_id"] for item in findings["findings"]]
+        preserve = {item["finding_id"]: item["must_preserve"] for item in findings["findings"]}
+        correction = f"""
+This is a narrow corrective run. Consume the immutable copied findings at {result_dir / 'review-findings.json'}. Address every finding ID exactly once and preserve its must_preserve constraints. The corrective handoff must include correction_results for {json.dumps(finding_ids)}. Preserve constraints: {json.dumps(preserve, sort_keys=True)}.
+"""
     return f"""KVEN II CODEX EXECUTION CONTRACT
 {network}
 Inspect the supplied task and repository baseline before editing. Work only on the already-created feature branch and linked worktree. Test, correct, and commit coherent changes. Do not merge, push, deploy, or restart services unless the supplied task explicitly requires it. Protect /agent/data and secrets. Finish with a structured report containing status, branch, baseline, commits, changed files, tests, service status, protected-data status, secret check, remaining actions, and rollback.
+{handoff}{correction}
 
 SUPPLIED TASK
 {task.rstrip()}
@@ -399,12 +417,14 @@ def make_result_manifest(*, task_id: str, started: dt.datetime, finished: dt.dat
                          diff_check: int, secret_scan: dict, tests: list[dict],
                          contract: object, contract_error: str | None,
                          contract_sha256: str | None, evidence_secret_scan: dict,
-                         feature_head: str) -> dict:
+                         feature_head: str, handoff_validation: dict | None = None,
+                         review_findings: dict | None = None) -> dict:
     changed = git(worktree, "diff", "--name-only", f"{baseline}..{feature_head}", check=False).stdout.splitlines()
     clean = repository_state(worktree)["status"] == "" and repository_state(worktree)["head"] == feature_head
     tests_passed = bool(tests) and all(test.get("passed") is True for test in tests)
     model_matches = actual_model is not None and (requested_model is None or requested_model == actual_model)
-    final_status = "PASS" if exit_code == 0 and clean and diff_check == 0 and not secret_scan["matches"] and tests_passed and model_matches and reasoning_effort is not None else "FAIL"
+    handoff_passed = bool(handoff_validation and handoff_validation.get("passed") is True)
+    final_status = "PASS" if exit_code == 0 and clean and diff_check == 0 and not secret_scan["matches"] and tests_passed and model_matches and reasoning_effort is not None and handoff_passed else "FAIL"
     sty = os.environ.get("STY")
     screen_name = sty.split(".", 1)[1] if sty and "." in sty else sty
     return {
@@ -454,6 +474,8 @@ def make_result_manifest(*, task_id: str, started: dt.datetime, finished: dt.dat
         "deployment_contract_path": "deployment-contract.json",
         "deployment_contract_sha256": contract_sha256,
         "deployment_contract_error": contract_error,
+        "reviewer_handoff": handoff_validation,
+        "review_findings": review_findings,
         "requested_deployment_services": (contract or {}).get("services", []),
         "requested_backup_targets": (contract or {}).get("backups", {}),
         "requested_migration_checks": (contract or {}).get("migration_checks", []),
@@ -476,6 +498,7 @@ def make_result_summary(manifest: dict) -> str:
         and manifest["deployment_contract"] is not None
         and bool(manifest["tests"])
         and all(test.get("passed") is True for test in manifest["tests"])
+        and bool(manifest.get("reviewer_handoff", {}).get("passed"))
     )
     commits = "\n".join(f"- `{item['sha']}` {item['subject']}" for item in manifest["commits_created"]) or "- None"
     changed = "\n".join(f"- `{item}`" for item in manifest["changed_files"]) or "- None"
@@ -488,6 +511,9 @@ Actual runtime model: **{manifest.get('actual_runtime_model') or 'unavailable'}*
 Actual reasoning effort: **{manifest.get('actual_reasoning_effort') or 'unavailable'}**
 Bound deployment contract: **{manifest.get('deployment_contract_path') or 'unavailable'}**
 Contract SHA-256: **{manifest.get('deployment_contract_sha256') or 'unavailable'}**
+Reviewer handoff: **{'valid' if manifest.get('reviewer_handoff', {}).get('passed') else 'invalid'}**
+Handoff JSON: **{manifest.get('reviewer_handoff', {}).get('json_path', 'handoff-to-reviewer.json')}**
+Handoff Markdown: **{manifest.get('reviewer_handoff', {}).get('markdown_path', 'handoff-to-reviewer.md')}**
 
 ## Commits
 
@@ -550,6 +576,7 @@ def parse_args(argv=None):
     parser.add_argument("task_file", help="task prompt file, or - for stdin")
     parser.add_argument("--model", help="model forwarded to Codex")
     parser.add_argument("--allow-network", action="store_true", help="permit only task-required network use")
+    parser.add_argument("--review-findings", help="read-only review-findings.json input for a corrective run")
     return parser.parse_args(argv)
 
 
@@ -575,6 +602,10 @@ def main(argv=None, stdin=None) -> int:
     deployment_contract_error = None
     deployment_contract_sha256 = None
     evidence_secret_scan = {"passed": True, "files_scanned": [], "matches": []}
+    handoff_validation = {"passed": False, "schema_version": HANDOFF_SCHEMA_VERSION,
+                          "json_path": "handoff-to-reviewer.json", "markdown_path": "handoff-to-reviewer.md",
+                          "error": "handoff validation not run"}
+    review_findings = None
     feature_head_before_validation = None
     validation_repository_state = None
     runtime_metadata = {
@@ -619,7 +650,17 @@ def main(argv=None, stdin=None) -> int:
         result_dir.mkdir(parents=True, mode=0o755)
         worktree_root.chmod(0o755)
         result_dir.chmod(0o755)
-        effective = execution_contract(task, args.allow_network)
+        if args.review_findings:
+            source = Path(args.review_findings)
+            resolved = source.resolve(strict=True)
+            if source.is_symlink() or not resolved.is_file() or str(resolved).startswith("/agent/data/"):
+                raise RunnerError("unsafe review findings path")
+            try:
+                review_findings = validate_review_findings(load_json(resolved, "review-findings.json"))
+            except HandoffError as exc:
+                raise RunnerError(str(exc)) from exc
+            _json_result(result_dir / "review-findings.json", review_findings)
+        effective = execution_contract(task, args.allow_network, result_dir=result_dir, findings=review_findings)
         write_result(result_dir / "task.txt", redact_evidence(task))
         write_result(result_dir / "effective-prompt.txt", redact_evidence(effective))
         write_result(result_dir / "task-id.txt", raw_task_id + "\n")
@@ -651,6 +692,28 @@ def main(argv=None, stdin=None) -> int:
         integrity = git(worktree, "diff", "--check", f"{baseline}..{feature_head_before_validation}", check=False)
         integrity_code = integrity.returncode
         secret_scan = obvious_secret_scan(worktree, baseline, feature_head_before_validation)
+        try:
+            handoff_json_path = result_dir / "handoff-to-reviewer.json"
+            handoff_md_path = result_dir / "handoff-to-reviewer.md"
+            if not handoff_json_path.is_file() or handoff_json_path.is_symlink():
+                raise HandoffError("handoff-to-reviewer.json is missing")
+            if not handoff_md_path.is_file() or handoff_md_path.is_symlink():
+                raise HandoffError("handoff-to-reviewer.md is missing")
+            handoff_data = load_json(handoff_json_path, "handoff-to-reviewer.json")
+            validate_handoff(
+                handoff_data, handoff_md_path.read_text(encoding="utf-8"), task_id=raw_task_id,
+                baseline=baseline, branch=branch, feature_head=feature_head_before_validation,
+                commits=_commits(worktree, baseline), changed_files=_changed_files(worktree, baseline),
+                result_package=str(result_dir),
+                finding_ids=[item["finding_id"] for item in review_findings["findings"]] if review_findings else None,
+            )
+            handoff_validation = {
+                "passed": True, "schema_version": HANDOFF_SCHEMA_VERSION,
+                "json_path": "handoff-to-reviewer.json", "markdown_path": "handoff-to-reviewer.md",
+                "error": None,
+            }
+        except (OSError, HandoffError) as exc:
+            handoff_validation["error"] = redact_evidence(str(exc))
         contract_path = worktree / "deployment-contract.json"
         if contract_path.is_file() and not contract_path.is_symlink():
             try:
@@ -700,6 +763,8 @@ def main(argv=None, stdin=None) -> int:
             post_errors.append("validation-tests-failed")
         if deployment_contract_error:
             post_errors.append("deployment-contract-invalid")
+        if not handoff_validation["passed"]:
+            post_errors.append("reviewer-handoff-invalid")
         if validation_repository_state is not None and repository_state(worktree) != validation_repository_state:
             post_errors.append("feature-state-changed-during-validation")
         if final_state.returncode or final_state.stdout.splitlines()[1:]:
@@ -758,13 +823,19 @@ def main(argv=None, stdin=None) -> int:
                         contract_sha256=deployment_contract_sha256,
                         evidence_secret_scan=evidence_secret_scan,
                         feature_head=feature_head_before_validation or git(worktree, "rev-parse", "HEAD", check=False).stdout.strip(),
+                        handoff_validation=handoff_validation, review_findings=review_findings,
                     )
                     _json_result(result_dir / "result-manifest.json", manifest)
                     write_result(result_dir / "result-summary.md", make_result_summary(manifest))
                     evidence_secret_scan = scan_tree(result_dir)
                     manifest["evidence_secret_scan"] = evidence_secret_scan
                     if not evidence_secret_scan["passed"]:
+                        exit_code = exit_code or 1
+                        manifest["exit_code"] = exit_code
                         manifest["final_codex_status"] = "FAIL"
+                        manifest["summary"] = "result evidence secret scan failed"
+                        write_result(result_dir / "exit-code.txt", f"{exit_code}\n")
+                        write_result(result_dir / "summary.txt", manifest["summary"] + "\n")
                     _json_result(result_dir / "result-manifest.json", manifest)
                     write_result(result_dir / "result-summary.md", make_result_summary(manifest))
                     evidence_secret_scan = scan_tree(result_dir)

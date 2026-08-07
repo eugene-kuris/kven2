@@ -337,6 +337,7 @@ def validate_manifest_types(data: object) -> dict:
         "codex_model", "summary", "deployment_contract_error",
         "requested_deployment_services", "requested_backup_targets", "requested_migration_checks",
         "result_package_path", "evidence_provenance", "execution_methodology",
+        "reviewer_handoff", "review_findings",
     })
     if data["schema_version"] != SCHEMA_VERSION:
         raise IntegrationError(f"unsupported result manifest schema: {data['schema_version']}")
@@ -380,6 +381,19 @@ def validate_manifest_types(data: object) -> dict:
                 or type(provenance["runner_contained_manifest_features"]) is not bool
                 or not _is_string(provenance["description"])):
             raise IntegrationError("evidence_provenance is invalid")
+    handoff = data.get("reviewer_handoff")
+    if handoff is not None:
+        handoff = _require_keys(
+            handoff, {"passed", "schema_version", "json_path", "markdown_path", "error"},
+            "reviewer_handoff",
+        )
+        if (type(handoff["passed"]) is not bool or handoff["schema_version"] != "1.0"
+                or handoff["json_path"] != "handoff-to-reviewer.json"
+                or handoff["markdown_path"] != "handoff-to-reviewer.md"
+                or (handoff["error"] is not None and not isinstance(handoff["error"], str))):
+            raise IntegrationError("reviewer_handoff validation record is invalid")
+    if provenance and provenance["method"] == "automatic_runner" and not (handoff and handoff["passed"]):
+        raise IntegrationError("new result lacks a valid mandatory reviewer handoff")
     if not isinstance(data["changed_files"], list) or len(data["changed_files"]) != len(set(data["changed_files"])) or not all(_is_string(x) for x in data["changed_files"]):
         raise IntegrationError("changed_files must be a unique string array")
     commits = data["commits_created"]
@@ -563,6 +577,9 @@ def inspect_manifest(manifest: dict, *, manifest_path: Path, expected_repository
         "deployment_contract_path": manifest["deployment_contract_path"],
         "deployment_contract_sha256": contract_digest,
         "evidence_secret_scan": evidence_scan,
+        "reviewer_handoff": manifest.get("reviewer_handoff", {
+            "passed": None, "compatibility": "historical package predating mandatory handoff",
+        }),
     }
 
 

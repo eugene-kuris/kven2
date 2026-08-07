@@ -1,52 +1,67 @@
 {
-  "acceptance_checklist": [
-    "Confirm inspect and dry-run report only the declared operations.",
-    "Confirm no production feature behavior changed."
-  ],
+  "schema_version": "2.0",
+  "expected_baseline": "6d08a8d3d11240d5dda5a14466fb3bb710d18257",
+  "feature_branch": "codex/work-kven-ops-003a-codex-task-20260807T083603Z-2068587",
   "allowed_paths": [
     "deployment-contract.json",
+    "docs/KVEN_CODEX_REVIEW_HANDOFF.md",
     "docs/KVEN_INTEGRATION_WORKFLOW.md",
+    "scripts/kven-codex-task",
     "scripts/kven-integrate-task",
-    "test_kven_integrate_task.py"
+    "scripts/kven-review-handoff",
+    "scripts/kven_handoff.py",
+    "test_kven_codex_task.py",
+    "test_kven_integrate_task.py",
+    "test_kven_review_handoff.py"
   ],
+  "services": [],
   "backups": {
-    "configuration": [],
-    "sqlite": []
+    "sqlite": [],
+    "configuration": []
   },
-  "expected_baseline": "ac6a953649e9c68b6ef1283a039a9659f04ea48c",
-  "fatal_log_checks": [],
-  "feature_branch": "codex/work-kven-ops-002c-codex-task-20260807T074350Z-1885286",
   "migration_checks": [],
-  "post_merge_tests": [
+  "result_validation_tests": [
     {
-      "command": ["/opt/kven2/venv/bin/python", "-m", "unittest", "discover"],
+      "name": "handoff-and-codex-runner",
+      "command": ["/opt/kven2/venv/bin/python", "-m", "unittest", "-v", "test_kven_review_handoff.py", "test_kven_codex_task.py"],
+      "timeout": 300
+    },
+    {
+      "name": "integration-runner-compatibility",
+      "command": ["/opt/kven2/venv/bin/python", "-m", "unittest", "-v", "test_kven_integrate_task.py"],
+      "timeout": 900
+    },
+    {
+      "name": "full-repository-suite",
+      "command": ["/opt/kven2/venv/bin/python", "-m", "unittest", "discover", "-v"],
       "timeout": 1800
     }
   ],
   "pre_merge_tests": [
     {
-      "command": ["/opt/kven2/venv/bin/python", "-m", "unittest", "test_kven_integrate_task"],
-      "timeout": 600
+      "name": "handoff-and-runner-pre-merge",
+      "command": ["/opt/kven2/venv/bin/python", "-m", "unittest", "-v", "test_kven_review_handoff.py", "test_kven_codex_task.py", "test_kven_integrate_task.py"],
+      "timeout": 1200
     }
   ],
-  "result_validation_tests": [
+  "post_merge_tests": [
     {
-      "command": ["/opt/kven2/venv/bin/python", "-m", "unittest", "-v", "test_kven_integrate_task"],
-      "name": "focused-runner-and-integration-tests",
-      "timeout": 900
-    },
-    {
+      "name": "full-suite-post-merge",
       "command": ["/opt/kven2/venv/bin/python", "-m", "unittest", "discover", "-v"],
-      "name": "full-repository-suite",
       "timeout": 1800
     }
   ],
   "readiness_checks": [],
+  "fatal_log_checks": [],
+  "acceptance_checklist": [
+    "Reviewer handoff schema 1.0 is mandatory for new automatic result packages.",
+    "Review findings schema 1.0 and correction_results provide exact finding coverage.",
+    "Historical bootstrap packages remain inspectable without semantic-review duplication.",
+    "No product runtime, service, database, or protected-data behavior changed."
+  ],
   "rollback": {
-    "restore_backups": true,
     "restore_git": true,
+    "restore_backups": true,
     "verify_readiness": true
-  },
-  "schema_version": "2.0",
-  "services": []
+  }
 }
