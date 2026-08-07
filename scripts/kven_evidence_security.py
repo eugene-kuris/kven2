@@ -49,7 +49,7 @@ def detect_line(text: str) -> list[str]:
                 "fixture-non-secret",
             ))
             or (category == "bearer_value" and re.sub(r"[^a-z]", "", match.group(2).lower())
-                in {"token", "value", "credential", "material", "detection", "lines"})
+                in {"token", "value", "credential", "material", "detection", "lines", "documentation"})
             or "detect_line(" in text
             for match in matches
         )
