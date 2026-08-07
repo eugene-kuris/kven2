@@ -48,8 +48,8 @@ def detect_line(text: str) -> list[str]:
                 "[redacted]", "redacted", "placeholder", "example", "synthetic-non-secret",
                 "fixture-non-secret",
             ))
-            or (category == "bearer_value" and match.group(2).strip("`'\".,;:<>[]()").lower()
-                in {"token", "value", "credential", "material"})
+            or (category == "bearer_value" and re.sub(r"[^a-z]", "", match.group(2).lower())
+                in {"token", "value", "credential", "material", "detection", "lines"})
             or "detect_line(" in text
             for match in matches
         )
