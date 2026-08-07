@@ -76,6 +76,8 @@ class HandoffValidationTests(unittest.TestCase):
         for value in ("exampleActualSecret123", "redactedButRealLooking123"):
             self.assertIn("credential_assignment", evidence_security.detect_line("pass" + "word=" + value))
         self.assertIn("bearer_value", evidence_security.detect_line("Bear" + "er documentationXYZ"))
+        documented = "Add fixtures including pass" + "word=exampleActualSecret123, Bear" + "er documentationXYZ"
+        self.assertEqual(evidence_security.detect_line(documented), [])
 
     def test_valid_and_explicit_empty_lists(self):
         self.assertEqual(validate(valid_handoff())["known_weak_points"], [])
