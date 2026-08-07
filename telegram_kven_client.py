@@ -209,6 +209,7 @@ class TelegramKvenClient:
             messages=prepared_messages, tools=[], tool_choice="none",
         )
         payload["kven_internal_request"] = "telegram_compaction"
+        payload["max_tokens"] = 4096
         message = await self._request_message(payload)
         if message.get("tool_calls"):
             raise KvenClientError("Kven requested a tool during compaction")
