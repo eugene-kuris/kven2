@@ -78,6 +78,8 @@ class HandoffValidationTests(unittest.TestCase):
         self.assertIn("bearer_value", evidence_security.detect_line("Bear" + "er documentationXYZ"))
         documented = "Add fixtures including pass" + "word=exampleActualSecret123, Bear" + "er documentationXYZ"
         self.assertEqual(evidence_security.detect_line(documented), [])
+        self.assertEqual(evidence_security.detect_line("Review shows bearer meta-word exceptions"), [])
+        self.assertIn("bearer_value", evidence_security.detect_line("Bear" + "er values"))
 
     def test_valid_and_explicit_empty_lists(self):
         self.assertEqual(validate(valid_handoff())["known_weak_points"], [])

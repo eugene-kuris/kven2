@@ -54,6 +54,10 @@ def _safe_value(category: str, match: re.Match[str], text: str) -> bool:
             and (re.search(r'(?i)["\']subject["\']\s*:', text)
                  or "Classify bearer documentation meta-words safely" in text)):
         return True
+    if category == "bearer_value" and re.search(
+            r"(?i)\b(?:bearer values made only of broad meta-words|"
+            r"shows bearer meta-word exceptions)\b", text):
+        return True
     if category == "bearer_value" and normalized == "token" and re.search(
             r"(?i)\b(?:the|a)\s+bearer\s+token\s+(?:is|value)\b", text):
         return True
