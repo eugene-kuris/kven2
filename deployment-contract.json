@@ -4,20 +4,18 @@
     "Confirm no production feature behavior changed."
   ],
   "allowed_paths": [
-    "AGENTS.md",
     "deployment-contract.json",
-    "docs/",
-    "scripts/",
-    "test_kven_codex_task.py",
+    "docs/KVEN_INTEGRATION_WORKFLOW.md",
+    "scripts/kven-integrate-task",
     "test_kven_integrate_task.py"
   ],
   "backups": {
     "configuration": [],
     "sqlite": []
   },
-  "expected_baseline": "91ca8fb8ed1f6aa60c366d032995e03ca9acce54",
+  "expected_baseline": "6e98e393ba854cc92b847d0fe84335a72395d94a",
   "fatal_log_checks": [],
-  "feature_branch": "codex/work-kven-ops-002a-r5-console-20260806T184128Z-1359302",
+  "feature_branch": "codex/work-kven-ops-002b-codex-task-20260807T053421Z-1640034",
   "migration_checks": [],
   "post_merge_tests": [
     {
@@ -27,13 +25,13 @@
   ],
   "pre_merge_tests": [
     {
-      "command": ["/opt/kven2/venv/bin/python", "-m", "unittest", "test_kven_codex_task", "test_kven_integrate_task"],
+      "command": ["/opt/kven2/venv/bin/python", "-m", "unittest", "test_kven_integrate_task"],
       "timeout": 600
     }
   ],
   "result_validation_tests": [
     {
-      "command": ["/opt/kven2/venv/bin/python", "-m", "unittest", "-v", "test_kven_codex_task", "test_kven_integrate_task"],
+      "command": ["/opt/kven2/venv/bin/python", "-m", "unittest", "-v", "test_kven_integrate_task"],
       "name": "focused-runner-and-integration-tests",
       "timeout": 900
     },

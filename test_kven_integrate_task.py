@@ -113,6 +113,13 @@ R5_REGRESSION_COVERAGE = {
     ],
 }
 
+OPS_002B_REGRESSION_COVERAGE = {
+    "feature_only_migration_and_cwd": ["test_feature_only_migration_runs_from_exact_checkout"],
+    "cwd_safety": ["test_migration_checkout_cwd_mapping_and_refusal"],
+    "migration_fingerprint": ["test_migration_checkout_mutation_is_refused", "test_smoke_checkout_mutation_is_refused"],
+    "migration_cleanup": ["test_migration_failure_and_cleanup_failure_are_pre_mutation"],
+}
+
 
 def cmd(*args, cwd=None, env=None):
     return subprocess.run(args, cwd=cwd, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -644,6 +651,148 @@ class RepositoryFixture(unittest.TestCase):
         self.assertEqual((self.feature_worktree / "feature.txt").read_text(), "operator dirty data\n")
         self.assertTrue((self.feature_worktree / "operator-untracked.txt").is_file())
         self.assertTrue(state["validation_checkout"]["cleanup"]["passed"])
+
+    def configure_feature_only_migration(self, *, command_body=None, smoke_body=None, cwd=None):
+        source = self.root / "live.sqlite"
+        sqlite3.connect(source).close()
+        scripts = self.feature_worktree / "scripts"
+        scripts.mkdir(exist_ok=True)
+        (scripts / "feature-migrate.py").write_text(command_body or (
+            "import os, sqlite3\n"
+            "c=sqlite3.connect(os.environ['DB'])\n"
+            "c.execute('create table if not exists added(id integer)')\n"
+            "c.commit(); c.close()\n"
+        ), encoding="utf-8")
+        (scripts / "feature-smoke.py").write_text(smoke_body or (
+            "import os, sqlite3\n"
+            "c=sqlite3.connect(os.environ['DB'])\n"
+            "assert c.execute(\"select count(*) from sqlite_master where name='added'\").fetchone()[0] == 1\n"
+            "c.close()\n"
+        ), encoding="utf-8")
+        self.contract["allowed_paths"].append("scripts/")
+        self.contract["backups"]["sqlite"] = [{"path": str(source), "services": []}]
+        self.contract["migration_checks"] = [{
+            "database": str(source), "database_env": "DB", "cwd": str(cwd or self.repo),
+            "command": [sys.executable, "scripts/feature-migrate.py"],
+            "application_smoke_command": [sys.executable, "scripts/feature-smoke.py"],
+            "idempotent": True, "verification_sql": ["select * from added"], "timeout": 30,
+        }]
+        cmd("git", "-C", str(self.feature_worktree), "add", "scripts")
+        return source
+
+    def test_feature_only_migration_runs_from_exact_checkout(self):
+        source = self.configure_feature_only_migration()
+        self.assertFalse((self.repo / "scripts" / "feature-migrate.py").exists())
+        result = self.stage_cli()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        state = json.loads((self.run_dir() / "integration-manifest.json").read_text())
+        evidence = state["migration_checkout"]
+        self.assertEqual(state["status"], "AWAITING_ACCEPTANCE")
+        self.assertEqual(evidence["initial_fingerprint"]["head"], state["feature_head"])
+        self.assertEqual(evidence["initial_fingerprint"], evidence["final_fingerprint"])
+        self.assertTrue(evidence["cleanup"]["passed"])
+        self.assertFalse(Path(evidence["checkout_path"]).exists())
+        check = state["migration_validation"][0]
+        self.assertEqual(Path(check["cwd"]), Path(evidence["checkout_path"]))
+        self.assertTrue(all(item["unchanged"] for item in check["attempt_fingerprints"]))
+        self.assertTrue(check["application_smoke_fingerprint"]["unchanged"])
+        with sqlite3.connect(source) as live:
+            self.assertEqual(live.execute("select count(*) from sqlite_master where name='added'").fetchone()[0], 0)
+
+    def test_migration_checkout_cwd_mapping_and_refusal(self):
+        checkout = self.root / "checkout"
+        (checkout / "scripts").mkdir(parents=True)
+        self.assertEqual(integration.migration_checkout_cwd(self.repo, self.repo, checkout), checkout)
+        self.assertEqual(
+            integration.migration_checkout_cwd(self.repo / "scripts", self.repo, checkout),
+            checkout / "scripts",
+        )
+        external = self.root / "external"
+        external.mkdir()
+        self.assertEqual(integration.migration_checkout_cwd(external, self.repo, checkout), external)
+        with self.assertRaisesRegex(integration.IntegrationError, "escapes"):
+            integration.migration_checkout_cwd("../outside", self.repo, checkout)
+        (checkout / "linked").symlink_to(external, target_is_directory=True)
+        with self.assertRaisesRegex(integration.IntegrationError, "escapes"):
+            integration.migration_checkout_cwd("linked", self.repo, checkout)
+
+    def assert_migration_checkout_mutation_refused(self):
+        before = integration.repository_state(self.repo)
+        _, state = integration.stage(self.path, self.manifest, self._stage_args())
+        self.assertEqual(state["status"], "AUTOMATED_CHECK_FAILED")
+        self.assertFalse(state["live_mutation_started"])
+        self.assertEqual(integration.repository_state(self.repo), before)
+        self.assertTrue(state["migration_checkout"]["cleanup"]["passed"])
+        self.assertFalse(Path(state["migration_checkout"]["checkout_path"]).exists())
+
+    def test_migration_checkout_mutation_is_refused(self):
+        self.configure_feature_only_migration(
+            command_body="from pathlib import Path\nPath('feature.txt').write_text('changed')\n",
+        )
+        self.assert_migration_checkout_mutation_refused()
+
+    def test_smoke_checkout_mutation_is_refused(self):
+        self.configure_feature_only_migration(
+            smoke_body="from pathlib import Path\nPath('feature.txt').write_text('changed')\n",
+        )
+        self.assert_migration_checkout_mutation_refused()
+
+    def test_migration_failure_and_cleanup_failure_are_pre_mutation(self):
+        self.configure_feature_only_migration(command_body="raise SystemExit(9)\n")
+        before = integration.repository_state(self.repo)
+        _, state = integration.stage(self.path, self.manifest, self._stage_args())
+        self.assertEqual(state["status"], "AUTOMATED_CHECK_FAILED")
+        self.assertFalse(state["live_mutation_started"])
+        self.assertEqual(integration.repository_state(self.repo), before)
+        self.assertTrue(state["migration_checkout"]["cleanup"]["passed"])
+
+    def test_migration_cleanup_failure_is_pre_mutation(self):
+        self.configure_feature_only_migration()
+        before = integration.repository_state(self.repo)
+        real_cleanup = integration.cleanup_validation_checkout
+        calls = 0
+
+        def fail_second_cleanup(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            record_value = real_cleanup(*args, **kwargs)
+            if calls == 2:
+                record_value["passed"] = False
+                record_value["bounded_output"] = "synthetic cleanup verification failure"
+            return record_value
+
+        with mock.patch.object(integration, "cleanup_validation_checkout", side_effect=fail_second_cleanup):
+            _, state = integration.stage(self.path, self.manifest, self._stage_args())
+        self.assertEqual(state["status"], "AUTOMATED_CHECK_FAILED")
+        self.assertFalse(state["live_mutation_started"])
+        self.assertEqual(integration.repository_state(self.repo), before)
+        self.assertFalse(state["migration_checkout"]["cleanup"]["passed"])
+
+    def test_migration_checkout_creation_failure_is_pre_mutation(self):
+        self.configure_feature_only_migration()
+        before = integration.repository_state(self.repo)
+        real_create = integration.create_validation_checkout
+        calls = 0
+
+        def fail_second_create(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            parent, checkout, record_value = real_create(*args, **kwargs)
+            if calls == 2:
+                real_cleanup = integration.cleanup_validation_checkout(args[0], parent, checkout)
+                self.assertTrue(real_cleanup["passed"])
+                parent.mkdir()
+                record_value["passed"] = False
+                record_value["exit_code"] = 1
+            return parent, checkout, record_value
+
+        with mock.patch.object(integration, "create_validation_checkout", side_effect=fail_second_create):
+            _, state = integration.stage(self.path, self.manifest, self._stage_args())
+        self.assertEqual(state["status"], "AUTOMATED_CHECK_FAILED")
+        self.assertFalse(state["live_mutation_started"])
+        self.assertEqual(integration.repository_state(self.repo), before)
+        self.assertTrue(state["migration_checkout"]["cleanup"]["passed"])
+
 
     def test_validation_tracked_mutation_refused_before_live_mutation(self):
         command = [

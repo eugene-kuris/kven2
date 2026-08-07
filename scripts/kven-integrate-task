@@ -783,7 +783,49 @@ def restore_backups(records: list[dict], *, service_manager=None, service_timeou
     return results
 
 
-def validate_migrations(contract: dict, backups: list[dict], run_dir: Path, *, protected_work_dir: Path | None = None) -> list[dict]:
+def migration_checkout_cwd(declared_cwd, repository_root: Path, checkout: Path) -> Path:
+    """Map repository cwd values into the trusted checkout without redirecting external paths."""
+    repository_root = repository_root.resolve(strict=True)
+    checkout = checkout.resolve(strict=True)
+    if declared_cwd is None:
+        candidate = checkout
+    else:
+        declared = Path(declared_cwd)
+        if declared.is_absolute():
+            normalized = Path(os.path.abspath(declared))
+            try:
+                relative = normalized.relative_to(repository_root)
+            except ValueError:
+                return normalized
+            candidate = checkout / relative
+        else:
+            if any(part == ".." for part in declared.parts):
+                raise IntegrationError("migration cwd escapes the repository")
+            candidate = checkout / declared
+    try:
+        candidate.resolve(strict=True).relative_to(checkout)
+    except (OSError, ValueError) as exc:
+        raise IntegrationError("migration cwd is missing or escapes the trusted checkout") from exc
+    return candidate
+
+
+def _run_trusted_migration_command(command, artifact: Path, *, cwd: Path, env: dict,
+                                   timeout: int, checkout: Path, label: str) -> tuple[dict, dict]:
+    before = validation_checkout_state(checkout)
+    record = command_record(command, artifact, cwd=cwd, env=env, timeout=timeout)
+    after = validation_checkout_state(checkout)
+    fingerprint = {"before": before, "after": after, "unchanged": after == before}
+    if after != before:
+        raise IntegrationError(f"trusted migration checkout changed during {label}")
+    return record, fingerprint
+
+
+def validate_migrations(contract: dict, backups: list[dict], run_dir: Path, *,
+                        protected_work_dir: Path | None = None,
+                        repository_root: Path | None = None,
+                        execution_checkout: Path | None = None) -> list[dict]:
+    if (repository_root is None) != (execution_checkout is None):
+        raise IntegrationError("migration execution context is incomplete")
     results = []
     available = {x["source"]: x for x in backups if x["kind"] == "sqlite"}
     for index, check in enumerate(contract["migration_checks"]):
@@ -795,15 +837,30 @@ def validate_migrations(contract: dict, backups: list[dict], run_dir: Path, *, p
         disposable.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(protected, disposable)
         env = os.environ.copy()
+        if execution_checkout is not None:
+            env["PYTHONDONTWRITEBYTECODE"] = "1"
         env[check.get("database_env", "KVEN_MIGRATION_DATABASE")] = str(disposable)
+        cwd = check.get("cwd")
+        if execution_checkout is not None:
+            cwd = migration_checkout_cwd(cwd, repository_root, execution_checkout)
         attempts = 2 if check.get("idempotent", True) else 1
         executions = []
+        fingerprints = []
         for attempt in range(attempts):
-            record = command_record(
-                check["command"], run_dir / "migration-logs" / f"{index}-{attempt + 1}.log",
-                cwd=check.get("cwd"), env=env, timeout=check.get("timeout", 300),
-            )
+            if execution_checkout is None:
+                record = command_record(
+                    check["command"], run_dir / "migration-logs" / f"{index}-{attempt + 1}.log",
+                    cwd=cwd, env=env, timeout=check.get("timeout", 300),
+                )
+                fingerprint = None
+            else:
+                record, fingerprint = _run_trusted_migration_command(
+                    check["command"], run_dir / "migration-logs" / f"{index}-{attempt + 1}.log",
+                    cwd=cwd, env=env, timeout=check.get("timeout", 300),
+                    checkout=execution_checkout, label=f"migration[{index}][{attempt + 1}]",
+                )
             executions.append(record)
+            fingerprints.append(fingerprint)
             if not record["passed"]:
                 raise IntegrationError(f"migration validation failed; see {record['output_artifact']}")
         connection = sqlite3.connect(disposable)
@@ -815,14 +872,25 @@ def validate_migrations(contract: dict, backups: list[dict], run_dir: Path, *, p
             connection.close()
         if integrity != "ok":
             raise IntegrationError("migrated disposable database failed integrity check")
-        smoke = command_record(
-            check["application_smoke_command"], run_dir / "migration-logs" / f"{index}-application-smoke.log",
-            cwd=check.get("cwd"), env=env, timeout=check.get("timeout", 300),
-        )
+        if execution_checkout is None:
+            smoke = command_record(
+                check["application_smoke_command"], run_dir / "migration-logs" / f"{index}-application-smoke.log",
+                cwd=cwd, env=env, timeout=check.get("timeout", 300),
+            )
+            smoke_fingerprint = None
+        else:
+            smoke, smoke_fingerprint = _run_trusted_migration_command(
+                check["application_smoke_command"], run_dir / "migration-logs" / f"{index}-application-smoke.log",
+                cwd=cwd, env=env, timeout=check.get("timeout", 300), checkout=execution_checkout,
+                label=f"application-smoke[{index}]",
+            )
         if not smoke["passed"]:
             raise IntegrationError(f"application migration smoke failed; see {smoke['output_artifact']}")
         results.append({"database": source, "copy": str(disposable), "attempts": executions,
-                        "integrity_check": integrity, "application_smoke": smoke})
+                        "integrity_check": integrity, "application_smoke": smoke,
+                        "cwd": str(cwd) if cwd is not None else None,
+                        "attempt_fingerprints": fingerprints,
+                        "application_smoke_fingerprint": smoke_fingerprint})
     return results
 
 
@@ -1023,6 +1091,65 @@ def run_feature_validation(repo: Path, feature_head: str, items: list, run_dir: 
     return [item["command"] for item in evidence["commands"]], evidence
 
 
+def run_trusted_migration_validation(repo: Path, feature_head: str, contract: dict,
+                                     backups: list[dict], run_dir: Path,
+                                     protected_work_dir: Path, run_id_value: str) -> tuple[list[dict], dict]:
+    evidence_path = run_dir / "migration-checkout.json"
+    evidence = {
+        "schema_version": SCHEMA_VERSION, "feature_head": feature_head,
+        "detached": True, "cleanup": None,
+    }
+    parent = checkout = None
+    failure = None
+    results = []
+    try:
+        parent, checkout, creation = create_validation_checkout(
+            repo, feature_head, f"migration-{run_id_value}",
+        )
+        evidence.update({"checkout_path": str(checkout.resolve()), "creation": creation})
+        atomic_json(evidence_path, evidence)
+        if not creation["passed"]:
+            raise IntegrationError("migration checkout creation failed")
+        initial = validation_checkout_state(checkout)
+        evidence["initial_fingerprint"] = initial
+        if initial["head"] != feature_head or initial["branch"] or initial["status"]:
+            raise IntegrationError("migration checkout is not the exact clean detached feature HEAD")
+        atomic_json(evidence_path, evidence)
+        results = validate_migrations(
+            contract, backups, run_dir, protected_work_dir=protected_work_dir,
+            repository_root=repo, execution_checkout=checkout,
+        )
+        evidence["checks"] = results
+        final = validation_checkout_state(checkout)
+        evidence["final_fingerprint"] = final
+        evidence["fingerprint_unchanged"] = final == initial
+        if final != initial:
+            raise IntegrationError("trusted migration checkout changed during validation")
+        atomic_json(evidence_path, evidence)
+    except Exception as exc:
+        failure = exc
+        evidence["failure"] = redact(str(exc))
+        if checkout is not None and checkout.exists():
+            try:
+                evidence["failure_fingerprint"] = validation_checkout_state(checkout)
+            except Exception as fingerprint_exc:
+                evidence["failure_fingerprint_error"] = redact(str(fingerprint_exc))
+        atomic_json(evidence_path, evidence)
+    finally:
+        if parent is not None and checkout is not None:
+            try:
+                evidence["cleanup"] = cleanup_validation_checkout(repo, parent, checkout)
+                if not evidence["cleanup"]["passed"]:
+                    failure = IntegrationError("migration checkout cleanup or prune failed")
+            except Exception as exc:
+                evidence["cleanup"] = {"passed": False, "failure": redact(str(exc))}
+                failure = exc
+            atomic_json(evidence_path, evidence)
+    if failure is not None:
+        raise failure
+    return results, evidence
+
+
 def run_id(task_id: str) -> str:
     safe = re.sub(r"[^a-z0-9]+", "-", task_id.lower()).strip("-")
     return f"{safe}-{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
@@ -1042,6 +1169,9 @@ Contract SHA-256: `{state.get('deployment_contract_sha256', 'unavailable')}`
 Pre-merge context: exact feature HEAD in a tool-created disposable detached checkout.
 Validation checkout: `{state.get('validation_checkout', {}).get('checkout_path', 'not created')}`
 Validation cleanup: `{state.get('validation_checkout', {}).get('cleanup', {}).get('passed', 'not run')}`
+Migration context: exact feature HEAD in a second tool-created disposable detached checkout.
+Migration checkout: `{state.get('migration_checkout', {}).get('checkout_path', 'not created')}`
+Migration cleanup: `{state.get('migration_checkout', {}).get('cleanup', {}).get('passed', 'not run')}`
 Post-merge context: exact staged production main.
 Push trust boundary: `git push`, local push hooks, and post-push executable checks are reconciled before FINALIZED.
 
@@ -1324,10 +1454,12 @@ def stage(manifest_path: Path, manifest: dict, args) -> tuple[Path, dict]:
             state["backups"] = create_backups(contract, backup_dir)
             atomic_json(run_dir / "backup-manifest.json", state["backups"])
             persist(run_dir, state, "MIGRATING", "MIGRATING")
-            state["migration_validation"] = validate_migrations(
-                contract, state["backups"], run_dir, protected_work_dir=backup_dir / "migration-copies",
+            state["migration_validation"], state["migration_checkout"] = run_trusted_migration_validation(
+                repo, manifest["feature_head"], contract, state["backups"], run_dir,
+                backup_dir / "migration-copies", identifier,
             )
             atomic_json(run_dir / "migration-validation.json", state["migration_validation"])
+            atomic_json(run_dir / "migration-checkout.json", state["migration_checkout"])
             # This is the last preflight before the first repository mutation.
             immediate = inspect_manifest(manifest, manifest_path=manifest_path, expected_repository=repo)
             if immediate["main_state"] != state["expected_repository_state"]:
@@ -1423,6 +1555,14 @@ def stage(manifest_path: Path, manifest: dict, args) -> tuple[Path, dict]:
                     ]
                 except (OSError, json.JSONDecodeError):
                     state["validation_checkout_evidence_error"] = "validation evidence could not be reloaded"
+            migration_evidence_path = run_dir / "migration-checkout.json"
+            if migration_evidence_path.is_file():
+                try:
+                    state["migration_checkout"] = json.loads(
+                        migration_evidence_path.read_text(encoding="utf-8")
+                    )
+                except (OSError, json.JSONDecodeError):
+                    state["migration_checkout_evidence_error"] = "migration evidence could not be reloaded"
             state["failure"] = redact(str(exc))
             persist(run_dir, state, "AUTOMATED_CHECK_FAILED", "AUTOMATED_CHECK_FAILED")
             if not state.get("live_mutation_started"):
