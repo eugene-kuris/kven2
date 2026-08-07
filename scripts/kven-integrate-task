@@ -198,13 +198,14 @@ def _require_keys(value, required: set[str], label: str, optional: set[str] | No
     return value
 
 
-def validate_command_items(value, label: str, *, required_nonempty=False) -> list[dict]:
+def validate_command_items(value, label: str, *, required_nonempty=False, allow_cwd=False) -> list[dict]:
     if not isinstance(value, list) or (required_nonempty and not value):
         requirement = "non-empty " if required_nonempty else ""
         raise IntegrationError(f"{label} must be a {requirement}array")
     normalized = []
     for index, item in enumerate(value):
-        item = _require_keys(item, {"command"}, f"{label}[{index}]", {"timeout", "name"})
+        optional = {"timeout", "name"} | ({"cwd"} if allow_cwd else set())
+        item = _require_keys(item, {"command"}, f"{label}[{index}]", optional)
         command = item["command"]
         if not isinstance(command, list) or not command or not all(_is_string(x) for x in command):
             raise IntegrationError(f"{label}[{index}].command must be a non-empty argv array")
@@ -215,7 +216,10 @@ def validate_command_items(value, label: str, *, required_nonempty=False) -> lis
         name = item.get("name", f"{label}-{index + 1}")
         if not _is_string(name):
             raise IntegrationError(f"{label}[{index}].name is invalid")
-        normalized.append({"command": command, "timeout": timeout, "name": name})
+        cwd = item.get("cwd")
+        if cwd is not None and not _is_string(cwd):
+            raise IntegrationError(f"{label}[{index}].cwd is invalid")
+        normalized.append({"command": command, "timeout": timeout, "name": name, **({"cwd": cwd} if cwd is not None else {})})
     return normalized
 
 
@@ -273,8 +277,9 @@ def validate_contract(contract: object, manifest: dict) -> dict:
             raise IntegrationError(f"migration_checks[{index}].verification_sql is invalid")
     for field in ("result_validation_tests", "pre_merge_tests", "post_merge_tests"):
         contract[field] = validate_command_items(contract[field], field, required_nonempty=True)
-    for field in ("readiness_checks", "fatal_log_checks", "deployment_steps"):
-        contract[field] = validate_command_items(contract.get(field, []), field)
+    for field in ("readiness_checks", "fatal_log_checks"):
+        contract[field] = validate_command_items(contract.get(field, []), field, allow_cwd=True)
+    contract["deployment_steps"] = validate_command_items(contract.get("deployment_steps", []), "deployment_steps")
     if services and (not contract["readiness_checks"] or not contract["fatal_log_checks"]):
         raise IntegrationError("declared services require readiness_checks and fatal_log_checks")
     checklist = contract["acceptance_checklist"]
@@ -783,7 +788,7 @@ def restore_backups(records: list[dict], *, service_manager=None, service_timeou
     return results
 
 
-def migration_checkout_cwd(declared_cwd, repository_root: Path, checkout: Path) -> Path:
+def trusted_checkout_cwd(declared_cwd, repository_root: Path, checkout: Path) -> Path:
     """Map repository cwd values into the trusted checkout without redirecting external paths."""
     repository_root = repository_root.resolve(strict=True)
     checkout = checkout.resolve(strict=True)
@@ -800,13 +805,42 @@ def migration_checkout_cwd(declared_cwd, repository_root: Path, checkout: Path) 
             candidate = checkout / relative
         else:
             if any(part == ".." for part in declared.parts):
-                raise IntegrationError("migration cwd escapes the repository")
+                raise IntegrationError("trusted checkout cwd escapes the repository")
             candidate = checkout / declared
     try:
         candidate.resolve(strict=True).relative_to(checkout)
     except (OSError, ValueError) as exc:
-        raise IntegrationError("migration cwd is missing or escapes the trusted checkout") from exc
+        raise IntegrationError("trusted checkout cwd is missing or escapes the checkout") from exc
     return candidate
+
+
+def trusted_checkout_argv(command, repository_root: Path, checkout: Path) -> list[str]:
+    """Map absolute repository-owned argv paths to the exact-feature checkout."""
+    repository_root = repository_root.resolve(strict=True)
+    checkout = checkout.resolve(strict=True)
+    mapped = []
+    for value in command:
+        path = Path(value)
+        if not path.is_absolute():
+            mapped.append(value)
+            continue
+        normalized = Path(os.path.abspath(path))
+        try:
+            relative = normalized.relative_to(repository_root)
+        except ValueError:
+            mapped.append(value)
+            continue
+        candidate = checkout / relative
+        try:
+            candidate.resolve(strict=True).relative_to(checkout)
+        except (OSError, ValueError) as exc:
+            raise IntegrationError("repository argv path is missing or escapes the trusted checkout") from exc
+        mapped.append(str(candidate))
+    return mapped
+
+
+# Compatibility name retained for the OPS-002B migration API and tests.
+migration_checkout_cwd = trusted_checkout_cwd
 
 
 def _run_trusted_migration_command(command, artifact: Path, *, cwd: Path, env: dict,
@@ -842,7 +876,7 @@ def validate_migrations(contract: dict, backups: list[dict], run_dir: Path, *,
         env[check.get("database_env", "KVEN_MIGRATION_DATABASE")] = str(disposable)
         cwd = check.get("cwd")
         if execution_checkout is not None:
-            cwd = migration_checkout_cwd(cwd, repository_root, execution_checkout)
+            cwd = trusted_checkout_cwd(cwd, repository_root, execution_checkout)
         attempts = 2 if check.get("idempotent", True) else 1
         executions = []
         fingerprints = []
@@ -1150,6 +1184,94 @@ def run_trusted_migration_validation(repo: Path, feature_head: str, contract: di
     return results, evidence
 
 
+def run_trusted_rollback_verification(repo: Path, feature_head: str, contract: dict,
+                                      run_dir: Path, run_id_value: str) -> tuple[dict, dict]:
+    """Run post-rollback verifier code from a disposable exact-feature checkout."""
+    existing_attempts = sorted(run_dir.glob("rollback-verification-checkout-attempt-*.json"))
+    evidence_path = run_dir / f"rollback-verification-checkout-attempt-{len(existing_attempts) + 1}.json"
+    evidence = {
+        "schema_version": SCHEMA_VERSION, "feature_head": feature_head,
+        "production_repository": str(repo.resolve()), "detached": True,
+        "evidence_path": str(evidence_path), "commands": [], "cleanup": None,
+    }
+    parent = checkout = None
+    failure = None
+    results = {"readiness": [], "fatal_logs": []}
+    try:
+        parent, checkout, creation = create_validation_checkout(
+            repo, feature_head, f"rollback-{run_id_value}",
+        )
+        evidence.update({"checkout_path": str(checkout.resolve()), "creation": creation})
+        atomic_json(evidence_path, evidence)
+        if not creation["passed"]:
+            raise IntegrationError("rollback verification checkout creation failed")
+        initial = validation_checkout_state(checkout)
+        evidence["initial_fingerprint"] = initial
+        if initial["head"] != feature_head or initial["branch"] or initial["status"]:
+            raise IntegrationError("rollback verification checkout is not the exact clean detached feature HEAD")
+        atomic_json(evidence_path, evidence)
+        for category, items in (("readiness", contract["readiness_checks"]),
+                                ("fatal_logs", contract["fatal_log_checks"])):
+            for index, item in enumerate(items):
+                cwd = trusted_checkout_cwd(item.get("cwd"), repo, checkout)
+                command = trusted_checkout_argv(item["command"], repo, checkout)
+                before = validation_checkout_state(checkout)
+                command_evidence = {
+                    "category": category, "index": index, "declared_argv": redact_argv(item["command"]),
+                    "argv": redact_argv(command), "cwd": str(cwd),
+                    "production_repository": str(repo.resolve()), "before": before,
+                }
+                evidence["commands"].append(command_evidence)
+                atomic_json(evidence_path, evidence)
+                record = command_record(
+                    command, run_dir / "logs" / f"rollback-{category}-{index}.log",
+                    cwd=cwd, timeout=item["timeout"],
+                    env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1",
+                         "KVEN_PRODUCTION_REPOSITORY": str(repo.resolve())},
+                )
+                after = validation_checkout_state(checkout)
+                command_evidence.update({"command": record, "after": after,
+                                         "fingerprint_unchanged": after == before})
+                results[category].append(record)
+                atomic_json(evidence_path, evidence)
+                if after != before:
+                    raise IntegrationError(
+                        f"trusted rollback verification checkout changed during {category}[{index}]"
+                    )
+                if not record["passed"]:
+                    raise IntegrationError(
+                        f"rollback-{category} command failed; see {record['output_artifact']}"
+                    )
+        final = validation_checkout_state(checkout)
+        evidence["final_fingerprint"] = final
+        evidence["fingerprint_unchanged"] = final == initial
+        if final != initial:
+            raise IntegrationError("trusted rollback verification checkout changed during verification")
+        atomic_json(evidence_path, evidence)
+    except Exception as exc:
+        failure = exc
+        evidence["failure"] = redact(str(exc))
+        if checkout is not None and checkout.exists():
+            try:
+                evidence["failure_fingerprint"] = validation_checkout_state(checkout)
+            except Exception as fingerprint_exc:
+                evidence["failure_fingerprint_error"] = redact(str(fingerprint_exc))
+        atomic_json(evidence_path, evidence)
+    finally:
+        if parent is not None and checkout is not None:
+            try:
+                evidence["cleanup"] = cleanup_validation_checkout(repo, parent, checkout)
+                if not evidence["cleanup"]["passed"]:
+                    failure = IntegrationError("rollback verification checkout cleanup or prune failed")
+            except Exception as exc:
+                evidence["cleanup"] = {"passed": False, "failure": redact(str(exc))}
+                failure = exc
+            atomic_json(evidence_path, evidence)
+    if failure is not None:
+        raise failure
+    return results, evidence
+
+
 def run_id(task_id: str) -> str:
     safe = re.sub(r"[^a-z0-9]+", "-", task_id.lower()).strip("-")
     return f"{safe}-{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
@@ -1336,15 +1458,6 @@ def restore_service_states(state: dict, run_dir: Path, contract: dict, args) -> 
             service_action(args.service_manager, "stop", service, timeout=args.service_timeout)
         wait_service_state(args.service_manager, service, target, timeout=args.service_timeout)
         records[service] = service_state(args.service_manager, service)
-    if any(value == "active" for value in desired.values()) or not desired:
-        state["rollback_readiness"] = run_checks(
-            contract["readiness_checks"], run_dir, "rollback-readiness", cwd=Path(state["repository"]),
-            expected_repository_state=state["expected_repository_state"],
-        )
-        state["rollback_fatal_logs"] = run_checks(
-            contract["fatal_log_checks"], run_dir, "rollback-fatal-logs", cwd=Path(state["repository"]),
-            expected_repository_state=state["expected_repository_state"],
-        )
     return records
 
 
@@ -1366,21 +1479,56 @@ def rollback_state(run_dir: Path, state: dict, reason: str, *, marker: Path | No
         state["rollback_failure"] = f"refusing rollback: repository differs from recorded state; expected={expected}, actual={actual}"
         persist(run_dir, state, "ROLLBACK_REFUSED", "INTERNAL_ERROR")
         raise IntegrationError(state["rollback_failure"])
-    persist(run_dir, state, "ROLLING_BACK", "ROLLING_BACK")
-    for service in reversed(contract["services"]):
-        if service_state(args.service_manager, service) != "inactive":
-            service_action(args.service_manager, "stop", service, timeout=args.service_timeout)
-        wait_service_state(args.service_manager, service, "inactive", timeout=args.service_timeout)
-    if actual["head"] != state["baseline_head"]:
-        reset = git(repo, "reset", "--hard", state["baseline_head"])
-        if reset.returncode:
-            raise IntegrationError("guarded Git rollback failed")
-    state["expected_repository_state"] = repository_state(repo)
-    persist(run_dir, state, "RESTORING_BACKUPS")
-    state["backup_restoration"] = restore_backups(
-        state.get("backups", []), service_manager=args.service_manager, service_timeout=args.service_timeout,
+    legacy_verification_started = (
+        state.get("phase") == "RESTORING_BACKUPS"
+        and actual["head"] == state["baseline_head"]
+        and (any((run_dir / "logs").glob("rollback-readiness-*.log"))
+             or any((run_dir / "logs").glob("rollback-fatal-logs-*.log")))
     )
-    state["service_status_after_rollback"] = restore_service_states(state, run_dir, contract, args)
+    if legacy_verification_started and not state.get("rollback_git_restored"):
+        # Pre-OPS-002C persisted immediately before backup restore, but emitted a
+        # readiness artifact only after Git, backups, and services were restored.
+        # Treat that durable ordering evidence as completed restoration so the
+        # failed verification can be retried without a second restore/churn.
+        state.update({
+            "rollback_git_restored": True,
+            "rollback_backups_restored": True,
+            "rollback_services_restored": True,
+            "legacy_rollback_resume_evidence": "post-rollback check artifact after baseline restore",
+        })
+        state.setdefault("service_status_after_rollback", state.get("service_status_before", {}))
+        persist(run_dir, state, "VERIFYING_ROLLBACK", "ROLLING_BACK")
+    persist(run_dir, state, "ROLLING_BACK", "ROLLING_BACK")
+    if not state.get("rollback_git_restored"):
+        for service in reversed(contract["services"]):
+            if service_state(args.service_manager, service) != "inactive":
+                service_action(args.service_manager, "stop", service, timeout=args.service_timeout)
+            wait_service_state(args.service_manager, service, "inactive", timeout=args.service_timeout)
+        if actual["head"] != state["baseline_head"]:
+            reset = git(repo, "reset", "--hard", state["baseline_head"])
+            if reset.returncode:
+                raise IntegrationError("guarded Git rollback failed")
+        state["expected_repository_state"] = repository_state(repo)
+        state["rollback_git_restored"] = True
+        persist(run_dir, state, "RESTORING_BACKUPS")
+    if not state.get("rollback_backups_restored"):
+        state["backup_restoration"] = restore_backups(
+            state.get("backups", []), service_manager=args.service_manager, service_timeout=args.service_timeout,
+        )
+        state["rollback_backups_restored"] = True
+        persist(run_dir, state, "RESTORING_SERVICES")
+    if not state.get("rollback_services_restored"):
+        state["service_status_after_rollback"] = restore_service_states(state, run_dir, contract, args)
+        state["rollback_services_restored"] = True
+        persist(run_dir, state, "VERIFYING_ROLLBACK")
+    if any(value == "active" for value in state.get("service_status_before", {}).values()) or not contract["services"]:
+        checks, checkout_evidence = run_trusted_rollback_verification(
+            repo, state["feature_head"], contract, run_dir, state["run_id"],
+        )
+        state["rollback_readiness"] = checks["readiness"]
+        state["rollback_fatal_logs"] = checks["fatal_logs"]
+        state["rollback_verification_checkout"] = checkout_evidence
+        persist(run_dir, state, "VERIFYING_ROLLBACK")
     final = repository_state(repo)
     origin = require_git(repo, "rev-parse", "refs/remotes/origin/main")
     index_clean = git(repo, "diff", "--cached", "--quiet").returncode == 0

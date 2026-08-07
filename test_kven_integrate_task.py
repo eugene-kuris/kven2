@@ -120,6 +120,12 @@ OPS_002B_REGRESSION_COVERAGE = {
     "migration_cleanup": ["test_migration_failure_and_cleanup_failure_are_pre_mutation"],
 }
 
+OPS_002C_REGRESSION_COVERAGE = {
+    "exact_feature_rollback_context": ["test_feature_only_rollback_verifier_uses_exact_detached_checkout"],
+    "rollback_checkout_safety": ["test_rollback_verifier_mutation_and_unsafe_paths_fail_with_cleanup"],
+    "resumable_rollback": ["test_rollback_verification_retry_skips_completed_restoration"],
+}
+
 
 def cmd(*args, cwd=None, env=None):
     return subprocess.run(args, cwd=cwd, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -558,6 +564,136 @@ class RepositoryFixture(unittest.TestCase):
         self.assertEqual(rollback.returncode, 0, rollback.stderr)
         self.assertEqual(cmd("git", "-C", str(self.repo), "rev-parse", "HEAD").stdout.strip(), self.base)
         self.assertTrue((run_dir / "rollback-result.json").is_file())
+
+    def configure_feature_only_rollback_verifier(self, body=None):
+        scripts = self.feature_worktree / "scripts"
+        scripts.mkdir(exist_ok=True)
+        checker = scripts / "check-feature-fatal-logs"
+        checker.write_text(body or (
+            "import os, pathlib, subprocess\n"
+            "if 'KVEN_PRODUCTION_REPOSITORY' in os.environ:\n"
+            " production = pathlib.Path(os.environ['KVEN_PRODUCTION_REPOSITORY'])\n"
+            " assert subprocess.run(['git', '-C', str(production), 'rev-parse', 'HEAD'], "
+            "text=True, capture_output=True, check=True).stdout.strip() == os.environ['EXPECTED_BASELINE']\n"
+            " assert pathlib.Path.cwd() != production\n"
+            " assert subprocess.run(['git', 'branch', '--show-current'], text=True, capture_output=True, "
+            "check=True).stdout.strip() == ''\n"
+            " assert pathlib.Path(os.environ['RESTORED_STATE']).read_text() == 'restored\\n'\n"
+        ), encoding="utf-8")
+        self.contract["allowed_paths"].append("scripts/")
+        self.contract["fatal_log_checks"] = [{
+            "command": [sys.executable, str(self.repo / "scripts" / "check-feature-fatal-logs")],
+            "cwd": str(self.repo), "timeout": 30,
+        }]
+        cmd("git", "-C", str(self.feature_worktree), "add", "scripts")
+
+    def test_feature_only_rollback_verifier_uses_exact_detached_checkout(self):
+        restored = self.root / "restored-state"
+        restored.write_text("restored\n", encoding="utf-8")
+        self.configure_feature_only_rollback_verifier()
+        old = os.environ.copy()
+        os.environ.update({"EXPECTED_BASELINE": self.base, "RESTORED_STATE": str(restored)})
+        try:
+            result = self.stage_cli()
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            run_dir = self.run_dir()
+            recorded = json.loads((run_dir / "integration-manifest.json").read_text())["feature_head"]
+            checker = self.feature_worktree / "scripts" / "check-feature-fatal-logs"
+            checker.write_text("raise SystemExit(91)\n", encoding="utf-8")
+            cmd("git", "-C", str(self.feature_worktree), "add", str(checker))
+            cmd("git", "-C", str(self.feature_worktree), "commit", "-m", "mutable source moved")
+            rollback = cmd(sys.executable, str(SCRIPT), "rollback", str(run_dir), "--repository", str(self.repo), env=os.environ)
+        finally:
+            os.environ.clear()
+            os.environ.update(old)
+        self.assertEqual(rollback.returncode, 0, rollback.stdout + rollback.stderr)
+        state = json.loads((run_dir / "integration-manifest.json").read_text())
+        evidence = state["rollback_verification_checkout"]
+        self.assertEqual(state["status"], "ROLLED_BACK")
+        self.assertEqual(integration.repository_state(self.repo)["head"], self.base)
+        self.assertEqual(evidence["initial_fingerprint"]["head"], recorded)
+        self.assertEqual(evidence["initial_fingerprint"]["branch"], "")
+        self.assertEqual(evidence["initial_fingerprint"], evidence["final_fingerprint"])
+        self.assertTrue(evidence["cleanup"]["passed"])
+        self.assertFalse(Path(evidence["checkout_path"]).exists())
+        self.assertEqual(evidence["commands"][0]["production_repository"], str(self.repo))
+        self.assertTrue(evidence["commands"][0]["argv"][1].startswith(evidence["checkout_path"]))
+
+    def test_rollback_verifier_mutation_and_unsafe_paths_fail_with_cleanup(self):
+        self.configure_feature_only_rollback_verifier(
+            "from pathlib import Path\nPath('feature.txt').write_text('mutated')\n"
+        )
+        self.bind_contract()
+        run_dir = self.root / "rollback-evidence"
+        run_dir.mkdir()
+        with self.assertRaisesRegex(integration.IntegrationError, "changed"):
+            integration.run_trusted_rollback_verification(
+                self.repo, self.feature, self.contract, run_dir, "fixture",
+            )
+        evidence_path, = run_dir.glob("rollback-verification-checkout-attempt-*.json")
+        evidence = json.loads(evidence_path.read_text())
+        self.assertTrue(evidence["cleanup"]["passed"])
+        self.assertFalse(Path(evidence["checkout_path"]).exists())
+        checkout = self.root / "checkout"
+        checkout.mkdir()
+        with self.assertRaisesRegex(integration.IntegrationError, "escapes"):
+            integration.trusted_checkout_cwd("../outside", self.repo, checkout)
+        external = self.root / "external"
+        external.mkdir()
+        (checkout / "linked").symlink_to(external, target_is_directory=True)
+        with self.assertRaisesRegex(integration.IntegrationError, "escapes"):
+            integration.trusted_checkout_cwd("linked", self.repo, checkout)
+
+        mismatch_dir = self.root / "rollback-mismatch-evidence"
+        mismatch_dir.mkdir()
+        with self.assertRaisesRegex(integration.IntegrationError, "creation failed"):
+            integration.run_trusted_rollback_verification(
+                self.repo, "0" * 40, self.contract, mismatch_dir, "mismatch",
+            )
+        mismatch_path, = mismatch_dir.glob("rollback-verification-checkout-attempt-*.json")
+        mismatch = json.loads(mismatch_path.read_text())
+        self.assertFalse(mismatch["creation"]["passed"])
+        self.assertTrue(mismatch["cleanup"]["passed"])
+
+    def test_rollback_verification_retry_skips_completed_restoration(self):
+        result = self.stage_cli()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        run_dir = self.run_dir()
+        state = json.loads((run_dir / "integration-manifest.json").read_text())
+        calls = {"restore": 0, "verify": 0}
+        real_restore = integration.restore_backups
+        real_verify = integration.run_trusted_rollback_verification
+
+        def counted_restore(*args, **kwargs):
+            calls["restore"] += 1
+            return real_restore(*args, **kwargs)
+
+        def fail_once(*args, **kwargs):
+            calls["verify"] += 1
+            if calls["verify"] == 1:
+                raise integration.IntegrationError("synthetic interrupted verification")
+            return real_verify(*args, **kwargs)
+
+        with integration.repository_lock(self.repo) as marker, \
+                mock.patch.object(integration, "restore_backups", side_effect=counted_restore), \
+                mock.patch.object(integration, "run_trusted_rollback_verification", side_effect=fail_once):
+            with self.assertRaisesRegex(integration.IntegrationError, "interrupted"):
+                integration.rollback_state(run_dir, state, "fixture", marker=marker)
+            persisted = json.loads((run_dir / "integration-manifest.json").read_text())
+            self.assertTrue(persisted["rollback_git_restored"])
+            self.assertTrue(persisted["rollback_backups_restored"])
+            self.assertTrue(persisted["rollback_services_restored"])
+            # Simulate the pre-OPS-002C state shape from the preserved failed run:
+            # it persisted RESTORING_BACKUPS but its check log proves restoration completed.
+            for key in ("rollback_git_restored", "rollback_backups_restored", "rollback_services_restored"):
+                persisted.pop(key)
+            persisted["phase"] = "RESTORING_BACKUPS"
+            (run_dir / "logs" / "rollback-fatal-logs-0.log").write_text("legacy failure\n", encoding="utf-8")
+            integration.rollback_state(run_dir, persisted, "fixture retry", marker=marker)
+        self.assertEqual(calls, {"restore": 1, "verify": 2})
+        completed = json.loads((run_dir / "integration-manifest.json").read_text())
+        self.assertEqual(completed["status"], "ROLLED_BACK")
+        self.assertIn("post-rollback check artifact", completed["legacy_rollback_resume_evidence"])
 
     def test_feature_branch_move_uses_recorded_exact_head(self):
         args = self._stage_args()
@@ -1848,6 +1984,12 @@ class CoverageTests(unittest.TestCase):
 
     def test_r5_regression_map_references_discovered_tests(self):
         names = {name for tests in R5_REGRESSION_COVERAGE.values() for name in tests}
+        discovered = {name for cls in (RepositoryFixture, BackupMigrationTests, FakeServiceTests, CoverageTests)
+                      for name in dir(cls) if name.startswith("test_")}
+        self.assertTrue(names <= discovered)
+
+    def test_ops_002c_regression_map_references_discovered_tests(self):
+        names = {name for tests in OPS_002C_REGRESSION_COVERAGE.values() for name in tests}
         discovered = {name for cls in (RepositoryFixture, BackupMigrationTests, FakeServiceTests, CoverageTests)
                       for name in dir(cls) if name.startswith("test_")}
         self.assertTrue(names <= discovered)
