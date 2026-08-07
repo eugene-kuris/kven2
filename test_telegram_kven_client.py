@@ -703,6 +703,10 @@ class TelegramKvenClientTests(
             client.captured_payload.get("max_tokens"),
             4096,
         )
+        self.assertEqual(
+            client.captured_payload.get("temperature"),
+            0,
+        )
 
 
 if __name__ == "__main__":

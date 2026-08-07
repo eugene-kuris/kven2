@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from typing import Any, Protocol
 
 from telegram_store import (
@@ -39,6 +41,8 @@ class KvenReplyClient(Protocol):
         ...
 
 
+logger = logging.getLogger(__name__)
+
 async def run_generation_once(
     store: GenerationStore,
     kven_client: KvenReplyClient,
@@ -60,6 +64,13 @@ async def run_generation_once(
                 model_id=getattr(kven_client, "_model", None),
             )
         except Exception as exc:
+            logger.warning(
+                "[TELEGRAM_COMPACTION] status=failed checkpoint_id=%s "
+                "error_type=%s error=%s",
+                compaction.checkpoint_id,
+                type(exc).__name__,
+                str(exc),
+            )
             await store.fail_compaction(compaction.checkpoint_id, exc)
         return True
 

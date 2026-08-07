@@ -61,8 +61,14 @@ potentially incomplete conversation context, not authoritative memory."""
 
 
 def parse_and_validate_payload(raw: str, valid_ids: set[int]) -> dict[str, Any]:
+    text = raw.strip() if isinstance(raw, str) else raw
+    if isinstance(text, str) and text.startswith("```"):
+        first_newline = text.find("\n")
+        if first_newline != -1 and text.endswith("```"):
+            text = text[first_newline + 1:-3].strip()
+
     try:
-        payload = json.loads(raw)
+        payload = json.loads(text)
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
         raise ValueError("compaction output is not valid JSON") from exc
     if not isinstance(payload, dict) or payload.get("schema_version") != SCHEMA_VERSION:

@@ -7,6 +7,7 @@ from pathlib import Path
 from telegram_compaction import SCHEMA_VERSION, parse_and_validate_payload
 from telegram_store import TelegramStore
 from telegram_workers import run_generation_once
+import telegram_compaction
 
 
 def payload(ids, **overrides):
@@ -141,6 +142,29 @@ class TelegramCompactionTests(unittest.IsolatedAsyncioTestCase):
         disabled = TelegramStore(str(Path(self.temp.name) / "disabled.db"), compaction_enabled=False)
         await disabled.init()
         self.assertIsNone(await disabled.claim_next_compaction())
+
+
+    def test_fenced_json_payload_is_accepted_without_weakening_validation(self):
+        payload = {
+            "schema_version": "telegram-compaction-v1",
+            "overview": "A concise grounded checkpoint.",
+            "established_context": [
+                {
+                    "text": "A fact grounded in entry 1.",
+                    "source_entry_ids": [1],
+                }
+            ],
+            "speaker_statements": [],
+            "uncertainty_and_disagreement": [],
+            "open_loops": [],
+            "commitments": [],
+            "important_reference_ids": [1],
+        }
+
+        raw = "```json\n" + json.dumps(payload) + "\n```"
+        parsed = telegram_compaction.parse_and_validate_payload(raw, {1})
+
+        self.assertEqual(parsed, payload)
 
 
 if __name__ == "__main__":
