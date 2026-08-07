@@ -25,6 +25,7 @@ def command(*args, cwd=None, env=None):
 class UnitTests(unittest.TestCase):
     def test_exact_task_id_line(self):
         self.assertEqual(runner.task_id_from("x\nTASK ID: ABC-12\ny", "a.txt"), "ABC-12")
+        self.assertEqual(runner.task_id_from("TASK ID:\nABC-12\n", "a.txt"), "ABC-12")
         self.assertEqual(runner.task_id_from(" Task ID: wrong", "named.task"), "named")
 
     def test_safe_sanitization(self):
@@ -188,10 +189,31 @@ contract={'schema_version':'2.0','expected_baseline':base,'feature_branch':branc
  'readiness_checks':[],'fatal_log_checks':[],'acceptance_checklist':['Synthetic acceptance'],
  'rollback':{'restore_git':True,'restore_backups':True,'verify_readiness':True}}
 if os.environ.get('CONTRACT_LITERAL'): contract['result_validation_tests'][0]['command'] += ['--'+'token', os.environ['CONTRACT_LITERAL']]
-(work/'deployment-contract.json').write_text(json.dumps(contract))
-subprocess.run(['git','add','agent.txt','deployment-contract.json'],cwd=work,check=True)
-subprocess.run(['git','-c','user.name=Test','-c','user.email=test@example.invalid','commit','-m','agent work'],cwd=work,check=True,stdout=subprocess.DEVNULL)
+if not os.environ.get('NO_CORRECTION_COMMIT'):
+ (work/'deployment-contract.json').write_text(json.dumps(contract))
+ subprocess.run(['git','add','agent.txt','deployment-contract.json'],cwd=work,check=True)
+ subprocess.run(['git','-c','user.name=Test','-c','user.email=test@example.invalid','commit','-m','agent work'],cwd=work,check=True,stdout=subprocess.DEVNULL)
 if os.environ.get('DIRTY_CONTRACT_AFTER_COMMIT'): (work/'deployment-contract.json').write_text(json.dumps(contract)+' ')
+head=subprocess.run(['git','-C',str(work),'rev-parse','HEAD'],text=True,stdout=subprocess.PIPE,check=True).stdout.strip()
+commit={'sha':head,'subject':'agent work'}; changed=['agent.txt','deployment-contract.json']
+handoff={'schema_version':'1.0','task_identity':{'task_id':'DEMO','task_title':'Synthetic task','baseline_sha':base,'feature_branch':branch,'feature_head':head,'commits':[commit],'result_package':str(out.parent),'codex_model':os.environ.get('ACTUAL_MODEL') or 'unit-model','started_at':'2026-01-01T00:00:00Z','finished_at':'2026-01-01T00:00:01Z'},
+ 'task_understood_as':{'implementation':'Synthetic runner fixture','why':'Exercise packaging','non_goals':[],'constraints_preserved':[]},
+ 'implementation_map':[{'path':p,'why_changed':'Synthetic evidence','symbols':['fixture'],'responsibility':'Runner test fixture','interaction':'Test only','requirement_ids':['REQ-1']} for p in changed],
+ 'important_design_decisions':[],'rejected_alternatives':[],'architecture_deviations':{'status':'none','reason':'Not applicable','consequence':'None','approval_required':False},'data_schema_migration_changes':[],'runtime_behavior_changed':[],'existing_behavior_intentionally_preserved':[],'known_weak_points':[],'uncertainties':[],
+ 'requirement_evidence_map':[{'requirement_id':'REQ-1','requirement':'Synthetic success','implementation_locations':['agent.txt'],'exact_test_names':['synthetic-validation'],'log_result_artifact':'test-artifacts/01-synthetic-validation.log','result':'PASS','notes':'fixture'}],
+ 'tests':[],'exact_git_state':{'baseline':base,'commits':[commit],'feature_head':head,'changed_files':changed,'diff_check':'passed','worktree_status':'clean','feature_worktree_clean':True},'recommended_reviewer_checks':[],'do_not_spend_time_rediscovering':[],'unresolved_issues':[],'correction_routing_metadata':{'requirement_ids':['REQ-1'],'decision_ids':[],'implementation_area_ids':[]}}
+handoff.update({'existing_architecture_reused':[],'runtime_path_changes':[],'persistent_state_changes':[],'security_privacy_impact':[],'deployment_impact':[],'things_not_tested':[]})
+if os.environ.get('HANDOFF_SECRET'): handoff['unresolved_issues']=[os.environ['HANDOFF_SECRET']]
+if (out.parent/'review-findings.json').is_file():
+ findings=json.loads((out.parent/'review-findings.json').read_text())
+ handoff['correction_results']=[{'finding_id':f['finding_id'],'root_cause':'fixture cause','exact_correction':'fixture fix','files_symbols_changed':['agent.txt:fixture'],'tests_added_run':['synthetic-validation'],'verification_result':'PASS','remaining_risk':'none','status':'FIXED'} for f in findings['findings']]
+ if (out.parent/'correction-context.json').is_file():
+  context=json.loads((out.parent/'correction-context.json').read_text())
+  delta={'schema_version':'1.0','task_id':'DEMO','previous_run_id':context['previous_run_id'],'previous_feature_sha':context['previous_feature_sha'],'feature_sha':head,'correction_sequence':context['correction_sequence'],'finding_results':[{'finding_id':f['finding_id']} for f in findings['findings']], 'changed_paths_since_previous':changed,'tests_added':['synthetic-validation'],'tests_run':['synthetic-validation'],'decisions_preserved':[],'assumptions_invalidated':[],'deployment_impact_delta':'none','migration_impact_delta':'none','restart_scope_delta':'none','new_risks':[],'open_findings':[],'closed_findings':[f['finding_id'] for f in findings['findings']]}
+  (out.parent/'delta-handoff.json').write_text(json.dumps(delta)); (out.parent/'delta-handoff.md').write_text('DEMO delta')
+mode=os.environ.get('HANDOFF_MODE','valid')
+if mode!='missing-json': (out.parent/'handoff-to-reviewer.json').write_text('{' if mode=='malformed-json' else json.dumps(handoff))
+if mode!='missing-markdown': (out.parent/'handoff-to-reviewer.md').write_text('# DEMO reviewer handoff\\n\\nFeature HEAD: '+(('0'*40) if mode=='wrong-markdown' else head)+'\\n')
 out.write_text('final report --'+'token '+os.environ['CONTRACT_LITERAL'] if os.environ.get('CONTRACT_LITERAL') else 'final report')
 model=os.environ.get('ACTUAL_MODEL') or (args[args.index('--model')+1] if '--model' in args else 'default-fixture-model')
 print('fake stdout'+((' --'+'token '+os.environ['CONTRACT_LITERAL']) if os.environ.get('CONTRACT_LITERAL') else ''))
@@ -229,9 +251,16 @@ raise SystemExit(int(os.environ.get('FAKE_CODEX_EXIT','0')))
         self.assertTrue((package / "service-state.json").is_file())
         self.assertTrue((package / "result-manifest.json").is_file())
         self.assertTrue((package / "result-summary.md").is_file())
+        self.assertTrue((package / "handoff-to-reviewer.json").is_file())
+        self.assertTrue((package / "reviewer-context.json").is_file())
+        self.assertTrue((package / "review-status.json").is_file())
+        self.assertTrue((package / "chatgpt-review-bundle.md").is_file())
         manifest = json.loads((package / "result-manifest.json").read_text())
         self.assertEqual(manifest["schema_version"], "2.0")
         self.assertEqual(manifest["final_codex_status"], "PASS")
+        self.assertTrue(manifest["reviewer_handoff"]["passed"])
+        self.assertEqual(json.loads((package / "review-status.json").read_text())["final_status"], "PASS")
+        self.assertIn("Final status: **PASS**", (package / "chatgpt-review-bundle.md").read_text())
         self.assertEqual(len(manifest["tests"]), 1)
         record = manifest["tests"][0]
         self.assertTrue(record["passed"])
@@ -263,6 +292,157 @@ raise SystemExit(int(os.environ.get('FAKE_CODEX_EXIT','0')))
         self.assertEqual(len(list(self.worktrees.glob("demo-*"))), 1)
         prompt = next(self.worktrees.glob("demo-*")) / "agent.txt"
         self.assertIn("Network access is prohibited", prompt.read_text(encoding="utf-8"))
+        self.assertIn("handoff-to-reviewer.json", prompt.read_text(encoding="utf-8"))
+
+    def test_missing_malformed_and_disagreeing_handoffs_fail(self):
+        for mode in ("missing-json", "missing-markdown", "malformed-json", "wrong-markdown"):
+            with self.subTest(mode=mode):
+                env = self.env.copy(); env["HANDOFF_MODE"] = mode
+                result = self.invoke(env=env)
+                self.assertNotEqual(result.returncode, 0)
+                package = sorted(self.results.glob("demo-*"))[-1]
+                manifest = json.loads((package / "result-manifest.json").read_text())
+                self.assertFalse(manifest["reviewer_handoff"]["passed"])
+
+    def test_review_findings_are_copied_prompted_preserved_and_corrected(self):
+        findings = {"schema_version": "1.0", "task_id": "DEMO", "findings": [{
+            "finding_id": "REV-001", "severity": "major", "status": "open",
+            "claim_or_requirement": "REQ-1", "observed": "problem", "evidence": ["agent.txt"],
+            "required_correction": "fix", "must_preserve": ["existing behavior"],
+            "verification_required": ["synthetic-validation"], "expected_behavior": "fixed",
+            "suspected_component": "fixture", "reproduction_exists": "yes",
+            "required_regression_test": "synthetic-validation", "reviewer_confidence": "high"}]}
+        source = Path(self.temp.name) / "review-findings.json"
+        original = json.dumps(findings, sort_keys=True); source.write_text(original, encoding="utf-8")
+        result = self.invoke("--review-findings", str(source))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(source.read_text(encoding="utf-8"), original)
+        package = next(self.results.glob("demo-*"))
+        self.assertEqual(json.loads((package / "review-findings.json").read_text()), findings)
+        prompt = (next(self.worktrees.glob("demo-*")) / "agent.txt").read_text()
+        self.assertIn("REV-001", prompt); self.assertIn("existing behavior", prompt)
+        rendered = json.loads((package / "handoff-to-reviewer.json").read_text())
+        self.assertEqual(rendered["correction_results"][0]["finding_id"], "REV-001")
+
+    def test_correction_context_binds_task_hash_lineage_and_fallback(self):
+        self.assertEqual(self.invoke().returncode, 0)
+        package = next(self.results.glob("demo-*"))
+        manifest = json.loads((package / "result-manifest.json").read_text())
+        findings = {"schema_version": "1.0", "task_id": "DEMO", "findings": [{
+            "finding_id": "REV-001", "severity": "major", "status": "open",
+            "claim_or_requirement": "REQ", "observed": "bad", "evidence": ["file"],
+            "required_correction": "fix", "must_preserve": [], "verification_required": ["test"],
+            "expected_behavior": "good", "suspected_component": "runner",
+            "reproduction_exists": "yes", "required_regression_test": "test",
+            "reviewer_confidence": "high"}],
+            "reviewed_run": {"feature_sha": manifest["feature_head"]}}
+        task = "TASK ID: DEMO\nDo work\n"
+        task_path = Path(self.temp.name) / "task.txt"
+        context = runner.load_correction_context(
+            package, task=task, task_path=str(task_path), findings=findings,
+            previous_feature_sha=manifest["feature_head"], repository=self.repo,
+        )
+        self.assertEqual(context["original_task_sha256"], __import__("hashlib").sha256(task.encode()).hexdigest())
+        self.assertEqual(context["previous_feature_sha"], manifest["feature_head"])
+        self.assertEqual(context["previous_requirement_map"][0]["requirement_id"], "REQ-1")
+        with self.assertRaisesRegex(runner.RunnerError, "stale or incorrect"):
+            runner.load_correction_context(package, task=task, task_path=str(task_path), findings=findings,
+                                           previous_feature_sha="0" * 40, repository=self.repo)
+
+    def test_bootstrap_context_without_manifest_is_fail_closed_and_immutable(self):
+        self.assertEqual(self.invoke().returncode, 0)
+        package = next(self.results.glob("demo-*"))
+        manifest = json.loads((package / "result-manifest.json").read_text())
+        findings = {"schema_version": "1.0", "task_id": "DEMO", "findings": [],
+                    "reviewed_run": {"feature_sha": manifest["feature_head"],
+                                     "result_package": str(package)}}
+        (package / "result-manifest.json").unlink()
+        before = {p.name: p.read_bytes() for p in package.iterdir() if p.is_file()}
+        context = runner.load_correction_context(
+            package, task="TASK ID: DEMO\nDo work\n", task_path=str(Path(self.temp.name) / "task.txt"),
+            findings=findings, previous_feature_sha=manifest["feature_head"], repository=self.repo,
+        )
+        self.assertEqual(context["previous_result_source"], "bootstrap-reviewer-context")
+        self.assertEqual(context["previous_test_evidence"], json.loads(
+            (package / "reviewer-context.json").read_text())["test_results"])
+        self.assertEqual(before, {p.name: p.read_bytes() for p in package.iterdir() if p.is_file()})
+        context_path = package / "reviewer-context.json"
+        valid_context = json.loads(context_path.read_text())
+        for field, value, message in (
+            ("feature_branch", "wrong-branch", "disagree"),
+            ("original_task_sha256", "0" * 64, "hash differs"),
+        ):
+            broken = dict(valid_context); broken[field] = value
+            context_path.write_text(json.dumps(broken), encoding="utf-8")
+            with self.assertRaisesRegex(runner.RunnerError, message):
+                runner.load_correction_context(
+                    package, task="TASK ID: DEMO\nDo work\n",
+                    task_path=str(Path(self.temp.name) / "task.txt"), findings=findings,
+                    previous_feature_sha=manifest["feature_head"], repository=self.repo)
+        context_path.write_text(json.dumps(valid_context), encoding="utf-8")
+        saved = context_path.read_bytes()
+        context_path.unlink()
+        with self.assertRaisesRegex(runner.RunnerError, "requires reviewer-context"):
+            runner.load_correction_context(
+                package, task="TASK ID: DEMO\nDo work\n", task_path=str(Path(self.temp.name) / "task.txt"),
+                findings=findings, previous_feature_sha=manifest["feature_head"], repository=self.repo)
+        context_path.write_bytes(saved)
+        findings_path = Path(self.temp.name) / "bootstrap-findings.json"
+        findings_path.write_text(json.dumps(findings), encoding="utf-8")
+        correction = self.invoke(
+            "--previous-result", str(package), "--previous-feature-sha", manifest["feature_head"],
+            "--review-findings", str(findings_path), "--no-resume",
+        )
+        # The synthetic agent's contract deliberately assumes a fresh branch, but the
+        # ordinary runner must still reconstruct context before invoking that agent.
+        self.assertNotEqual(correction.returncode, 0)
+        new_package = max(self.results.glob("demo-*"), key=lambda item: item.stat().st_mtime_ns)
+        generated = json.loads((new_package / "correction-context.json").read_text())
+        self.assertEqual(generated["previous_result_source"], "bootstrap-reviewer-context")
+
+    def test_task_sha256_uses_exact_crlf_file_bytes(self):
+        path = Path(self.temp.name) / "crlf.task.md"
+        raw = b"TASK ID: DEMO\r\nDo work\r\n"
+        path.write_bytes(raw)
+        text = runner.read_task(str(path))
+        self.assertEqual(runner.task_sha256(str(path), text), __import__("hashlib").sha256(raw).hexdigest())
+        self.assertEqual(runner.task_sha256("-", text), __import__("hashlib").sha256(text.encode()).hexdigest())
+
+    def test_correction_requires_commit_after_previous_feature_sha(self):
+        self.assertEqual(self.invoke().returncode, 0)
+        package = next(self.results.glob("demo-*"))
+        manifest = json.loads((package / "result-manifest.json").read_text())
+        finding = {
+            "schema_version": "1.0", "task_id": "DEMO", "findings": [{
+                "finding_id": "REV-016", "severity": "major", "status": "open",
+                "claim_or_requirement": "new correction commit", "observed": "none",
+                "evidence": ["fixture"], "required_correction": "commit",
+                "must_preserve": ["history"], "verification_required": ["test"],
+                "expected_behavior": "new commit", "suspected_component": "runner",
+                "reproduction_exists": "yes", "required_regression_test": "test",
+                "reviewer_confidence": "high"
+            }], "reviewed_run": {"feature_sha": manifest["feature_head"],
+                                  "result_package": str(package)}
+        }
+        source = Path(self.temp.name) / "noop-findings.json"
+        source.write_text(json.dumps(finding), encoding="utf-8")
+        env = self.env.copy(); env["NO_CORRECTION_COMMIT"] = "1"
+        result = self.invoke(
+            "--previous-result", str(package), "--previous-feature-sha", manifest["feature_head"],
+            "--review-findings", str(source), "--no-resume", env=env,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        correction = max(self.results.glob("demo-*"), key=lambda item: item.stat().st_mtime_ns)
+        self.assertIn("correction-created-no-new-commit", (correction / "summary.txt").read_text())
+
+    def test_malformed_and_unsafe_review_findings_are_rejected(self):
+        malformed = Path(self.temp.name) / "malformed.json"; malformed.write_text("{")
+        result = self.invoke("--review-findings", str(malformed))
+        self.assertNotEqual(result.returncode, 0); self.assertIn("malformed", result.stderr)
+        target = Path(self.temp.name) / "target.json"; target.write_text("{}")
+        unsafe = Path(self.temp.name) / "unsafe.json"; unsafe.symlink_to(target)
+        result = self.invoke("--review-findings", str(unsafe))
+        self.assertNotEqual(result.returncode, 0); self.assertIn("unsafe", result.stderr)
 
     def test_runner_refuses_worktree_contract_different_from_committed_blob(self):
         env = self.env.copy()
@@ -369,6 +549,16 @@ raise SystemExit(int(os.environ.get('FAKE_CODEX_EXIT','0')))
         for path in package.rglob("*"):
             if path.is_file():
                 self.assertNotIn(literal, path.read_text(encoding="utf-8", errors="replace"), str(path))
+
+    def test_secret_like_handoff_content_fails_evidence_scan(self):
+        env = self.env.copy(); env["HANDOFF_SECRET"] = "api_" + "key=" + ("z" * 24)
+        result = self.invoke(env=env)
+        self.assertNotEqual(result.returncode, 0)
+        manifest = json.loads((next(self.results.glob("demo-*")) / "result-manifest.json").read_text())
+        self.assertEqual(manifest["final_codex_status"], "FAIL")
+        self.assertFalse(manifest["evidence_secret_scan"]["passed"])
+        self.assertEqual(json.loads((next(self.results.glob("demo-*")) / "review-status.json").read_text())["final_status"], "FAIL")
+        self.assertIn("Final status: **FAIL**", (next(self.results.glob("demo-*")) / "chatgpt-review-bundle.md").read_text())
 
 
 if __name__ == "__main__":

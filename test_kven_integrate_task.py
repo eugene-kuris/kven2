@@ -222,6 +222,30 @@ class RepositoryFixture(unittest.TestCase):
         self.backups = self.root / "backups"
         self.write()
 
+    def test_inspect_surfaces_handoff_and_preserves_historical_compatibility(self):
+        self.path.write_text(json.dumps(self.manifest), encoding="utf-8")
+        historical = integration.inspect_manifest(self.manifest, manifest_path=self.path,
+                                                  expected_repository=self.repo)
+        self.assertIsNone(historical["reviewer_handoff"]["passed"])
+        current = copy.deepcopy(self.manifest)
+        current["evidence_provenance"] = {"method": "automatic_runner",
+                                           "runner_contained_manifest_features": True,
+                                           "description": "current"}
+        current["reviewer_handoff"] = {"passed": True, "schema_version": "1.0",
+                                        "json_path": "handoff-to-reviewer.json",
+                                        "markdown_path": "handoff-to-reviewer.md", "error": None}
+        current.update({"reviewer_context_path": "reviewer-context.json",
+                        "review_status_path": "review-status.json",
+                        "review_bundle_path": "chatgpt-review-bundle.md"})
+        (self.package / "handoff-to-reviewer.json").write_text("{}", encoding="utf-8")
+        (self.package / "handoff-to-reviewer.md").write_text("TEST\n" + self.feature, encoding="utf-8")
+        current["evidence_secret_scan"] = {"passed": True}
+        report = integration.inspect_manifest(current, manifest_path=self.path,
+                                              expected_repository=self.repo)
+        self.assertTrue(report["reviewer_handoff"]["passed"])
+        current["reviewer_handoff"]["passed"] = False
+        with self.assertRaisesRegex(integration.IntegrationError, "mandatory reviewer handoff"):
+            integration.validate_manifest_types(current)
     def tearDown(self):
         self.temp.cleanup()
 

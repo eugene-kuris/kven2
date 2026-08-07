@@ -20,6 +20,17 @@ The lifecycle is `inspect` → `dry-run` → `stage` → `AWAITING_ACCEPTANCE` �
 
 The runner writes `result-manifest.json` with requested model (nullable), actual runtime model, actual reasoning effort, reported token usage (nullable), exit and final status, repository and branch identities, baseline and feature heads, commits, changed files, tests, diff-check and secret-scan results, network declaration, evidence provenance, embedded deployment contract, requested services/backups/migrations, and package path. Runtime facts are parsed from the Codex startup stream; a requested/actual model conflict forces `FAIL`. Prohibited network use is recorded as `false`; allowed but unobservable use is `null` with an explanation. A still-running bootstrap package uses `null` for unavailable final runtime rather than guessing and identifies `bootstrap_postprocessing`; normal future output identifies `automatic_runner`. `result-summary.md` is the canonical human entry point. Legacy text artifacts remain available, but schema 1.0 manifests are deliberately not integration-eligible under the stricter inspector.
 
+OPS-003A-capable automatic runs additionally require a validated reviewer
+handoff and record its schema, paths, status, and error in `reviewer_handoff`.
+They also bind `reviewer-context.json`, `review-status.json`, and the standalone
+`chatgpt-review-bundle.md`; corrective runs add exact previous-result/SHA context
+and a delta handoff. Final status artifacts are regenerated after postprocessing
+so an evidence-scan or validation failure cannot be hidden by an earlier handoff.
+`inspect` surfaces that record but does not repeat semantic review. Historical
+schema-2.0 bootstrap packages remain readable without retroactive enforcement.
+See [KVEN_CODEX_REVIEW_HANDOFF.md](KVEN_CODEX_REVIEW_HANDOFF.md) for schema 1.0,
+review findings, correction routing, and the read-only consumption helper.
+
 `result_validation_tests` is the canonical runner contract. After Codex exits, the runner snapshots the exact feature branch, HEAD, index, and clean status, then executes every declared argv command itself. The state must remain identical after every command and the full set; a validation command may not commit, stage, switch branch, or create tracked/untracked data. The manifest always records the pre-validation feature HEAD. Each test record contains the exact name and redacted argv in contract order, start/finish timestamps, duration, exit code, pass/fail result, bounded output, and a result-package-relative full artifact path with size and SHA-256. Inspect resolves artifacts from the actual manifest directory, refuses absolute/traversal/outside/symlink paths, and verifies file size and checksum. Missing, extra, reordered, mismatched, malformed, timed-out, tampered, or failed evidence forces non-eligibility; tests are never inferred from Codex prose.
 
 ## Deployment contract schema 2.0
