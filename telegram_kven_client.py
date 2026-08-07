@@ -205,9 +205,11 @@ class TelegramKvenClient:
     ) -> str:
         """Generate derived JSON without exposing tools or tool side effects."""
         prepared_messages = self._validate_messages(messages)
-        message = await self._request_message(self._build_payload(
+        payload = self._build_payload(
             messages=prepared_messages, tools=[], tool_choice="none",
-        ))
+        )
+        payload["kven_internal_request"] = "telegram_compaction"
+        message = await self._request_message(payload)
         if message.get("tool_calls"):
             raise KvenClientError("Kven requested a tool during compaction")
         return self._require_answer_content(message, phase="compaction response")
