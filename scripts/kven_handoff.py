@@ -20,6 +20,9 @@ HANDOFF_SECTIONS = {
     "uncertainties", "requirement_evidence_map", "tests", "exact_git_state",
     "recommended_reviewer_checks", "do_not_spend_time_rediscovering",
     "unresolved_issues", "correction_routing_metadata",
+    "existing_architecture_reused", "runtime_path_changes",
+    "persistent_state_changes", "security_privacy_impact", "deployment_impact",
+    "things_not_tested",
 }
 EXPLICIT_LIST_SECTIONS = {
     "implementation_map", "important_design_decisions", "rejected_alternatives",
@@ -27,6 +30,32 @@ EXPLICIT_LIST_SECTIONS = {
     "existing_behavior_intentionally_preserved", "known_weak_points", "uncertainties",
     "requirement_evidence_map", "tests", "recommended_reviewer_checks",
     "do_not_spend_time_rediscovering", "unresolved_issues",
+    "existing_architecture_reused", "runtime_path_changes",
+    "persistent_state_changes", "security_privacy_impact", "deployment_impact",
+    "things_not_tested",
+}
+
+REVIEWER_CONTEXT_FIELDS = {
+    "schema_version", "task_id", "original_task_path", "original_task_sha256",
+    "codex_run_id", "codex_session_id_if_available", "start_time", "finish_time",
+    "model", "baseline_sha", "feature_branch", "feature_sha", "worktree",
+    "commit_list", "changed_paths", "migration_paths", "config_paths",
+    "affected_services", "tests", "test_results", "secret_scan", "git_diff_check",
+    "network_used", "developer_handoff_path", "previous_run_id",
+    "previous_feature_sha", "correction_sequence", "review_status", "known_risks",
+    "architecture_deviations", "findings_received", "findings_closed",
+    "findings_open", "developer_run_number", "runtime_seconds", "token_usage",
+    "session_resumable", "correction_context_path", "delta_handoff_path",
+    "review_bundle_path",
+}
+
+DELTA_HANDOFF_FIELDS = {
+    "schema_version", "task_id", "previous_run_id", "previous_feature_sha",
+    "feature_sha", "correction_sequence", "finding_results",
+    "changed_paths_since_previous", "tests_added", "tests_run",
+    "decisions_preserved", "assumptions_invalidated", "deployment_impact_delta",
+    "migration_impact_delta", "restart_scope_delta", "new_risks",
+    "open_findings", "closed_findings",
 }
 
 
@@ -72,6 +101,8 @@ def validate_review_findings(value: Any) -> dict:
     required = {
         "finding_id", "severity", "status", "claim_or_requirement", "observed",
         "evidence", "required_correction", "must_preserve", "verification_required",
+        "expected_behavior", "suspected_component", "reproduction_exists",
+        "required_regression_test", "reviewer_confidence",
     }
     for index, finding in enumerate(data["findings"]):
         finding = _keys(finding, required, f"findings[{index}]")
@@ -86,6 +117,59 @@ def validate_review_findings(value: Any) -> dict:
         ids.append(finding_id)
     if len(ids) != len(set(ids)):
         raise HandoffError("review findings contain duplicate finding IDs")
+    return data
+
+
+def validate_reviewer_context(value: Any) -> dict:
+    data = _keys(value, REVIEWER_CONTEXT_FIELDS, "reviewer-context.json")
+    if data["schema_version"] != HANDOFF_SCHEMA_VERSION:
+        raise HandoffError("unsupported reviewer-context schema_version")
+    for field in ("task_id", "original_task_path", "original_task_sha256", "codex_run_id",
+                  "start_time", "finish_time", "baseline_sha", "feature_branch", "feature_sha",
+                  "worktree", "developer_handoff_path", "review_status"):
+        _nonempty(data[field], f"reviewer context {field}")
+    if not re.fullmatch(r"[0-9a-f]{64}", data["original_task_sha256"]):
+        raise HandoffError("reviewer context original_task_sha256 is malformed")
+    for field in ("baseline_sha", "feature_sha"):
+        if not SHA_RE.fullmatch(data[field]):
+            raise HandoffError(f"reviewer context {field} is malformed")
+    if data["previous_feature_sha"] is not None and not SHA_RE.fullmatch(data["previous_feature_sha"]):
+        raise HandoffError("reviewer context previous_feature_sha is malformed")
+    for field in ("commit_list", "changed_paths", "migration_paths", "config_paths",
+                  "affected_services", "tests", "test_results", "known_risks",
+                  "architecture_deviations", "findings_received", "findings_closed", "findings_open"):
+        if not isinstance(data[field], list):
+            raise HandoffError(f"reviewer context {field} must be a list")
+    if type(data["correction_sequence"]) is not int or data["correction_sequence"] < 0:
+        raise HandoffError("reviewer context correction_sequence is invalid")
+    if type(data["developer_run_number"]) is not int or data["developer_run_number"] < 1:
+        raise HandoffError("reviewer context developer_run_number is invalid")
+    if type(data["session_resumable"]) is not bool:
+        raise HandoffError("reviewer context session_resumable must be boolean")
+    return data
+
+
+def validate_delta_handoff(value: Any, finding_ids: list[str]) -> dict:
+    data = _keys(value, DELTA_HANDOFF_FIELDS, "delta-handoff.json")
+    if data["schema_version"] != HANDOFF_SCHEMA_VERSION:
+        raise HandoffError("unsupported delta-handoff schema_version")
+    if not SHA_RE.fullmatch(data["previous_feature_sha"]) or not SHA_RE.fullmatch(data["feature_sha"]):
+        raise HandoffError("delta handoff feature SHA is malformed")
+    list_fields = DELTA_HANDOFF_FIELDS - {
+        "schema_version", "task_id", "previous_run_id", "previous_feature_sha",
+        "feature_sha", "correction_sequence", "deployment_impact_delta",
+        "migration_impact_delta", "restart_scope_delta",
+    }
+    for field in list_fields:
+        if not isinstance(data[field], list):
+            raise HandoffError(f"delta handoff {field} must be a list")
+    result_ids = [item.get("finding_id") for item in data["finding_results"] if isinstance(item, dict)]
+    if len(result_ids) != len(set(result_ids)) or set(result_ids) != set(finding_ids):
+        raise HandoffError("delta finding results do not exactly match supplied findings")
+    open_ids = set(data["open_findings"])
+    closed_ids = set(data["closed_findings"])
+    if open_ids & closed_ids or open_ids | closed_ids != set(finding_ids):
+        raise HandoffError("delta open/closed findings do not exactly cover supplied findings")
     return data
 
 

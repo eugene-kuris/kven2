@@ -234,6 +234,9 @@ class RepositoryFixture(unittest.TestCase):
         current["reviewer_handoff"] = {"passed": True, "schema_version": "1.0",
                                         "json_path": "handoff-to-reviewer.json",
                                         "markdown_path": "handoff-to-reviewer.md", "error": None}
+        current.update({"reviewer_context_path": "reviewer-context.json",
+                        "review_status_path": "review-status.json",
+                        "review_bundle_path": "chatgpt-review-bundle.md"})
         (self.package / "handoff-to-reviewer.json").write_text("{}", encoding="utf-8")
         (self.package / "handoff-to-reviewer.md").write_text("TEST\n" + self.feature, encoding="utf-8")
         current["evidence_secret_scan"] = {"passed": True}

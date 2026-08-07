@@ -21,7 +21,7 @@ _TERM_PATTERN = "(?:" + "|".join(re.escape(value) for value in _TERMS) + ")"
 _ASSIGNMENT = re.compile(
     rf"(?i)(?<![A-Za-z0-9_])({_TERM_PATTERN})(\s*[:=]\s*)([^\s,;]+)"
 )
-_OPTION = re.compile(rf"(?i)(--?{_TERM_PATTERN}\s+)([^\s]+)")
+_OPTION = re.compile(rf"(?i)(?<![A-Za-z0-9_-])(--?{_TERM_PATTERN}\s+)([^\s]+)")
 _AUTH_HEADER = re.compile(rf"(?i)((?:{re.escape(_TERMS[-1])})\s*:\s*)([^\s]+)")
 _BEARER = re.compile(r"(?i)(\b" + "Bear" + r"er\s+)([^\s]+)")
 _PRIVATE_BEGIN_TEXT = "-----" + "BEGIN " + "PRIVATE KEY" + "-----"
@@ -42,7 +42,15 @@ def detect_line(text: str) -> list[str]:
         ("private_key_marker", _PRIVATE_BEGIN),
     )
     for category, pattern in checks:
-        if pattern.search(text) and category not in categories:
+        matches = list(pattern.finditer(text))
+        safe_only = bool(matches) and all(
+            any(marker in match.group(0).lower() for marker in (
+                "[redacted]", "redacted", "placeholder", "example", "synthetic-non-secret",
+                "fixture-non-secret",
+            ))
+            for match in matches
+        )
+        if matches and not safe_only and category not in categories:
             categories.append(category)
     return categories
 

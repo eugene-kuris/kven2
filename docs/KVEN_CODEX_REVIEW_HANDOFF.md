@@ -52,16 +52,69 @@ scripts/kven-review-handoff RESULT correction-results
 Invoke a corrective run with:
 
 ```bash
-scripts/kven-codex-task TASK.txt --review-findings /safe/path/review-findings.json
+scripts/kven-codex-task TASK.txt \
+  --review-findings /safe/path/review-findings.json \
+  --previous-result /home/eugene/kven-codex-results/PREVIOUS_RUN \
+  --previous-feature-sha REVIEWED_FEATURE_SHA
 ```
 
 The runner rejects malformed, duplicate-ID, symlink, non-file, and protected
 `/agent/data` inputs. It copies the validated file into the result package and
 does not mutate the source. The prompt names every finding and preserve
 constraint. Ordinary Git, test, contract, handoff, and secret safeguards still
-apply. `correction_results` must map every supplied finding exactly once to root
+apply. The runner verifies the previous package, handoff, branch ref, clean
+worktree, reviewed SHA, task ID/hash, findings binding, current-main ancestry,
+and prior test/requirement evidence before Codex starts. `correction-context.json`
+contains the original task identity, previous handoff, commits, test evidence,
+requirement map, decisions, findings, and review state. If the prior manifest has
+a session ID, Codex CLI 0.146.1 supports `codex exec resume SESSION_ID -` and the
+runner uses it; `--no-resume` deterministically exercises the complete-context
+fallback. `correction_results` must map every supplied finding exactly once to root
 cause, correction, changed files/symbols, tests, verification, remaining risk,
 and `FIXED`, `PARTIAL`, `NOT_FIXED`, or `REJECTED_WITH_REASON` status.
+
+Every correction also produces `delta-handoff.json` and Markdown. The delta
+binds the previous run/SHA and new SHA, changed paths, tests added/run, preserved
+decisions, invalidated assumptions, deployment/migration/restart deltas, new
+risks, and an exact partition of open and closed finding IDs. Prior packages and
+handoffs remain immutable.
+
+## Reviewer context, bundle, and status
+
+After all runner gates, each new package contains `reviewer-context.json`,
+`review-status.json`, and mode-0644 `chatgpt-review-bundle.md`. Context holds
+exact task hash, run/session identity, Git state, paths, services, tests, scans,
+network use, lineage, sequence, risk, and review status. The standalone bundle
+contains the final manifest status, handoff, requirement/test map, correction
+history, risks, and recommended checks without embedding large logs.
+
+```bash
+scripts/kven-review-handoff RESULT status --json
+```
+
+Status reports run number, before/after SHA, runtime/tokens, commits/tests,
+received/closed/open findings, latest handoff/bundle, resumability, and final
+evidence-scan result.
+
+## Roles and workflow
+
+- The architectural session defines architecture and task boundaries.
+- The working session reads the canonical bundle first, validates exact Git and
+  high-risk evidence, then integrates or creates structured findings.
+- The Codex developer implements and corrects findings on the same lineage.
+- An optional fresh Codex reviewer may independently inspect the bundle and exact
+  code; it does not share the developer's assumptions.
+- A future control session may route project work; it is not implemented here.
+
+Manual patching is appropriate only for a trivial, obvious correction where the
+correction workflow would cost more than independent verification. Otherwise:
+initial run → handoff/bundle → review findings → correction run → delta review.
+The reviewer starts with the bundle, not broad repository rediscovery.
+
+Optional sanitized read-only HTTPS publication remains out of scope. If later
+approved, export only explicit handoff/context/bundle artifacts behind opaque
+run IDs, with no directory listing, source tree, credentials, environment files,
+databases, private messages, or arbitrary path access.
 
 ## Compatibility boundary
 

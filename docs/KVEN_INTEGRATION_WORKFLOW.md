@@ -22,6 +22,10 @@ The runner writes `result-manifest.json` with requested model (nullable), actual
 
 OPS-003A-capable automatic runs additionally require a validated reviewer
 handoff and record its schema, paths, status, and error in `reviewer_handoff`.
+They also bind `reviewer-context.json`, `review-status.json`, and the standalone
+`chatgpt-review-bundle.md`; corrective runs add exact previous-result/SHA context
+and a delta handoff. Final status artifacts are regenerated after postprocessing
+so an evidence-scan or validation failure cannot be hidden by an earlier handoff.
 `inspect` surfaces that record but does not repeat semantic review. Historical
 schema-2.0 bootstrap packages remain readable without retroactive enforcement.
 See [KVEN_CODEX_REVIEW_HANDOFF.md](KVEN_CODEX_REVIEW_HANDOFF.md) for schema 1.0,

@@ -18,6 +18,7 @@ VIEWS = {
     "requirement-evidence": ("requirement_evidence_map", "tests"),
     "uncertainties-weak-points": ("uncertainties", "known_weak_points"),
     "correction-results": ("correction_results",),
+    "status": (),
 }
 
 
@@ -41,7 +42,11 @@ def main(argv=None) -> int:
     try:
         if path.is_symlink() or not path.is_file():
             raise HandoffError(f"handoff does not exist or is unsafe: {path}")
-        output = selected(load_json(path, "handoff-to-reviewer.json"), args.view)
+        if args.view == "status":
+            status_path = path.parent / "review-status.json"
+            output = load_json(status_path, "review-status.json")
+        else:
+            output = selected(load_json(path, "handoff-to-reviewer.json"), args.view)
     except (OSError, HandoffError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

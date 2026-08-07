@@ -9,6 +9,7 @@
     "scripts/kven-codex-task",
     "scripts/kven-integrate-task",
     "scripts/kven-review-handoff",
+    "scripts/kven_evidence_security.py",
     "scripts/kven_handoff.py",
     "test_kven_codex_task.py",
     "test_kven_integrate_task.py",

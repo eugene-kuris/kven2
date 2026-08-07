@@ -22,7 +22,7 @@ from kven_evidence_security import redact as redact_evidence  # noqa: E402
 from kven_evidence_security import scan_git_range, scan_tree  # noqa: E402
 from kven_handoff import (  # noqa: E402
     HANDOFF_SCHEMA_VERSION, HandoffError, load_json, validate_handoff,
-    validate_review_findings,
+    validate_review_findings, validate_delta_handoff, validate_reviewer_context,
 )
 
 DEFAULT_REPOSITORY = Path("/opt/kven2")
@@ -62,10 +62,15 @@ class RunnerError(RuntimeError):
 
 
 def task_id_from(text: str, filename: str | None) -> str:
-    for line in text.splitlines():
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
         match = re.fullmatch(r"TASK ID:\s*(.+?)\s*", line)
         if match:
             return match.group(1)
+        if re.fullmatch(r"TASK ID:\s*", line) and index + 1 < len(lines):
+            candidate = lines[index + 1].strip()
+            if candidate:
+                return candidate
     if filename and filename != "-":
         return Path(filename).stem
     return "stdin-task"
@@ -110,8 +115,161 @@ def make_codex_command(codex: str, worktree: Path, output_file: Path, model: str
     return command
 
 
+def make_codex_resume_command(codex: str, worktree: Path, output_file: Path,
+                              model: str | None, session_id: str):
+    command = [codex, "--sandbox", "danger-full-access", "--ask-for-approval", "never"]
+    if model:
+        command.extend(("--model", model))
+    command.extend(("-C", str(worktree), "exec", "resume", "--output-last-message",
+                    str(output_file), session_id, "-"))
+    return command
+
+
+def load_correction_context(previous_result: Path, *, task: str, task_path: str,
+                            findings: dict, previous_feature_sha: str,
+                            repository: Path) -> dict:
+    package = previous_result.resolve(strict=True)
+    if previous_result.is_symlink() or not package.is_dir() or str(package).startswith("/agent/data/"):
+        raise RunnerError("unsafe previous result path")
+    manifest = load_json(package / "result-manifest.json", "previous result manifest")
+    handoff = load_json(package / "handoff-to-reviewer.json", "previous developer handoff")
+    identity = handoff.get("task_identity", {})
+    task_id = task_id_from(task, task_path)
+    if findings.get("task_id") != task_id or identity.get("task_id") != task_id:
+        raise RunnerError("task, findings, and previous handoff identity mismatch")
+    if manifest.get("feature_head") != previous_feature_sha or identity.get("feature_head") != previous_feature_sha:
+        raise RunnerError("previous result feature SHA is stale or incorrect")
+    reviewed = findings.get("reviewed_run", {})
+    if reviewed and reviewed.get("feature_sha") != previous_feature_sha:
+        raise RunnerError("review findings reference a stale feature SHA")
+    branch = manifest.get("feature_branch")
+    worktree = Path(manifest.get("worktree_path", "")).resolve()
+    if not branch or not worktree.is_dir():
+        raise RunnerError("previous feature branch or worktree is unavailable")
+    branch_head = git(repository, "rev-parse", "--verify", f"refs/heads/{branch}", check=False).stdout.strip()
+    if branch_head != previous_feature_sha:
+        raise RunnerError("previous feature branch no longer points to the reviewed SHA")
+    if git(worktree, "rev-parse", "HEAD", check=False).stdout.strip() != previous_feature_sha:
+        raise RunnerError("correction worktree is not at the reviewed SHA")
+    if repository_state(worktree)["status"]:
+        raise RunnerError("correction worktree must be clean")
+    prior_context_path = package / "reviewer-context.json"
+    prior_context = load_json(prior_context_path, "previous reviewer context") if prior_context_path.is_file() else {}
+    task_digest = hashlib.sha256(task.encode("utf-8")).hexdigest()
+    recorded_digest = prior_context.get("original_task_sha256")
+    if recorded_digest is not None and recorded_digest != task_digest:
+        raise RunnerError("original task hash differs from previous reviewer context")
+    previous_run_id = prior_context.get("codex_run_id", package.name)
+    sequence = prior_context.get("correction_sequence", 0) + 1
+    return {
+        "schema_version": HANDOFF_SCHEMA_VERSION,
+        "mode": "correction",
+        "task_id": task_id,
+        "original_task_path": str(Path(task_path).resolve()) if task_path != "-" else "stdin",
+        "original_task_sha256": task_digest,
+        "previous_result": str(package),
+        "previous_run_id": previous_run_id,
+        "previous_feature_sha": previous_feature_sha,
+        "feature_branch": branch,
+        "worktree": str(worktree),
+        "correction_sequence": sequence,
+        "previous_commit_list": manifest.get("commits_created", []),
+        "previous_test_evidence": manifest.get("tests", []),
+        "previous_requirement_map": handoff.get("requirement_evidence_map", []),
+        "previous_decisions": handoff.get("important_design_decisions", []),
+        "previous_review_status": prior_context.get("review_status", manifest.get("final_codex_status")),
+        "previous_handoff": handoff,
+        "review_findings": findings,
+        "previous_session_id": manifest.get("runtime_session_id"),
+    }
+
+
+def make_review_status(context: dict, manifest: dict) -> dict:
+    findings = context.get("review_findings", {}).get("findings", [])
+    delta = context.get("delta", {})
+    return {
+        "schema_version": HANDOFF_SCHEMA_VERSION,
+        "task_id": manifest["task_id"],
+        "developer_run_number": context.get("correction_sequence", 0) + 1,
+        "codex_session_id_if_available": manifest.get("runtime_session_id"),
+        "feature_sha_before": context.get("previous_feature_sha", manifest["baseline_head"]),
+        "feature_sha_after": manifest["feature_head"],
+        "runtime_seconds": manifest.get("codex_runtime_seconds"),
+        "token_usage": manifest.get("token_usage"),
+        "tests": manifest.get("tests", []),
+        "commits": manifest.get("commits_created", []),
+        "findings_received": [item["finding_id"] for item in findings],
+        "findings_closed": delta.get("closed_findings", []),
+        "findings_open": delta.get("open_findings", []),
+        "latest_handoff": "handoff-to-reviewer.md",
+        "reviewer_bundle": "chatgpt-review-bundle.md",
+        "session_resumable": bool(context.get("session_resumable")),
+        "final_status": manifest["final_codex_status"],
+        "evidence_secret_scan": manifest.get("evidence_secret_scan"),
+    }
+
+
+def make_reviewer_context(context: dict, manifest: dict, handoff: dict, *, task_path: str,
+                          task_sha256: str) -> dict:
+    findings = context.get("review_findings", {}).get("findings", [])
+    delta = context.get("delta", {})
+    value = {
+        "schema_version": HANDOFF_SCHEMA_VERSION, "task_id": manifest["task_id"],
+        "original_task_path": task_path, "original_task_sha256": task_sha256,
+        "codex_run_id": Path(manifest["result_package_path"]).name,
+        "codex_session_id_if_available": manifest.get("runtime_session_id"),
+        "start_time": manifest["started_at"], "finish_time": manifest["finished_at"],
+        "model": manifest.get("actual_runtime_model"), "baseline_sha": manifest["baseline_head"],
+        "feature_branch": manifest["feature_branch"], "feature_sha": manifest["feature_head"],
+        "worktree": manifest["worktree_path"], "commit_list": manifest["commits_created"],
+        "changed_paths": manifest["changed_files"],
+        "migration_paths": [item.get("database") for item in manifest.get("requested_migration_checks", [])],
+        "config_paths": [item.get("path") for item in manifest.get("requested_backup_targets", {}).get("configuration", [])],
+        "affected_services": manifest.get("requested_deployment_services", []),
+        "tests": [item.get("name") for item in manifest.get("tests", [])],
+        "test_results": manifest.get("tests", []), "secret_scan": manifest.get("secret_scan"),
+        "git_diff_check": manifest.get("git_diff_check"),
+        "network_used": manifest.get("network_use", {}).get("used"),
+        "developer_handoff_path": "handoff-to-reviewer.md",
+        "previous_run_id": context.get("previous_run_id"),
+        "previous_feature_sha": context.get("previous_feature_sha"),
+        "correction_sequence": context.get("correction_sequence", 0),
+        "review_status": manifest["final_codex_status"],
+        "known_risks": handoff.get("known_weak_points", []),
+        "architecture_deviations": [handoff.get("architecture_deviations", {})],
+        "findings_received": [item["finding_id"] for item in findings],
+        "findings_closed": delta.get("closed_findings", []), "findings_open": delta.get("open_findings", []),
+        "developer_run_number": context.get("correction_sequence", 0) + 1,
+        "runtime_seconds": manifest.get("codex_runtime_seconds"), "token_usage": manifest.get("token_usage"),
+        "session_resumable": bool(context.get("session_resumable")),
+        "correction_context_path": "correction-context.json" if context else None,
+        "delta_handoff_path": "delta-handoff.md" if delta else None,
+        "review_bundle_path": "chatgpt-review-bundle.md",
+    }
+    return validate_reviewer_context(value)
+
+
+def render_review_bundle(manifest: dict, handoff: dict, status: dict,
+                         delta: dict | None) -> str:
+    return "\n".join((
+        f"# ChatGPT review bundle: {manifest['task_id']}", "",
+        f"Final status: **{manifest['final_codex_status']}**",
+        f"Baseline: `{manifest['baseline_head']}`",
+        f"Feature HEAD: `{manifest['feature_head']}`",
+        f"Branch: `{manifest['feature_branch']}`", "",
+        "## Developer handoff", "", json.dumps(handoff, indent=2, sort_keys=True), "",
+        "## Requirement and test evidence", "",
+        json.dumps(handoff.get("requirement_evidence_map", []), indent=2, sort_keys=True), "",
+        "## Correction history", "", json.dumps(delta or {}, indent=2, sort_keys=True), "",
+        "## Final status and observability", "", json.dumps(status, indent=2, sort_keys=True), "",
+        "## Reviewer recommendations", "",
+        json.dumps(handoff.get("recommended_reviewer_checks", []), indent=2, sort_keys=True), "",
+        "Raw logs remain separate in this result package.", "",
+    ))
+
+
 def execution_contract(task: str, allow_network: bool, *, result_dir: Path | None = None,
-                       findings: dict | None = None) -> str:
+                       findings: dict | None = None, correction_context: dict | None = None) -> str:
     network = (
         "Network access is permitted only where the supplied task explicitly requires it."
         if allow_network else
@@ -120,14 +278,14 @@ def execution_contract(task: str, allow_network: bool, *, result_dir: Path | Non
     handoff = ""
     if result_dir is not None:
         handoff = f"""
-Before finishing, write schema {HANDOFF_SCHEMA_VERSION} handoff-to-reviewer.json and handoff-to-reviewer.md directly into {result_dir}. JSON is authoritative and Markdown must render the same content, including the task ID and exact feature HEAD. Cover every requirement and every changed file with concrete symbol/test/artifact evidence. Explicitly include empty lists for non-applicable sections. Do not include secrets or protected data.
+Before finishing, write schema {HANDOFF_SCHEMA_VERSION} handoff-to-reviewer.json and handoff-to-reviewer.md directly into {result_dir}. JSON is authoritative and Markdown must render the same content, including the task ID and exact feature HEAD. Cover every requirement and every changed file with concrete symbol/test/artifact evidence. Explicitly cover existing architecture reused, runtime-path changes, persistent-state changes, security/privacy impact, deployment impact, and things not tested; use empty lists when not applicable. Do not include secrets or protected data.
 """
     correction = ""
     if findings is not None:
         finding_ids = [item["finding_id"] for item in findings["findings"]]
         preserve = {item["finding_id"]: item["must_preserve"] for item in findings["findings"]}
         correction = f"""
-This is a narrow corrective run. Consume the immutable copied findings at {result_dir / 'review-findings.json'}. Address every finding ID exactly once and preserve its must_preserve constraints. The corrective handoff must include correction_results for {json.dumps(finding_ids)}. Preserve constraints: {json.dumps(preserve, sort_keys=True)}.
+This is a narrow corrective run. Consume the complete immutable context at {result_dir / 'correction-context.json'} and copied findings at {result_dir / 'review-findings.json'}. Address every finding ID exactly once and preserve its must_preserve constraints and still-valid prior decisions. The corrective handoff must include correction_results for {json.dumps(finding_ids)}. Also write delta-handoff.json and delta-handoff.md with exact lineage, changed paths since the previous feature SHA, decision/assumption/deployment/migration/restart/risk deltas, and open/closed findings. Preserve constraints: {json.dumps(preserve, sort_keys=True)}.
 """
     return f"""KVEN II CODEX EXECUTION CONTRACT
 {network}
@@ -476,6 +634,9 @@ def make_result_manifest(*, task_id: str, started: dt.datetime, finished: dt.dat
         "deployment_contract_error": contract_error,
         "reviewer_handoff": handoff_validation,
         "review_findings": review_findings,
+        "reviewer_context_path": "reviewer-context.json",
+        "review_status_path": "review-status.json",
+        "review_bundle_path": "chatgpt-review-bundle.md",
         "requested_deployment_services": (contract or {}).get("services", []),
         "requested_backup_targets": (contract or {}).get("backups", {}),
         "requested_migration_checks": (contract or {}).get("migration_checks", []),
@@ -577,6 +738,9 @@ def parse_args(argv=None):
     parser.add_argument("--model", help="model forwarded to Codex")
     parser.add_argument("--allow-network", action="store_true", help="permit only task-required network use")
     parser.add_argument("--review-findings", help="read-only review-findings.json input for a corrective run")
+    parser.add_argument("--previous-result", help="previous result package for same-lineage correction")
+    parser.add_argument("--previous-feature-sha", help="exact reviewed feature SHA required for correction")
+    parser.add_argument("--no-resume", action="store_true", help="construct full correction context without resuming the prior Codex session")
     return parser.parse_args(argv)
 
 
@@ -595,6 +759,7 @@ def main(argv=None, stdin=None) -> int:
     lock_handle = None
     baseline = origin_main = None
     raw_task_id = None
+    task = ""
     integrity_code = 1
     secret_scan = {"files_scanned": [], "matches": []}
     validation_tests = []
@@ -606,6 +771,7 @@ def main(argv=None, stdin=None) -> int:
                           "json_path": "handoff-to-reviewer.json", "markdown_path": "handoff-to-reviewer.md",
                           "error": "handoff validation not run"}
     review_findings = None
+    correction_context = None
     feature_head_before_validation = None
     validation_repository_state = None
     runtime_metadata = {
@@ -660,7 +826,24 @@ def main(argv=None, stdin=None) -> int:
             except HandoffError as exc:
                 raise RunnerError(str(exc)) from exc
             _json_result(result_dir / "review-findings.json", review_findings)
-        effective = execution_contract(task, args.allow_network, result_dir=result_dir, findings=review_findings)
+        if bool(args.previous_result) != bool(args.previous_feature_sha):
+            raise RunnerError("correction requires both --previous-result and --previous-feature-sha")
+        if args.previous_result:
+            if review_findings is None:
+                raise RunnerError("correction requires --review-findings")
+            correction_context = load_correction_context(
+                Path(args.previous_result), task=task, task_path=args.task_file,
+                findings=review_findings, previous_feature_sha=args.previous_feature_sha,
+                repository=repository,
+            )
+            branch = correction_context["feature_branch"]
+            worktree = Path(correction_context["worktree"])
+            correction_context["session_resumable"] = bool(
+                correction_context.get("previous_session_id") and not args.no_resume
+            )
+            _json_result(result_dir / "correction-context.json", correction_context)
+        effective = execution_contract(task, args.allow_network, result_dir=result_dir,
+                                       findings=review_findings, correction_context=correction_context)
         write_result(result_dir / "task.txt", redact_evidence(task))
         write_result(result_dir / "effective-prompt.txt", redact_evidence(effective))
         write_result(result_dir / "task-id.txt", raw_task_id + "\n")
@@ -669,11 +852,19 @@ def main(argv=None, stdin=None) -> int:
         write_result(result_dir / "authentication-status.txt", (auth.stdout or auth.stderr).strip() + "\n")
         write_result(result_dir / "main-baseline.txt", f"branch=main\nhead={baseline}\norigin/main={origin_main}\n")
 
-        git(repository, "worktree", "add", "-b", branch, worktree, baseline)
+        if correction_context is None:
+            git(repository, "worktree", "add", "-b", branch, worktree, baseline)
+        elif git(repository, "merge-base", "--is-ancestor", baseline, args.previous_feature_sha, check=False).returncode:
+            raise RunnerError("current approved main is not incorporated in the reviewed feature lineage")
         write_result(result_dir / "worktree.txt", f"branch={branch}\npath={worktree}\n")
         final_message = result_dir / "final-response.txt"
         final_message.touch(mode=0o644)
-        command = make_codex_command(codex, worktree, final_message, args.model)
+        if correction_context and correction_context["session_resumable"]:
+            command = make_codex_resume_command(
+                codex, worktree, final_message, args.model, correction_context["previous_session_id"]
+            )
+        else:
+            command = make_codex_command(codex, worktree, final_message, args.model)
         completed = run(command, input_text=effective, check=False)
         write_result(result_dir / "stdout.txt", redact_evidence(completed.stdout))
         write_result(result_dir / "stderr-progress.txt", redact_evidence(completed.stderr))
@@ -707,6 +898,21 @@ def main(argv=None, stdin=None) -> int:
                 result_package=str(result_dir),
                 finding_ids=[item["finding_id"] for item in review_findings["findings"]] if review_findings else None,
             )
+            if correction_context:
+                delta_json_path = result_dir / "delta-handoff.json"
+                delta_md_path = result_dir / "delta-handoff.md"
+                if not delta_json_path.is_file() or not delta_md_path.is_file():
+                    raise HandoffError("corrective result requires delta handoff JSON and Markdown")
+                delta_data = validate_delta_handoff(
+                    load_json(delta_json_path, "delta-handoff.json"),
+                    [item["finding_id"] for item in review_findings["findings"]],
+                )
+                if (delta_data["previous_feature_sha"] != correction_context["previous_feature_sha"]
+                        or delta_data["feature_sha"] != feature_head_before_validation):
+                    raise HandoffError("delta handoff lineage mismatch")
+                if raw_task_id not in delta_md_path.read_text(encoding="utf-8"):
+                    raise HandoffError("delta handoff Markdown task disagreement")
+                correction_context["delta"] = delta_data
             handoff_validation = {
                 "passed": True, "schema_version": HANDOFF_SCHEMA_VERSION,
                 "json_path": "handoff-to-reviewer.json", "markdown_path": "handoff-to-reviewer.md",
@@ -827,6 +1033,19 @@ def main(argv=None, stdin=None) -> int:
                     )
                     _json_result(result_dir / "result-manifest.json", manifest)
                     write_result(result_dir / "result-summary.md", make_result_summary(manifest))
+                    handoff_data = load_json(result_dir / "handoff-to-reviewer.json", "handoff-to-reviewer.json")
+                    artifact_context = correction_context or {}
+                    reviewer_context = make_reviewer_context(
+                        artifact_context, manifest, handoff_data,
+                        task_path=str(Path(args.task_file).resolve()) if args.task_file != "-" else "stdin",
+                        task_sha256=hashlib.sha256(task.encode("utf-8")).hexdigest(),
+                    )
+                    _json_result(result_dir / "reviewer-context.json", reviewer_context)
+                    review_status = make_review_status(artifact_context, manifest)
+                    _json_result(result_dir / "review-status.json", review_status)
+                    write_result(result_dir / "chatgpt-review-bundle.md", render_review_bundle(
+                        manifest, handoff_data, review_status, artifact_context.get("delta")
+                    ))
                     evidence_secret_scan = scan_tree(result_dir)
                     manifest["evidence_secret_scan"] = evidence_secret_scan
                     if not evidence_secret_scan["passed"]:
@@ -838,12 +1057,23 @@ def main(argv=None, stdin=None) -> int:
                         write_result(result_dir / "summary.txt", manifest["summary"] + "\n")
                     _json_result(result_dir / "result-manifest.json", manifest)
                     write_result(result_dir / "result-summary.md", make_result_summary(manifest))
+                    reviewer_context = make_reviewer_context(
+                        artifact_context, manifest, handoff_data,
+                        task_path=str(Path(args.task_file).resolve()) if args.task_file != "-" else "stdin",
+                        task_sha256=hashlib.sha256(task.encode("utf-8")).hexdigest(),
+                    )
+                    _json_result(result_dir / "reviewer-context.json", reviewer_context)
+                    review_status = make_review_status(artifact_context, manifest)
+                    _json_result(result_dir / "review-status.json", review_status)
+                    write_result(result_dir / "chatgpt-review-bundle.md", render_review_bundle(
+                        manifest, handoff_data, review_status, artifact_context.get("delta")
+                    ))
                     evidence_secret_scan = scan_tree(result_dir)
                     if not evidence_secret_scan["passed"]:
                         manifest["evidence_secret_scan"] = evidence_secret_scan
                         manifest["final_codex_status"] = "FAIL"
                         _json_result(result_dir / "result-manifest.json", manifest)
-            except OSError as exc:
+            except (OSError, HandoffError) as exc:
                 print(f"error: result-package failure: {exc}", file=sys.stderr)
                 exit_code = 1
         if lock_handle:
