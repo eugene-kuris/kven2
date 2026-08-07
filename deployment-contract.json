@@ -13,9 +13,9 @@
     "configuration": [],
     "sqlite": []
   },
-  "expected_baseline": "6e98e393ba854cc92b847d0fe84335a72395d94a",
+  "expected_baseline": "ac6a953649e9c68b6ef1283a039a9659f04ea48c",
   "fatal_log_checks": [],
-  "feature_branch": "codex/work-kven-ops-002b-codex-task-20260807T053421Z-1640034",
+  "feature_branch": "codex/work-kven-ops-002c-codex-task-20260807T074350Z-1885286",
   "migration_checks": [],
   "post_merge_tests": [
     {
