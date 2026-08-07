@@ -15,66 +15,142 @@
     "telegram_kven_client.py",
     "telegram_store.py",
     "telegram_workers.py",
-    "test_telegram_compaction.py"
+    "test_telegram_compaction.py",
+    "routes.py"
   ],
-  "services": ["kven2-telegram-gateway.service"],
+  "services": [
+    "kven2-telegram-gateway.service",
+    "kven2-main.service"
+  ],
   "backups": {
     "configuration": [],
-    "sqlite": [{
-      "path": "/agent/data/kven2/telegram_gateway.db",
-      "services": ["kven2-telegram-gateway.service"]
-    }]
-  },
-  "migration_checks": [{
-    "database": "/agent/data/kven2/telegram_gateway.db",
-    "database_env": "KVEN_TELEGRAM_MIGRATION_DB",
-    "cwd": "/opt/kven2",
-    "command": ["/opt/kven2/venv/bin/python", "scripts/validate-telegram-compaction-migration"],
-    "application_smoke_command": ["/opt/kven2/venv/bin/python", "scripts/validate-telegram-compaction-migration"],
-    "idempotent": true,
-    "timeout": 120,
-    "verification_sql": [
-      "SELECT name FROM sqlite_master WHERE type='table' AND name='telegram_compaction_checkpoints'",
-      "PRAGMA integrity_check"
+    "sqlite": [
+      {
+        "path": "/agent/data/kven2/telegram_gateway.db",
+        "services": [
+          "kven2-telegram-gateway.service"
+        ]
+      }
     ]
-  }],
+  },
+  "migration_checks": [
+    {
+      "database": "/agent/data/kven2/telegram_gateway.db",
+      "database_env": "KVEN_TELEGRAM_MIGRATION_DB",
+      "cwd": "/opt/kven2",
+      "command": [
+        "/opt/kven2/venv/bin/python",
+        "scripts/validate-telegram-compaction-migration"
+      ],
+      "application_smoke_command": [
+        "/opt/kven2/venv/bin/python",
+        "scripts/validate-telegram-compaction-migration"
+      ],
+      "idempotent": true,
+      "timeout": 120,
+      "verification_sql": [
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='telegram_compaction_checkpoints'",
+        "PRAGMA integrity_check"
+      ]
+    }
+  ],
   "result_validation_tests": [
     {
       "name": "focused-telegram-compaction-and-continuity",
-      "command": ["/opt/kven2/venv/bin/python", "-m", "unittest", "-v", "test_telegram_compaction", "test_telegram_continuity", "test_telegram_workers", "test_telegram_gateway", "test_telegram_delivery_worker", "test_telegram_runtime"],
+      "command": [
+        "/opt/kven2/venv/bin/python",
+        "-m",
+        "unittest",
+        "-v",
+        "test_telegram_compaction",
+        "test_telegram_continuity",
+        "test_telegram_workers",
+        "test_telegram_gateway",
+        "test_telegram_delivery_worker",
+        "test_telegram_runtime"
+      ],
       "timeout": 900
     },
     {
       "name": "trusted-feature-migration-runner-regressions",
-      "command": ["/opt/kven2/venv/bin/python", "-m", "unittest", "-v", "test_kven_integrate_task.RepositoryFixture.test_feature_only_migration_runs_from_exact_checkout", "test_kven_integrate_task.RepositoryFixture.test_migration_checkout_cwd_mapping_and_refusal"],
+      "command": [
+        "/opt/kven2/venv/bin/python",
+        "-m",
+        "unittest",
+        "-v",
+        "test_kven_integrate_task.RepositoryFixture.test_feature_only_migration_runs_from_exact_checkout",
+        "test_kven_integrate_task.RepositoryFixture.test_migration_checkout_cwd_mapping_and_refusal"
+      ],
       "timeout": 900
     },
     {
       "name": "full-repository-suite",
-      "command": ["/opt/kven2/venv/bin/python", "-m", "unittest", "discover", "-v"],
+      "command": [
+        "/opt/kven2/venv/bin/python",
+        "-m",
+        "unittest",
+        "discover",
+        "-v"
+      ],
       "timeout": 1800
     }
   ],
-  "pre_merge_tests": [{
-    "name": "feature-checkout-full-suite",
-    "command": ["/opt/kven2/venv/bin/python", "-m", "unittest", "discover", "-v"],
-    "timeout": 1800
-  }],
-  "post_merge_tests": [{
-    "name": "staged-main-full-suite",
-    "command": ["/opt/kven2/venv/bin/python", "-m", "unittest", "discover", "-v"],
-    "timeout": 1800
-  }],
-  "readiness_checks": [{
-    "name": "telegram-gateway-active",
-    "command": ["systemctl", "is-active", "kven2-telegram-gateway.service"],
-    "timeout": 30
-  }],
-  "fatal_log_checks": [{
-    "name": "telegram-gateway-no-recent-fatal",
-    "command": ["/opt/kven2/venv/bin/python", "scripts/check-telegram-fatal-logs"],
-    "timeout": 30
-  }],
+  "pre_merge_tests": [
+    {
+      "name": "feature-checkout-full-suite",
+      "command": [
+        "/opt/kven2/venv/bin/python",
+        "-m",
+        "unittest",
+        "discover",
+        "-v"
+      ],
+      "timeout": 1800
+    }
+  ],
+  "post_merge_tests": [
+    {
+      "name": "staged-main-full-suite",
+      "command": [
+        "/opt/kven2/venv/bin/python",
+        "-m",
+        "unittest",
+        "discover",
+        "-v"
+      ],
+      "timeout": 1800
+    }
+  ],
+  "readiness_checks": [
+    {
+      "name": "telegram-gateway-active",
+      "command": [
+        "systemctl",
+        "is-active",
+        "kven2-telegram-gateway.service"
+      ],
+      "timeout": 30
+    },
+    {
+      "name": "kven2-main-active",
+      "command": [
+        "systemctl",
+        "is-active",
+        "kven2-main.service"
+      ],
+      "timeout": 30
+    }
+  ],
+  "fatal_log_checks": [
+    {
+      "name": "telegram-gateway-no-recent-fatal",
+      "command": [
+        "/opt/kven2/venv/bin/python",
+        "scripts/check-telegram-fatal-logs"
+      ],
+      "timeout": 30
+    }
+  ],
   "acceptance_checklist": [
     "Verify exact recent context and an exact reply to an old message override derived context.",
     "Verify unrelated topics remain unrelated and uncertain or contradictory claims remain unresolved.",
