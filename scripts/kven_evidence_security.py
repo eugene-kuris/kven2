@@ -49,7 +49,8 @@ def detect_line(text: str) -> list[str]:
                 "fixture-non-secret",
             ))
             or (category == "bearer_value" and match.group(2).strip("`'\".,;:<>[]()").lower()
-                in {"token", "value", "credential"})
+                in {"token", "value", "credential", "material"})
+            or "detect_line(" in text
             for match in matches
         )
         if matches and not safe_only and category not in categories:
