@@ -167,5 +167,41 @@ class TelegramCompactionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(parsed, payload)
 
 
+    def test_non_string_overview_is_discarded_but_provenance_stays_strict(self):
+        payload = {
+            "schema_version": "telegram-compaction-v1",
+            "overview": {"text": "model used the wrong shape"},
+            "established_context": [
+                {
+                    "text": "Grounded fact.",
+                    "source_entry_ids": [1],
+                }
+            ],
+            "speaker_statements": [],
+            "uncertainty_and_disagreement": [],
+            "open_loops": [],
+            "commitments": [],
+            "important_reference_ids": [1],
+        }
+
+        parsed = telegram_compaction.parse_and_validate_payload(
+            json.dumps(payload),
+            {1},
+        )
+
+        self.assertEqual(parsed["overview"], "")
+        self.assertEqual(
+            parsed["established_context"][0]["source_entry_ids"],
+            [1],
+        )
+
+        payload["established_context"][0]["source_entry_ids"] = [99]
+        with self.assertRaises(ValueError):
+            telegram_compaction.parse_and_validate_payload(
+                json.dumps(payload),
+                {1},
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

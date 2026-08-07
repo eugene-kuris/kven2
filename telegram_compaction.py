@@ -50,8 +50,14 @@ contradiction into resolution, an intention into a decision, or an unfinished
 action into a completed action. Preserve competing claims as attributed or
 unresolved. Completion/cancellation is allowed only when a later entry says so.
 Every semantic item must cite one or more supplied entry IDs. The overview must
-be neutral and may not add details absent from the entries. This is derived,
-potentially incomplete conversation context, not authoritative memory."""
+be a plain JSON string, neutral, and may not add details absent from the entries.
+Use exactly this value shape:
+{{"schema_version":"telegram-compaction-v1","overview":"plain text",
+"established_context":[],"speaker_statements":[],
+"uncertainty_and_disagreement":[],"open_loops":[],"commitments":[],
+"important_reference_ids":[]}}
+Populate list items only using the required fields described above. This is
+derived, potentially incomplete conversation context, not authoritative memory."""
     return [
         {"role": "system", "content": instructions},
         {"role": "user", "content": json.dumps(
@@ -73,8 +79,11 @@ def parse_and_validate_payload(raw: str, valid_ids: set[int]) -> dict[str, Any]:
         raise ValueError("compaction output is not valid JSON") from exc
     if not isinstance(payload, dict) or payload.get("schema_version") != SCHEMA_VERSION:
         raise ValueError("compaction schema version is missing or unsupported")
+    # Overview is convenience prose without per-item provenance. If the model
+    # violates its scalar shape, discard it rather than weakening validation of
+    # the source-cited semantic sections.
     if not isinstance(payload.get("overview"), str):
-        raise ValueError("compaction overview must be text")
+        payload["overview"] = ""
     for field in ITEM_FIELDS:
         items = payload.get(field)
         if not isinstance(items, list):
