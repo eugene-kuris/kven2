@@ -1,5 +1,9 @@
+import asyncio
 import base64
+import os
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -223,6 +227,56 @@ class DurableMediaTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(users[0]["content"], "before")
         self.assertIsInstance(users[1]["content"], list)
         self.assertIn("Replies to Telegram message 7", context[-2]["content"])
+
+
+class MigrationValidatorTests(unittest.TestCase):
+    def test_smoke_is_independent_of_existing_queued_jobs(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db = Path(temp_dir) / "gateway.db"
+
+            async def seed_unrelated_job():
+                store = TelegramStore(str(db))
+                await store.init()
+                inserted = await store.enqueue_text_update(
+                    update_id=8_100_000_001,
+                    chat_id=8_100_000_002,
+                    user_id=8_100_000_003,
+                    message_id=8_100_000_004,
+                    text="unrelated queued job",
+                    raw_update={"update_id": 8_100_000_001},
+                )
+                self.assertTrue(inserted)
+
+            asyncio.run(seed_unrelated_job())
+            env = os.environ.copy()
+            env["TELEGRAM_MIGRATION_DB"] = str(db)
+            repository = Path(__file__).resolve().parent
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(repository / "scripts" / "validate-telegram-vision-migration"),
+                    "smoke",
+                ],
+                cwd=repository,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(
+                completed.returncode,
+                0,
+                msg=f"stdout={completed.stdout!r} stderr={completed.stderr!r}",
+            )
+
+            async def verify_unrelated_job_remains():
+                store = TelegramStore(str(db))
+                await store.init()
+                job = await store.claim_next_job()
+                self.assertIsNotNone(job)
+                self.assertEqual(job.batch_update_ids, (8_100_000_001,))
+
+            asyncio.run(verify_unrelated_job_remains())
 
 
 if __name__ == "__main__":
