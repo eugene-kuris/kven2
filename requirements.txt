@@ -6,3 +6,4 @@ hnswlib
 numpy
 python-dotenv
 sentence-transformers
+Telethon==1.44.0

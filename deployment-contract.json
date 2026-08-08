@@ -1,82 +1,71 @@
 {
   "schema_version": "2.0",
-  "expected_baseline": "e7092aa1e3cb698caf50fe8859a5b715cba334f8",
-  "feature_branch": "codex/work-kven-tg-vision-001-20260808T145406Z-2989421",
+  "expected_baseline": "f40e17486ec32cf5869916a738c525250d60decd",
+  "feature_branch": "codex/work-kven-tg-user-001-20260808T181310Z-3057084",
   "allowed_paths": [
+    ".gitignore",
     "deployment-contract.json",
-    "scripts/validate-telegram-vision-migration",
-    "telegram_bot_api.py",
-    "telegram_kven_client.py",
-    "telegram_store.py",
-    "telegram_updates.py",
-    "telegram_workers.py",
-    "test_telegram_vision.py"
+    "docs/TELEGRAM_USER_ACCOUNT.md",
+    "infra/telegram-user/telegram-user.env.example",
+    "infra/telegram-user/systemd/kven2-telegram-user.service",
+    "requirements.txt",
+    "telegram_user_auth.py",
+    "telegram_user_control.py",
+    "telegram_user_runtime.py",
+    "test_telegram_user_runtime.py"
   ],
-  "services": ["kven2-telegram-gateway.service"],
+  "services": [],
   "backups": {
-    "sqlite": [
-      {
-        "path": "/agent/data/kven2/telegram_gateway.db",
-        "services": ["kven2-telegram-gateway.service"]
-      }
-    ],
+    "sqlite": [],
     "configuration": []
   },
-  "migration_checks": [
-    {
-      "database": "/agent/data/kven2/telegram_gateway.db",
-      "database_env": "TELEGRAM_MIGRATION_DB",
-      "command": ["/opt/kven2/venv/bin/python", "scripts/validate-telegram-vision-migration", "migrate"],
-      "application_smoke_command": ["/opt/kven2/venv/bin/python", "scripts/validate-telegram-vision-migration", "smoke"],
-      "idempotent": true,
-      "timeout": 120
-    }
-  ],
+  "migration_checks": [],
   "result_validation_tests": [
     {
-      "name": "telegram-vision-focused",
-      "command": ["/opt/kven2/venv/bin/python", "-m", "unittest", "-v", "test_telegram_vision.py"],
+      "name": "telegram-user-foundation",
+      "command": ["/opt/kven2/venv/bin/python", "-m", "unittest", "-v", "test_telegram_user_runtime.py"],
       "timeout": 300
     },
     {
-      "name": "telegram-and-context-regression",
-      "command": ["/opt/kven2/venv/bin/python", "-m", "unittest", "-v", "test_telegram_bot_api.py", "test_telegram_updates.py", "test_telegram_store.py", "test_telegram_continuity.py", "test_telegram_polling_worker.py", "test_telegram_workers.py", "test_telegram_runtime.py", "test_telegram_gateway.py", "test_telegram_kven_client.py", "test_telegram_compaction.py", "test_context_window.py"],
-      "timeout": 900
+      "name": "telegram-regressions",
+      "command": ["/opt/kven2/venv/bin/python", "-m", "unittest", "-v", "test_telegram_bot_api.py", "test_telegram_updates.py", "test_telegram_store.py", "test_telegram_continuity.py", "test_telegram_delivery_store.py", "test_telegram_delivery_worker.py", "test_telegram_polling_worker.py", "test_telegram_workers.py", "test_telegram_runtime.py", "test_telegram_gateway.py", "test_telegram_kven_client.py", "test_telegram_compaction.py", "test_telegram_vision.py"],
+      "timeout": 1200
     }
   ],
   "pre_merge_tests": [
     {
-      "name": "telegram-vision-and-regressions-pre-merge",
-      "command": ["/opt/kven2/venv/bin/python", "-m", "unittest", "-v", "test_telegram_vision.py", "test_telegram_bot_api.py", "test_telegram_updates.py", "test_telegram_store.py", "test_telegram_continuity.py", "test_telegram_polling_worker.py", "test_telegram_workers.py", "test_telegram_runtime.py", "test_telegram_gateway.py", "test_telegram_kven_client.py", "test_telegram_compaction.py", "test_context_window.py"],
-      "timeout": 900
+      "name": "telegram-user-and-bot-api-pre-merge",
+      "command": ["/opt/kven2/venv/bin/python", "-m", "unittest", "-v", "test_telegram_user_runtime.py", "test_telegram_bot_api.py", "test_telegram_updates.py", "test_telegram_store.py", "test_telegram_continuity.py", "test_telegram_delivery_store.py", "test_telegram_delivery_worker.py", "test_telegram_polling_worker.py", "test_telegram_workers.py", "test_telegram_runtime.py", "test_telegram_gateway.py", "test_telegram_kven_client.py", "test_telegram_compaction.py", "test_telegram_vision.py"],
+      "timeout": 1200
     }
   ],
   "post_merge_tests": [
     {
-      "name": "telegram-vision-and-regressions-post-merge",
-      "command": ["/opt/kven2/venv/bin/python", "-m", "unittest", "-v", "test_telegram_vision.py", "test_telegram_bot_api.py", "test_telegram_updates.py", "test_telegram_store.py", "test_telegram_continuity.py", "test_telegram_polling_worker.py", "test_telegram_workers.py", "test_telegram_runtime.py", "test_telegram_gateway.py", "test_telegram_kven_client.py", "test_telegram_compaction.py", "test_context_window.py"],
-      "timeout": 900
+      "name": "telegram-user-and-bot-api-post-merge",
+      "command": ["/opt/kven2/venv/bin/python", "-m", "unittest", "-v", "test_telegram_user_runtime.py", "test_telegram_bot_api.py", "test_telegram_updates.py", "test_telegram_store.py", "test_telegram_continuity.py", "test_telegram_delivery_store.py", "test_telegram_delivery_worker.py", "test_telegram_polling_worker.py", "test_telegram_workers.py", "test_telegram_runtime.py", "test_telegram_gateway.py", "test_telegram_kven_client.py", "test_telegram_compaction.py", "test_telegram_vision.py"],
+      "timeout": 1200
     }
   ],
   "readiness_checks": [
     {
-      "name": "telegram-gateway-active",
+      "name": "existing-telegram-bot-api-remains-active",
       "command": ["systemctl", "is-active", "kven2-telegram-gateway.service"],
       "timeout": 30
     }
   ],
   "fatal_log_checks": [
     {
-      "name": "telegram-gateway-fatal-logs",
+      "name": "existing-telegram-bot-api-fatal-logs",
       "command": ["/usr/bin/python3", "/opt/kven2/scripts/check-telegram-fatal-logs"],
       "timeout": 60
     }
   ],
   "acceptance_checklist": [
-    "Send an image containing text with the caption 'Напиши текст с картинки' and confirm the response uses text visible only in the image.",
-    "Send a vehicle photograph with the caption 'Определи номер и модель автомобиля на фото' and confirm an image-grounded attempt.",
-    "For restart recovery, stop the gateway only after an image update is durably visible as pending, restart it, and confirm exactly one response is produced after media acquisition completes.",
-    "Confirm ordinary text-only messages and replies still preserve conversation ordering and delivery behavior."
+    "Review docs/TELEGRAM_USER_ACCOUNT.md and approve the separate root-only configuration, durable session, dependency installation, and unit installation before live deployment.",
+    "After controlled installation and one-time console authorization, receive a distinctive private MTProto message and match its sender ID, peer ID, message ID, timestamp, length, and SHA-256 evidence.",
+    "Use the root-local Unix-socket command for exactly one explicit private send and verify the returned message ID/timestamp and visible Kven user identity.",
+    "Restart only kven2-telegram-user.service, confirm no authorization prompt and the same own ID/session path, then repeat one receive and one send.",
+    "Confirm kven2-telegram-gateway.service remains active and its existing text and vision paths remain operational."
   ],
   "rollback": {
     "restore_git": true,
