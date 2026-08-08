@@ -1,7 +1,7 @@
 {
   "schema_version": "2.0",
   "expected_baseline": "e7092aa1e3cb698caf50fe8859a5b715cba334f8",
-  "feature_branch": "codex/work-kven-tg-vision-001-20260808T142408Z-2913984",
+  "feature_branch": "codex/work-kven-tg-vision-001-20260808T145406Z-2989421",
   "allowed_paths": [
     "deployment-contract.json",
     "scripts/validate-telegram-vision-migration",
@@ -68,7 +68,7 @@
   "fatal_log_checks": [
     {
       "name": "telegram-gateway-fatal-logs",
-      "command": ["/opt/kven2/scripts/check-telegram-fatal-logs"],
+      "command": ["/usr/bin/python3", "/opt/kven2/scripts/check-telegram-fatal-logs"],
       "timeout": 60
     }
   ],
