@@ -1,0 +1,65 @@
+#!/bin/bash
+set -euo pipefail
+
+CONFIG=/etc/kven-human-notifier/config
+[ -r "$CONFIG" ] || { echo "ERROR: notifier config unreadable" >&2; exit 2; }
+# shellcheck disable=SC1090
+. "$CONFIG"
+
+EVENT="${1:-}"
+WORK_ID="${2:-}"
+
+case "$EVENT" in
+    NEED_USER)     TEXT="KVEN NEED_USER ${WORK_ID}. Open ChatGPT." ;;
+    WORK_FAILED)   TEXT="KVEN WORK_FAILED ${WORK_ID}. Open ChatGPT." ;;
+    WORK_COMPLETE) TEXT="KVEN WORK_COMPLETE ${WORK_ID}." ;;
+    *) echo "ERROR: unsupported event" >&2; exit 3 ;;
+esac
+
+if ! [[ "$WORK_ID" =~ ^[A-Za-z0-9._:-]{1,80}$ ]]; then
+    echo "ERROR: invalid work id" >&2
+    exit 4
+fi
+
+tmp="$(mktemp -d /tmp/kven-human-notifier.XXXXXX)"
+trap 'rm -rf "$tmp"' EXIT
+
+page="$tmp/sms.html"
+response="$tmp/response.html"
+headers="$tmp/headers"
+
+curl -fsS --max-time 8 --interface "$SOURCE_ADDR" --basic \
+    -u "${GOIP_USER}:${GOIP_PASS}" \
+    "http://${GOIP_ADDR}/default/en_US/tools.html?type=sms" \
+    -o "$page"
+
+smskey="$(
+    sed -n 's/.*name="smskey" value="\([^"]*\)".*/\1/p' "$page" | head -1
+)"
+[ -n "$smskey" ] || { echo "ERROR: smskey not found" >&2; exit 5; }
+
+http="$(
+    curl -sS --max-time 15 --interface "$SOURCE_ADDR" --basic \
+        -u "${GOIP_USER}:${GOIP_PASS}" \
+        -D "$headers" \
+        -o "$response" \
+        -w '%{http_code}' \
+        --data-urlencode "${GOIP_LINE_FIELD}=1" \
+        --data-urlencode "smskey=${smskey}" \
+        --data-urlencode 'action=SMS' \
+        --data-urlencode "telnum=${DEST_NUMBER}" \
+        --data-urlencode "smscontent=${TEXT}" \
+        --data-urlencode 'send=Send' \
+        "http://${GOIP_ADDR}/default/en_US/sms_info.html?type=sms"
+)"
+
+if [ "$http" != "200" ]; then
+    echo "ERROR: GoIP returned HTTP ${http}" >&2
+    exit 6
+fi
+
+logger -t kven-human-notifier -- "event=${EVENT} work_id=${WORK_ID} http=200 line=${GOIP_LINE_FIELD}"
+printf 'KVEN_HUMAN_NOTIFY=PASS\n'
+printf 'event=%s\n' "$EVENT"
+printf 'work_id=%s\n' "$WORK_ID"
+printf 'http=200\n'

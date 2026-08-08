@@ -1,0 +1,14 @@
+{
+  "accepted_sender": "authorized-sender@example.invalid",
+  "inbox_dir": "/home/qwenii/inbox",
+  "state_dir": "/var/lib/kven-qwenii-runner",
+  "work_dir": "/home/qwenii/work",
+  "results_dir": "/home/qwenii/results",
+  "execution_user": "qwenii",
+  "runuser_path": "/usr/sbin/runuser",
+  "send_helper": "/usr/local/bin/kven-mail-send-file",
+  "max_timeout_seconds": 900,
+  "inline_output_bytes": 65536,
+  "child_file_size_bytes": 104857600,
+  "poll_seconds": 5
+}

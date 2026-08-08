@@ -1,33 +1,27 @@
 {
   "schema_version": "2.0",
-  "expected_baseline": "c471b7ac42668c76540243b460a704739e87962a",
-  "feature_branch": "codex/work-kven-ops-003a-codex-task-20260807T083603Z-2068587",
+  "expected_baseline": "5e6daaa589e71797b2c898ceb6fe85646be026d2",
+  "feature_branch": "codex/work-kven-ops-004a-20260808T102017Z-2704408",
   "allowed_paths": [
     "deployment-contract.json",
-    "docs/KVEN_CODEX_REVIEW_HANDOFF.md",
-    "docs/KVEN_INTEGRATION_WORKFLOW.md",
-    "scripts/kven-codex-task",
-    "scripts/kven-integrate-task",
-    "scripts/kven-review-handoff",
-    "scripts/kven_evidence_security.py",
-    "scripts/kven_handoff.py",
-    "test_kven_codex_task.py",
-    "test_kven_integrate_task.py",
-    "test_kven_review_handoff.py"
+    "docs/MAIL_QWENII_SMS_INFRASTRUCTURE.md",
+    "infra/",
+    "scripts/verify_mail_qwenii_sms_capture.py",
+    "test_mail_qwenii_sms_infra.py"
   ],
   "services": [],
   "backups": {"sqlite": [], "configuration": []},
   "migration_checks": [],
   "result_validation_tests": [
     {
-      "name": "handoff-and-codex-runner",
-      "command": ["/opt/kven2/venv/bin/python", "-m", "unittest", "-v", "test_kven_review_handoff.py", "test_kven_codex_task.py"],
-      "timeout": 600
+      "name": "captured-infrastructure-tests",
+      "command": ["/opt/kven2/venv/bin/python", "-m", "unittest", "-v", "test_mail_qwenii_sms_infra.py"],
+      "timeout": 300
     },
     {
-      "name": "integration-runner-compatibility",
-      "command": ["/opt/kven2/venv/bin/python", "-m", "unittest", "-v", "test_kven_integrate_task.py"],
-      "timeout": 1200
+      "name": "offline-capture-validation",
+      "command": ["/opt/kven2/venv/bin/python", "scripts/verify_mail_qwenii_sms_capture.py", "--repository", "."],
+      "timeout": 120
     },
     {
       "name": "full-repository-suite",
@@ -37,9 +31,14 @@
   ],
   "pre_merge_tests": [
     {
-      "name": "handoff-and-runner-pre-merge",
-      "command": ["/opt/kven2/venv/bin/python", "-m", "unittest", "-v", "test_kven_review_handoff.py", "test_kven_codex_task.py", "test_kven_integrate_task.py"],
+      "name": "source-only-capture-pre-merge",
+      "command": ["/opt/kven2/venv/bin/python", "-m", "unittest", "-v", "test_mail_qwenii_sms_infra.py", "test_kven_review_handoff.py", "test_kven_integrate_task.py"],
       "timeout": 1800
+    },
+    {
+      "name": "capture-validator-pre-merge",
+      "command": ["/opt/kven2/venv/bin/python", "scripts/verify_mail_qwenii_sms_capture.py", "--repository", "."],
+      "timeout": 120
     }
   ],
   "post_merge_tests": [
@@ -52,9 +51,10 @@
   "readiness_checks": [],
   "fatal_log_checks": [],
   "acceptance_checklist": [
-    "Reviewer handoff and correction evidence bind exact task, lineage, findings, and final status.",
-    "Historical result packages remain readable and OPS-002A/002B/002C safeguards remain intact.",
-    "No product runtime, service, database, protected-data, or network behavior changed."
+    "Captured non-secret MAIL, QWENII, and SMS sources preserve the validated transport, authorization, execution, return, and escalation boundaries.",
+    "Sanitized configuration examples contain no live credentials, private communication, generated payloads, or persistent runtime state.",
+    "The runbook documents reconstruction, verification, retirement state, platform limitations, deferred reboot verification, and Git-only rollback.",
+    "No product runtime, service, database, protected-data, mail-server, GoIP, permission, or network behavior changed."
   ],
   "rollback": {"restore_git": true, "restore_backups": true, "verify_readiness": true}
 }

@@ -1,0 +1,20 @@
+[Unit]
+Description=Kven mail file courier (transport only, no execution)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/bin/python3 /opt/kven-mail-courier/receiver.py
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadOnlyPaths=/etc/kven-mail-courier.json
+ReadWritePaths=/var/lib/kven-mail-courier /home/qwenii/inbox
+
+[Install]
+WantedBy=multi-user.target

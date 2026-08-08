@@ -1,0 +1,27 @@
+#!/bin/bash
+set -euo pipefail
+
+EVENT="${1:-}"
+WORK_ID="${2:-}"
+
+case "$EVENT" in
+    NEED_USER|WORK_FAILED|WORK_COMPLETE) ;;
+    *) echo "ERROR: unsupported event" >&2; exit 2 ;;
+esac
+
+if ! [[ "$WORK_ID" =~ ^[A-Za-z0-9._:-]{1,80}$ ]]; then
+    echo "ERROR: invalid work id" >&2
+    exit 3
+fi
+
+if [ "$(id -un)" != "qwenii" ]; then
+    echo "ERROR: must run as qwenii" >&2
+    exit 4
+fi
+
+dir=/home/qwenii/notify
+tmp="$(mktemp "${dir}/.request.XXXXXX")"
+printf 'EVENT=%s\nWORK_ID=%s\n' "$EVENT" "$WORK_ID" > "$tmp"
+chmod 0600 "$tmp"
+mv "$tmp" "${dir}/$(date -u +%Y%m%dT%H%M%S)-$$-${RANDOM}.req"
+printf 'KVEN_HUMAN_REQUEST=QUEUED\n'

@@ -1,0 +1,13 @@
+{
+  "EMAIL_USER": "bridge-account@example.invalid",
+  "EMAIL_PASS": "REPLACE_FROM_PROTECTED_CONFIG",
+  "IMAP_HOST": "mail.internal.example.invalid",
+  "IMAP_PORT": 143,
+  "SMTP_HOST": "mail.internal.example.invalid",
+  "SMTP_PORT": 25,
+  "accepted_sender": "authorized-sender@example.invalid",
+  "outbound_recipient": "result-recipient@example.invalid",
+  "inbox_dir": "/home/qwenii/inbox",
+  "max_attachment_bytes": 10485760,
+  "poll_seconds": 30
+}
