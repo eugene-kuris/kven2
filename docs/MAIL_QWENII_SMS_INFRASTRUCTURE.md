@@ -106,11 +106,17 @@ This capture does not deploy. A future authorized operator should:
    above; verify no sudo, keys, privileged groups, or /opt/kven2 access.
 2. Install captured Python and shell sources at the inventory paths with the
    recorded modes (Python/request helper 0755; privileged notifier scripts 0750).
+   Create the live-equivalent `/usr/local/bin/kven-mail-send-file` symlink
+   pointing to `/opt/kven-mail-courier/send_file.py`; the runner's
+   `send_helper` configuration depends on that exact path.
 3. Build root-owned 0600 configs from the examples, supplying secrets through the
    protected operator channel; never commit or print them.
-4. Create root-owned state directories, install captured units, daemon-reload,
-   enable/start only under separate deployment authority, and preserve the
-   documented service ordering and sandbox paths.
+4. Create the root-owned state directories. The notifier hierarchy must include
+   `/var/lib/kven-human-notifier/sent` and
+   `/var/lib/kven-human-notifier/failed`, both root:root 0755, because the
+   dispatcher writes duplicate markers and failed requests there. Install
+   captured units, daemon-reload, enable/start only under separate deployment
+   authority, and preserve the documented service ordering and sandbox paths.
 5. Configure the secondary address through the host's existing network mechanism
    and verify same-L2 reachability without exposing GoIP credentials.
 

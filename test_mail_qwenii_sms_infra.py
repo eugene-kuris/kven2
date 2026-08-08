@@ -129,6 +129,25 @@ class QweniiAuthorizationTests(unittest.TestCase):
 
 
 class NotifierAndUnitTests(unittest.TestCase):
+    def test_reconstruction_documents_required_links_and_state_dirs(self):
+        runbook = (ROOT / "docs/MAIL_QWENII_SMS_INFRASTRUCTURE.md").read_text()
+        reconstruction = runbook.split("## Reconstruction", 1)[1].split(
+            "## Verification", 1
+        )[0]
+        self.assertIn(
+            "/usr/local/bin/kven-mail-send-file", reconstruction
+        )
+        self.assertIn(
+            "/opt/kven-mail-courier/send_file.py", reconstruction
+        )
+        self.assertIn(
+            "/var/lib/kven-human-notifier/sent", reconstruction
+        )
+        self.assertIn(
+            "/var/lib/kven-human-notifier/failed", reconstruction
+        )
+        self.assertIn("both root:root 0755", reconstruction)
+
     def test_notifier_vocabulary_and_request_validation(self):
         allowed = {"NEED_USER", "WORK_FAILED", "WORK_COMPLETE"}
         request = (ROOT / "infra/notify/kven-request-human").read_text()
