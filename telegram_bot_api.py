@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 import httpx
@@ -8,6 +9,15 @@ import httpx
 TELEGRAM_API_BASE = "https://api.telegram.org"
 TELEGRAM_MAX_TEXT_UNITS = 4096
 TELEGRAM_SAFE_TEXT_UNITS = 4000
+TELEGRAM_MAX_IMAGE_BYTES = 20 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class TelegramFile:
+    file_id: str
+    file_unique_id: str
+    file_path: str
+    file_size: int | None = None
 
 
 class AsyncHttpClient(Protocol):
@@ -18,6 +28,9 @@ class AsyncHttpClient(Protocol):
         json: dict[str, Any],
         timeout: float,
     ) -> Any:
+        ...
+
+    async def get(self, url: str, *, timeout: float) -> Any:
         ...
 
 
@@ -192,6 +205,9 @@ class TelegramBotApi:
             f"bot{self._token}/{method}"
         )
 
+    def _file_url(self, file_path: str) -> str:
+        return f"{self._api_base}/file/bot{self._token}/{file_path}"
+
     def _sanitize(self, value: object) -> str:
         return str(value).replace(
             self._token,
@@ -291,6 +307,74 @@ class TelegramBotApi:
             )
 
         return body["result"]
+
+    async def get_file(self, file_id: str) -> TelegramFile:
+        if not isinstance(file_id, str) or not file_id:
+            raise ValueError("Telegram file ID is empty")
+        result = await self._call(
+            "getFile", {"file_id": file_id}, timeout=30.0
+        )
+        if not isinstance(result, dict):
+            raise TelegramBotApiError("getFile", "result is not a file object")
+        returned_id = result.get("file_id")
+        unique_id = result.get("file_unique_id")
+        file_path = result.get("file_path")
+        file_size = result.get("file_size")
+        if returned_id != file_id or not isinstance(unique_id, str) or not unique_id:
+            raise TelegramBotApiError("getFile", "result has invalid file identity")
+        if (
+            not isinstance(file_path, str)
+            or not file_path
+            or file_path.startswith("/")
+            or ".." in file_path.split("/")
+        ):
+            raise TelegramBotApiError("getFile", "result has invalid file path")
+        if file_size is not None and (
+            not isinstance(file_size, int)
+            or isinstance(file_size, bool)
+            or file_size < 0
+        ):
+            raise TelegramBotApiError("getFile", "result has invalid file size")
+        return TelegramFile(returned_id, unique_id, file_path, file_size)
+
+    async def download_file(
+        self,
+        file_path: str,
+        *,
+        max_bytes: int = TELEGRAM_MAX_IMAGE_BYTES,
+    ) -> bytes:
+        if (
+            not isinstance(file_path, str)
+            or not file_path
+            or file_path.startswith("/")
+            or ".." in file_path.split("/")
+        ):
+            raise ValueError("Telegram file path is invalid")
+        if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes <= 0:
+            raise ValueError("Telegram download limit must be positive")
+        try:
+            response = await self._client.get(self._file_url(file_path), timeout=60.0)
+            response.raise_for_status()
+        except Exception as exc:
+            raise TelegramBotApiError(
+                "downloadFile", f"transport request failed: {self._sanitize(exc)}"
+            ) from None
+        raw_length = getattr(response, "headers", {}).get("content-length")
+        if raw_length is not None:
+            try:
+                declared_length = int(raw_length)
+            except (TypeError, ValueError):
+                raise TelegramBotApiError("downloadFile", "invalid Content-Length") from None
+            if declared_length > max_bytes:
+                raise TelegramBotApiError("downloadFile", "file exceeds image size limit")
+        content = getattr(response, "content", None)
+        if not isinstance(content, bytes):
+            raise TelegramBotApiError("downloadFile", "response has no byte content")
+        if not content:
+            raise TelegramBotApiError("downloadFile", "downloaded file is empty")
+        if len(content) > max_bytes:
+            raise TelegramBotApiError("downloadFile", "file exceeds image size limit")
+        return content
 
     async def get_updates(
         self,

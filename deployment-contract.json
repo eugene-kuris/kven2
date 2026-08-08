@@ -1,60 +1,86 @@
 {
   "schema_version": "2.0",
-  "expected_baseline": "5e6daaa589e71797b2c898ceb6fe85646be026d2",
-  "feature_branch": "codex/work-kven-ops-004a-20260808T102017Z-2704408",
+  "expected_baseline": "e7092aa1e3cb698caf50fe8859a5b715cba334f8",
+  "feature_branch": "codex/work-kven-tg-vision-001-20260808T145406Z-2989421",
   "allowed_paths": [
     "deployment-contract.json",
-    "docs/MAIL_QWENII_SMS_INFRASTRUCTURE.md",
-    "infra/",
-    "scripts/verify_mail_qwenii_sms_capture.py",
-    "test_mail_qwenii_sms_infra.py"
+    "scripts/validate-telegram-vision-migration",
+    "telegram_bot_api.py",
+    "telegram_kven_client.py",
+    "telegram_store.py",
+    "telegram_updates.py",
+    "telegram_workers.py",
+    "test_telegram_vision.py"
   ],
-  "services": [],
-  "backups": {"sqlite": [], "configuration": []},
-  "migration_checks": [],
+  "services": ["kven2-telegram-gateway.service"],
+  "backups": {
+    "sqlite": [
+      {
+        "path": "/agent/data/kven2/telegram_gateway.db",
+        "services": ["kven2-telegram-gateway.service"]
+      }
+    ],
+    "configuration": []
+  },
+  "migration_checks": [
+    {
+      "database": "/agent/data/kven2/telegram_gateway.db",
+      "database_env": "TELEGRAM_MIGRATION_DB",
+      "command": ["/opt/kven2/venv/bin/python", "scripts/validate-telegram-vision-migration", "migrate"],
+      "application_smoke_command": ["/opt/kven2/venv/bin/python", "scripts/validate-telegram-vision-migration", "smoke"],
+      "idempotent": true,
+      "timeout": 120
+    }
+  ],
   "result_validation_tests": [
     {
-      "name": "captured-infrastructure-tests",
-      "command": ["/opt/kven2/venv/bin/python", "-m", "unittest", "-v", "test_mail_qwenii_sms_infra.py"],
+      "name": "telegram-vision-focused",
+      "command": ["/opt/kven2/venv/bin/python", "-m", "unittest", "-v", "test_telegram_vision.py"],
       "timeout": 300
     },
     {
-      "name": "offline-capture-validation",
-      "command": ["/opt/kven2/venv/bin/python", "scripts/verify_mail_qwenii_sms_capture.py", "--repository", "."],
-      "timeout": 120
-    },
-    {
-      "name": "full-repository-suite",
-      "command": ["/opt/kven2/venv/bin/python", "-m", "unittest", "discover", "-v"],
-      "timeout": 2400
+      "name": "telegram-and-context-regression",
+      "command": ["/opt/kven2/venv/bin/python", "-m", "unittest", "-v", "test_telegram_bot_api.py", "test_telegram_updates.py", "test_telegram_store.py", "test_telegram_continuity.py", "test_telegram_polling_worker.py", "test_telegram_workers.py", "test_telegram_runtime.py", "test_telegram_gateway.py", "test_telegram_kven_client.py", "test_telegram_compaction.py", "test_context_window.py"],
+      "timeout": 900
     }
   ],
   "pre_merge_tests": [
     {
-      "name": "source-only-capture-pre-merge",
-      "command": ["/opt/kven2/venv/bin/python", "-m", "unittest", "-v", "test_mail_qwenii_sms_infra.py", "test_kven_review_handoff.py", "test_kven_integrate_task.py"],
-      "timeout": 1800
-    },
-    {
-      "name": "capture-validator-pre-merge",
-      "command": ["/opt/kven2/venv/bin/python", "scripts/verify_mail_qwenii_sms_capture.py", "--repository", "."],
-      "timeout": 120
+      "name": "telegram-vision-and-regressions-pre-merge",
+      "command": ["/opt/kven2/venv/bin/python", "-m", "unittest", "-v", "test_telegram_vision.py", "test_telegram_bot_api.py", "test_telegram_updates.py", "test_telegram_store.py", "test_telegram_continuity.py", "test_telegram_polling_worker.py", "test_telegram_workers.py", "test_telegram_runtime.py", "test_telegram_gateway.py", "test_telegram_kven_client.py", "test_telegram_compaction.py", "test_context_window.py"],
+      "timeout": 900
     }
   ],
   "post_merge_tests": [
     {
-      "name": "full-suite-post-merge",
-      "command": ["/opt/kven2/venv/bin/python", "-m", "unittest", "discover", "-v"],
-      "timeout": 2400
+      "name": "telegram-vision-and-regressions-post-merge",
+      "command": ["/opt/kven2/venv/bin/python", "-m", "unittest", "-v", "test_telegram_vision.py", "test_telegram_bot_api.py", "test_telegram_updates.py", "test_telegram_store.py", "test_telegram_continuity.py", "test_telegram_polling_worker.py", "test_telegram_workers.py", "test_telegram_runtime.py", "test_telegram_gateway.py", "test_telegram_kven_client.py", "test_telegram_compaction.py", "test_context_window.py"],
+      "timeout": 900
     }
   ],
-  "readiness_checks": [],
-  "fatal_log_checks": [],
-  "acceptance_checklist": [
-    "Captured non-secret MAIL, QWENII, and SMS sources preserve the validated transport, authorization, execution, return, and escalation boundaries.",
-    "Sanitized configuration examples contain no live credentials, private communication, generated payloads, or persistent runtime state.",
-    "The runbook documents reconstruction, verification, retirement state, platform limitations, deferred reboot verification, and Git-only rollback.",
-    "No product runtime, service, database, protected-data, mail-server, GoIP, permission, or network behavior changed."
+  "readiness_checks": [
+    {
+      "name": "telegram-gateway-active",
+      "command": ["systemctl", "is-active", "kven2-telegram-gateway.service"],
+      "timeout": 30
+    }
   ],
-  "rollback": {"restore_git": true, "restore_backups": true, "verify_readiness": true}
+  "fatal_log_checks": [
+    {
+      "name": "telegram-gateway-fatal-logs",
+      "command": ["/usr/bin/python3", "/opt/kven2/scripts/check-telegram-fatal-logs"],
+      "timeout": 60
+    }
+  ],
+  "acceptance_checklist": [
+    "Send an image containing text with the caption 'Напиши текст с картинки' and confirm the response uses text visible only in the image.",
+    "Send a vehicle photograph with the caption 'Определи номер и модель автомобиля на фото' and confirm an image-grounded attempt.",
+    "For restart recovery, stop the gateway only after an image update is durably visible as pending, restart it, and confirm exactly one response is produced after media acquisition completes.",
+    "Confirm ordinary text-only messages and replies still preserve conversation ordering and delivery behavior."
+  ],
+  "rollback": {
+    "restore_git": true,
+    "restore_backups": true,
+    "verify_readiness": true
+  }
 }

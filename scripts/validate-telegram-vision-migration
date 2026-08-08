@@ -1,0 +1,68 @@
+#!/opt/kven2/venv/bin/python
+from __future__ import annotations
+
+import argparse
+import asyncio
+import os
+from pathlib import Path
+import sys
+import tempfile
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from telegram_store import TelegramStore
+from telegram_updates import TelegramImageMedia
+
+
+async def _run_application_smoke() -> None:
+    with tempfile.TemporaryDirectory(prefix="kven-tg-vision-migration-") as temp_dir:
+        smoke_db = Path(temp_dir) / "gateway.db"
+        store = TelegramStore(str(smoke_db))
+        await store.init()
+        await store.enqueue_text_update(
+            update_id=9_000_000_001,
+            chat_id=9_000_000_002,
+            user_id=9_000_000_003,
+            message_id=9_000_000_004,
+            text="Image attachment.",
+            raw_update={"update_id": 9_000_000_001},
+            media=TelegramImageMedia(
+                kind="photo",
+                file_id="migration-fixture",
+                file_unique_id="migration-fixture-unique",
+                mime_type="image/png",
+                file_size=7,
+            ),
+        )
+        if await store.claim_next_job() is not None:
+            raise SystemExit("pending media did not block generation")
+        await store.complete_media(9_000_000_001, "photos/fixture.png", b"fixture")
+        job = await store.claim_next_job()
+        if job is None or job.batch_update_ids != (9_000_000_001,):
+            raise SystemExit("ready synthetic media did not unblock the synthetic job")
+        context = await store.build_generation_context(job)
+        if context[-1]["content"][1]["type"] != "image_url":
+            raise SystemExit("media was not reconstructed as multimodal content")
+
+
+async def run(mode: str) -> None:
+    db_path = os.environ.get("TELEGRAM_MIGRATION_DB")
+    if not db_path or not Path(db_path).is_file():
+        raise SystemExit("TELEGRAM_MIGRATION_DB must name a disposable database copy")
+    store = TelegramStore(db_path)
+    await store.init()
+    await store.init()
+    if mode == "migrate":
+        return
+    await _run_application_smoke()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("mode", choices=("migrate", "smoke"))
+    args = parser.parse_args()
+    asyncio.run(run(args.mode))
+
+
+if __name__ == "__main__":
+    main()
