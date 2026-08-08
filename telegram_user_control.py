@@ -7,10 +7,11 @@ import asyncio
 import json
 from pathlib import Path
 
-from telegram_user_runtime import DEFAULT_CONTROL_SOCKET
+from telegram_user_runtime import DEFAULT_CONTROL_SOCKET, validate_peer_id
 
 
 async def request_send(peer_id: int, text: str, *, socket_path: Path = DEFAULT_CONTROL_SOCKET) -> dict:
+    peer_id = validate_peer_id(peer_id)
     reader, writer = await asyncio.open_unix_connection(str(socket_path))
     writer.write((json.dumps({"action": "send_private_text", "peer_id": peer_id, "text": text}) + "\n").encode())
     await writer.drain()
@@ -22,7 +23,7 @@ async def request_send(peer_id: int, text: str, *, socket_path: Path = DEFAULT_C
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("peer_id", type=int, help="numeric Telegram user/peer ID")
+    parser.add_argument("peer_id", type=validate_peer_id, help="numeric Telegram user/peer ID")
     parser.add_argument("text", help="exact single message text")
     parser.add_argument("--socket", type=Path, default=DEFAULT_CONTROL_SOCKET)
     args = parser.parse_args()

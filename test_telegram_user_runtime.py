@@ -7,6 +7,7 @@ import unittest
 from unittest import mock
 
 from telegram_user_runtime import (
+    MAX_TELEGRAM_PEER_ID,
     PrivateMessageEvidence,
     TelegramUserConfig,
     TelegramUserRuntime,
@@ -14,6 +15,7 @@ from telegram_user_runtime import (
     normalize_private_message,
     prepare_session_directory,
     send_explicit_private_text,
+    validate_peer_id,
 )
 from telegram_user_auth import authorize
 from telegram_user_control import request_send
@@ -28,6 +30,7 @@ class FakeClient:
         self.disconnected = False
         self.start_calls = []
         self.handlers = []
+        self.send_calls = []
 
     async def connect(self):
         self.connected = True
@@ -42,6 +45,7 @@ class FakeClient:
         kwargs["password"]()
         self.authorized = True
     async def send_message(self, peer_id, text):
+        self.send_calls.append((peer_id, text))
         if self.send_error: raise self.send_error
         return types.SimpleNamespace(id=91, date=datetime(2026, 8, 8, tzinfo=timezone.utc))
 
@@ -59,7 +63,7 @@ class ConfigTests(unittest.TestCase):
     def tearDown(self): self.temp.cleanup()
 
     def test_required_config_and_secret_repr_redaction(self):
-        config = load_config(self.env, session_root=self.root)
+        config = load_config(self.env, session_root=self.root, control_root=self.root)
         self.assertEqual(config.api_id, 12345)
         self.assertNotIn(self.env["TELEGRAM_USER_API_HASH"], repr(config))
         self.assertNotIn("12345", repr(config))
@@ -68,19 +72,43 @@ class ConfigTests(unittest.TestCase):
         for env in ({}, {**self.env, "TELEGRAM_USER_API_ID": "x"}, {**self.env, "TELEGRAM_USER_API_ID": "0"}, {**self.env, "TELEGRAM_USER_API_HASH": " "}):
             with self.subTest(env=sorted(env)):
                 with self.assertRaises(ValueError) as raised:
-                    load_config(env, session_root=self.root)
+                    load_config(env, session_root=self.root, control_root=self.root)
                 self.assertNotIn(self.env["TELEGRAM_USER_API_HASH"], str(raised.exception))
 
     def test_session_must_be_dedicated_absolute_session_path(self):
         for value in ("relative.session", str(self.root.parent / "escape.session"), str(self.root / "bad.db")):
             with self.subTest(value=value):
                 with self.assertRaises(ValueError):
-                    load_config({**self.env, "TELEGRAM_USER_SESSION_PATH": value}, session_root=self.root)
+                    load_config(
+                        {**self.env, "TELEGRAM_USER_SESSION_PATH": value},
+                        session_root=self.root,
+                        control_root=self.root,
+                    )
 
     def test_session_directory_is_created_mode_0700(self):
         nested = self.root / "state" / "kven.session"
         prepare_session_directory(nested, session_root=self.root)
         self.assertEqual(nested.parent.stat().st_mode & 0o777, 0o700)
+
+    def test_control_socket_must_be_in_dedicated_runtime_directory(self):
+        for value in ("relative.sock", str(self.root.parent / "outside.sock")):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    load_config(
+                        {**self.env, "TELEGRAM_USER_CONTROL_SOCKET": value},
+                        session_root=self.root,
+                        control_root=self.root,
+                    )
+
+    def test_systemd_unit_owns_restrictive_dedicated_runtime_directory(self):
+        unit = Path("infra/telegram-user/systemd/kven2-telegram-user.service").read_text()
+        env_example = Path("infra/telegram-user/telegram-user.env.example").read_text()
+        self.assertIn("User=root\n", unit)
+        self.assertIn("Group=root\n", unit)
+        self.assertIn("RuntimeDirectory=kven2-telegram-user\n", unit)
+        self.assertIn("RuntimeDirectoryMode=0700\n", unit)
+        self.assertNotIn(" /run/kven2", unit)
+        self.assertIn("TELEGRAM_USER_CONTROL_SOCKET=/run/kven2-telegram-user/control.sock", env_example)
 
 
 class EventAndSendTests(unittest.IsolatedAsyncioTestCase):
@@ -101,6 +129,33 @@ class EventAndSendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["message_id"], 91)
         with self.assertRaises(RuntimeError):
             await send_explicit_private_text(FakeClient(send_error=RuntimeError("network detail")), 123, "one")
+
+    async def test_peer_id_signed_64_bit_boundaries_are_accepted(self):
+        for peer_id in (1, MAX_TELEGRAM_PEER_ID):
+            with self.subTest(peer_id=peer_id):
+                client = FakeClient()
+                result = await send_explicit_private_text(client, peer_id, "boundary")
+                self.assertEqual(result["peer_id"], peer_id)
+                self.assertEqual(client.send_calls, [(peer_id, "boundary")])
+
+    async def test_invalid_peer_ids_are_rejected_before_send(self):
+        rejected = (2**63, 10**100, True, False, 0, -1, "malformed", 1.5, None)
+        for peer_id in rejected:
+            with self.subTest(peer_id=peer_id):
+                client = FakeClient()
+                with self.assertRaises(ValueError) as raised:
+                    await send_explicit_private_text(client, peer_id, "private body")
+                self.assertEqual(client.send_calls, [])
+                self.assertNotIn("private body", str(raised.exception))
+
+    async def test_control_client_applies_same_peer_boundary_before_socket_open(self):
+        with mock.patch("telegram_user_control.asyncio.open_unix_connection") as open_socket:
+            for peer_id in (2**63, 10**100, True, False, 0, -1, "malformed", 1.5, None):
+                with self.subTest(peer_id=peer_id), self.assertRaises(ValueError):
+                    await request_send(peer_id, "private body")
+            open_socket.assert_not_called()
+        self.assertEqual(validate_peer_id(1), 1)
+        self.assertEqual(validate_peer_id(MAX_TELEGRAM_PEER_ID), MAX_TELEGRAM_PEER_ID)
 
     async def test_control_command_requests_exactly_one_send(self):
         requests = []

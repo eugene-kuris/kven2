@@ -18,8 +18,10 @@ from typing import Any
 
 DEFAULT_SESSION_ROOT = Path("/agent/data/kven2/telegram_user")
 DEFAULT_SESSION_PATH = DEFAULT_SESSION_ROOT / "kven.session"
-DEFAULT_CONTROL_SOCKET = Path("/run/kven2/telegram-user.sock")
+DEFAULT_CONTROL_ROOT = Path("/run/kven2-telegram-user")
+DEFAULT_CONTROL_SOCKET = DEFAULT_CONTROL_ROOT / "control.sock"
 DEFAULT_LOG_LEVEL = "INFO"
+MAX_TELEGRAM_PEER_ID = 2**63 - 1
 MAX_SEND_TEXT_LENGTH = 4096
 MAX_CONTROL_REQUEST_BYTES = 16_384
 LOGGER = logging.getLogger("kven.telegram_user")
@@ -74,10 +76,24 @@ def validate_session_path(path: Path, *, session_root: Path = DEFAULT_SESSION_RO
     return candidate
 
 
+def validate_control_socket(path: Path, *, control_root: Path = DEFAULT_CONTROL_ROOT) -> Path:
+    candidate = path if path.is_absolute() else Path()
+    try:
+        candidate.parent.resolve(strict=False).relative_to(control_root.resolve(strict=False))
+    except (OSError, ValueError):
+        raise ValueError(
+            "TELEGRAM_USER_CONTROL_SOCKET must be an absolute socket path under the dedicated runtime directory"
+        ) from None
+    if candidate.name in {"", ".", ".."}:
+        raise ValueError("TELEGRAM_USER_CONTROL_SOCKET must name a socket")
+    return candidate
+
+
 def load_config(
     environ: Mapping[str, str] | None = None,
     *,
     session_root: Path = DEFAULT_SESSION_ROOT,
+    control_root: Path = DEFAULT_CONTROL_ROOT,
 ) -> TelegramUserConfig:
     environment = os.environ if environ is None else environ
     api_id_raw = _required(environment, "TELEGRAM_USER_API_ID")
@@ -92,9 +108,10 @@ def load_config(
         Path(environment.get("TELEGRAM_USER_SESSION_PATH", str(DEFAULT_SESSION_PATH))),
         session_root=session_root,
     )
-    control_socket = Path(environment.get("TELEGRAM_USER_CONTROL_SOCKET", str(DEFAULT_CONTROL_SOCKET)))
-    if not control_socket.is_absolute():
-        raise ValueError("TELEGRAM_USER_CONTROL_SOCKET must be an absolute path")
+    control_socket = validate_control_socket(
+        Path(environment.get("TELEGRAM_USER_CONTROL_SOCKET", str(DEFAULT_CONTROL_SOCKET))),
+        control_root=control_root,
+    )
     log_level = environment.get("TELEGRAM_USER_LOG_LEVEL", DEFAULT_LOG_LEVEL).strip().upper()
     if log_level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
         raise ValueError("TELEGRAM_USER_LOG_LEVEL is invalid")
@@ -159,20 +176,20 @@ def normalize_private_message(event: Any, own_user_id: int) -> PrivateMessageEvi
     )
 
 
-def _positive_int(value: Any, field: str) -> int:
+def validate_peer_id(value: Any, field: str = "peer_id") -> int:
     if isinstance(value, bool):
-        raise ValueError(f"{field} must be a positive integer")
+        raise ValueError(f"{field} must be an integer in the signed 64-bit positive range")
     try:
         result = int(value)
     except (TypeError, ValueError):
-        raise ValueError(f"{field} must be a positive integer") from None
-    if result <= 0 or str(result) != str(value).strip():
-        raise ValueError(f"{field} must be a positive integer")
+        raise ValueError(f"{field} must be an integer in the signed 64-bit positive range") from None
+    if result < 1 or result > MAX_TELEGRAM_PEER_ID or str(result) != str(value).strip():
+        raise ValueError(f"{field} must be an integer in the signed 64-bit positive range")
     return result
 
 
 async def send_explicit_private_text(client: Any, peer_id: Any, text: Any) -> dict[str, Any]:
-    numeric_peer = _positive_int(peer_id, "peer_id")
+    numeric_peer = validate_peer_id(peer_id)
     if not isinstance(text, str) or not text or len(text) > MAX_SEND_TEXT_LENGTH:
         raise ValueError(f"text must contain 1..{MAX_SEND_TEXT_LENGTH} characters")
     message = await client.send_message(numeric_peer, text)
@@ -238,7 +255,7 @@ class TelegramUserRuntime:
             if not await self.client.is_user_authorized():
                 raise RuntimeError("HUMAN_REQUIRED: run the one-time Telegram user authorization command")
             me = await self.client.get_me()
-            self.own_user_id = _positive_int(getattr(me, "id", None), "own_user_id")
+            self.own_user_id = validate_peer_id(getattr(me, "id", None), "own_user_id")
             self.client.add_event_handler(self._observe, self.event_builder_factory())
             socket = self.config.control_socket
             socket.parent.mkdir(mode=0o755, parents=True, exist_ok=True)

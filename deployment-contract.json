@@ -1,7 +1,7 @@
 {
   "schema_version": "2.0",
   "expected_baseline": "f40e17486ec32cf5869916a738c525250d60decd",
-  "feature_branch": "codex/work-kven-tg-user-001-20260808T174033Z-3051473",
+  "feature_branch": "codex/work-kven-tg-user-001-20260808T181310Z-3057084",
   "allowed_paths": [
     ".gitignore",
     "deployment-contract.json",

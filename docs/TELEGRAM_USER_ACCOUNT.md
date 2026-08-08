@@ -18,8 +18,10 @@ Create `/agent/data/kven2/telegram_user` as root-owned mode `0700`. The default
 session is `/agent/data/kven2/telegram_user/kven.session`, a Telethon SQLite
 session outside Git. The unit has `RequiresMountsFor=/agent/data`, so an absent
 durable mount cannot silently create session state on the root filesystem.
-Service stop disconnects cleanly and never logs out. The local control socket is
-`/run/kven2/telegram-user.sock`, mode `0600`.
+Service stop disconnects cleanly and never logs out. The unit independently
+creates `/run/kven2-telegram-user` as root-owned mode `0700`; it does not depend
+on the Bot API service for runtime state. The local control socket is
+`/run/kven2-telegram-user/control.sock`, mode `0600`.
 
 ## Controlled deployment and live acceptance (not for Codex execution)
 
