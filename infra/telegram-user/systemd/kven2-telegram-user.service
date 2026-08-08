@@ -1,0 +1,24 @@
+[Unit]
+Description=Kven II Telegram user-account MTProto transport
+Wants=network-online.target
+After=network-online.target
+RequiresMountsFor=/agent/data
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/kven2
+EnvironmentFile=/etc/kven2/telegram-user.env
+ExecStart=/opt/kven2/venv/bin/python /opt/kven2/telegram_user_runtime.py
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/agent/data/kven2/telegram_user /run/kven2
+
+[Install]
+WantedBy=multi-user.target
