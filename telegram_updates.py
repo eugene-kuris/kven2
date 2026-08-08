@@ -8,6 +8,17 @@ class TelegramUpdateError(ValueError):
     pass
 
 
+SUPPORTED_IMAGE_MIME_TYPES = {
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+    "image/gif",
+    "image/bmp",
+    "image/tiff",
+}
+MAX_IMAGE_FILE_SIZE = 20 * 1024 * 1024
+
+
 @dataclass(frozen=True)
 class TelegramTextUpdate:
     update_id: int
@@ -18,6 +29,19 @@ class TelegramTextUpdate:
     raw_update: dict[str, Any]
     message_date: int | None = None
     reply_to_message_id: int | None = None
+    media: "TelegramImageMedia | None" = None
+
+
+@dataclass(frozen=True)
+class TelegramImageMedia:
+    kind: str
+    file_id: str
+    file_unique_id: str
+    mime_type: str
+    filename: str | None = None
+    width: int | None = None
+    height: int | None = None
+    file_size: int | None = None
 
 
 class TelegramUpdateStore(Protocol):
@@ -135,14 +159,22 @@ def parse_authorized_text_update(
         message.get("message_id")
     )
     text = message.get("text")
+    caption = message.get("caption")
+    media = _parse_image_media(message)
+    if "document" in message and media is None:
+        return None
     if text is None:
-        text = message.get("caption")
+        text = caption
 
     if chat_id is None or message_id is None:
         return None
 
-    if not isinstance(text, str) or text == "":
+    if media is None and (not isinstance(text, str) or text == ""):
         return None
+    if text is not None and (not isinstance(text, str) or text == ""):
+        raise TelegramUpdateError("Telegram image caption is malformed")
+    if text is None:
+        text = "Image attachment."
 
     return TelegramTextUpdate(
         update_id=update_id,
@@ -163,6 +195,69 @@ def parse_authorized_text_update(
             else None
         ),
         raw_update=raw_update,
+        media=media,
+    )
+
+
+def _required_media_text(value: object, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise TelegramUpdateError(f"Telegram image has no valid {label}")
+    return value
+
+
+def _optional_media_int(value: object, label: str) -> int | None:
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise TelegramUpdateError(f"Telegram image has invalid {label}")
+    if label == "file_size" and value > MAX_IMAGE_FILE_SIZE:
+        raise TelegramUpdateError("Telegram image exceeds the size limit")
+    return value
+
+
+def _parse_image_media(message: dict[str, Any]) -> TelegramImageMedia | None:
+    photos = message.get("photo")
+    if photos is not None:
+        if not isinstance(photos, list) or not photos or any(not isinstance(p, dict) for p in photos):
+            raise TelegramUpdateError("Telegram photo variants are malformed")
+        parsed = []
+        for photo in photos:
+            width = _optional_media_int(photo.get("width"), "width")
+            height = _optional_media_int(photo.get("height"), "height")
+            if width is None or height is None:
+                raise TelegramUpdateError("Telegram photo has no valid dimensions")
+            parsed.append(TelegramImageMedia(
+                kind="photo",
+                file_id=_required_media_text(photo.get("file_id"), "file_id"),
+                file_unique_id=_required_media_text(photo.get("file_unique_id"), "file_unique_id"),
+                mime_type="image/jpeg",
+                width=width,
+                height=height,
+                file_size=_optional_media_int(photo.get("file_size"), "file_size"),
+            ))
+        return max(parsed, key=lambda item: ((item.width or 0) * (item.height or 0), item.file_size or 0))
+    document = message.get("document")
+    if document is None:
+        return None
+    if not isinstance(document, dict):
+        raise TelegramUpdateError("Telegram document metadata is malformed")
+    mime_type = document.get("mime_type")
+    if not isinstance(mime_type, str) or not mime_type.lower().startswith("image/"):
+        return None
+    if mime_type.lower() not in SUPPORTED_IMAGE_MIME_TYPES:
+        return None
+    filename = document.get("file_name")
+    if filename is not None and (not isinstance(filename, str) or not filename):
+        raise TelegramUpdateError("Telegram image document has invalid filename")
+    return TelegramImageMedia(
+        kind="document",
+        file_id=_required_media_text(document.get("file_id"), "file_id"),
+        file_unique_id=_required_media_text(document.get("file_unique_id"), "file_unique_id"),
+        mime_type=mime_type.lower(),
+        filename=filename,
+        width=_optional_media_int(document.get("width"), "width"),
+        height=_optional_media_int(document.get("height"), "height"),
+        file_size=_optional_media_int(document.get("file_size"), "file_size"),
     )
 
 
@@ -190,6 +285,8 @@ async def ingest_telegram_update(
         extra["message_date"] = parsed.message_date
     if parsed.reply_to_message_id is not None:
         extra["reply_to_message_id"] = parsed.reply_to_message_id
+    if parsed.media is not None:
+        extra["media"] = parsed.media
     return await store.enqueue_text_update(
         update_id=parsed.update_id,
         chat_id=parsed.chat_id,

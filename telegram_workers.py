@@ -163,6 +163,12 @@ class TelegramPollingClient(Protocol):
     ) -> list[dict[str, Any]]:
         ...
 
+    async def get_file(self, file_id: str) -> Any:
+        ...
+
+    async def download_file(self, file_path: str, *, max_bytes: int) -> bytes:
+        ...
+
 
 class UpdateIngestor(Protocol):
     async def __call__(
@@ -231,5 +237,27 @@ async def run_polling_once(
             allowed_user_id=allowed_user_id,
         )
         processed += 1
+
+    pending_loader = getattr(store, "get_pending_media", None)
+    media_completer = getattr(store, "complete_media", None)
+    if pending_loader is not None and media_completer is not None:
+        while True:
+            pending = await pending_loader()
+            if pending is None:
+                break
+            telegram_file = await telegram_bot.get_file(str(pending["file_id"]))
+            if telegram_file.file_unique_id != pending["file_unique_id"]:
+                raise ValueError("Telegram getFile identity does not match source media")
+            declared = pending.get("declared_file_size")
+            if declared is not None and telegram_file.file_size is not None and telegram_file.file_size != declared:
+                raise ValueError("Telegram getFile size does not match source media")
+            content = await telegram_bot.download_file(
+                telegram_file.file_path, max_bytes=20 * 1024 * 1024
+            )
+            if telegram_file.file_size is not None and len(content) != telegram_file.file_size:
+                raise ValueError("Telegram download size does not match getFile")
+            await media_completer(
+                int(pending["update_id"]), telegram_file.file_path, content
+            )
 
     return processed

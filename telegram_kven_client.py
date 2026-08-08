@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from copy import deepcopy
 from typing import Any, Awaitable, Callable, Protocol
 
@@ -340,10 +341,13 @@ class TelegramKvenClient:
                     f"{index} has an invalid role"
                 )
 
-            if (
-                content is not None
-                and not isinstance(content, str)
-            ):
+            if isinstance(content, list):
+                if role != "user":
+                    raise ValueError(
+                        f"Kven message at index {index} has multimodal content for a non-user role"
+                    )
+                TelegramKvenClient._validate_multimodal_content(content, index)
+            elif content is not None and not isinstance(content, str):
                 raise ValueError(
                     "Kven message at index "
                     f"{index} has invalid content"
@@ -352,6 +356,32 @@ class TelegramKvenClient:
             validated.append(deepcopy(message))
 
         return validated
+
+    @staticmethod
+    def _validate_multimodal_content(content: list[Any], message_index: int) -> None:
+        if not content:
+            raise ValueError(f"Kven message at index {message_index} has empty multimodal content")
+        image_count = 0
+        for part in content:
+            if not isinstance(part, dict):
+                raise ValueError(f"Kven message at index {message_index} has invalid multimodal part")
+            if part.get("type") == "text":
+                if set(part) != {"type", "text"} or not isinstance(part.get("text"), str) or not part["text"]:
+                    raise ValueError(f"Kven message at index {message_index} has invalid text part")
+                continue
+            if part.get("type") != "image_url" or set(part) != {"type", "image_url"}:
+                raise ValueError(f"Kven message at index {message_index} has unsupported multimodal part")
+            image_url = part.get("image_url")
+            if not isinstance(image_url, dict) or set(image_url) != {"url"}:
+                raise ValueError(f"Kven message at index {message_index} has invalid image_url part")
+            url = image_url.get("url")
+            if not isinstance(url, str) or re.fullmatch(
+                r"data:image/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/]+={0,2}", url
+            ) is None:
+                raise ValueError(f"Kven message at index {message_index} has invalid image data URL")
+            image_count += 1
+        if image_count != 1:
+            raise ValueError(f"Kven message at index {message_index} must contain exactly one image")
 
     @staticmethod
     def _parse_single_tool_call(

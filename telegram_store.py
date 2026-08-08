@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from contextlib import contextmanager
+import hashlib
 import json
 import logging
 import sqlite3
@@ -13,6 +15,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from telegram_bot_api import split_telegram_text
+from telegram_updates import TelegramImageMedia
 from context_window import estimate_tokens_from_chars
 from telegram_compaction import (
     SCHEMA_VERSION, build_prompt, parse_and_validate_payload,
@@ -98,6 +101,7 @@ class TelegramStore:
         compaction_min_entries: int = 4,
     ):
         self.db_path = db_path
+        self.media_dir = Path(db_path).parent / "telegram_media"
         if batch_debounce_seconds < 0:
             raise ValueError(
                 "Telegram batch debounce must be "
@@ -159,6 +163,7 @@ class TelegramStore:
         raw_update: dict[str, Any],
         message_date: int | None = None,
         reply_to_message_id: int | None = None,
+        media: TelegramImageMedia | None = None,
     ) -> bool:
         return await asyncio.to_thread(
             self._enqueue_text_update_sync,
@@ -170,7 +175,14 @@ class TelegramStore:
             raw_update,
             message_date,
             reply_to_message_id,
+            media,
         )
+
+    async def get_pending_media(self) -> dict[str, Any] | None:
+        return await asyncio.to_thread(self._get_pending_media_sync)
+
+    async def complete_media(self, update_id: int, file_path: str, content: bytes) -> None:
+        await asyncio.to_thread(self._complete_media_sync, update_id, file_path, content)
 
     async def claim_next_job(self) -> TelegramJob | None:
         return await asyncio.to_thread(
@@ -223,7 +235,7 @@ class TelegramStore:
         chat_id: int,
         *,
         through_update_id: int | None = None,
-    ) -> list[dict[str, str]]:
+    ) -> list[dict[str, Any]]:
         return await asyncio.to_thread(
             self._load_conversation_sync,
             chat_id,
@@ -282,6 +294,7 @@ class TelegramStore:
             parents=True,
             exist_ok=True,
         )
+        self.media_dir.mkdir(parents=True, exist_ok=True, mode=0o755)
 
         with self._connection() as connection:
             connection.execute(
@@ -399,6 +412,32 @@ class TelegramStore:
                             REFERENCES telegram_jobs(id)
                             ON DELETE CASCADE
                     );
+
+                CREATE TABLE IF NOT EXISTS telegram_media (
+                    update_id INTEGER PRIMARY KEY,
+                    kind TEXT NOT NULL CHECK(kind IN ('photo','document')),
+                    file_id TEXT NOT NULL,
+                    file_unique_id TEXT NOT NULL,
+                    mime_type TEXT NOT NULL,
+                    filename TEXT,
+                    width INTEGER,
+                    height INTEGER,
+                    declared_file_size INTEGER,
+                    telegram_file_path TEXT,
+                    local_path TEXT,
+                    content_sha256 TEXT,
+                    content_size INTEGER,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ('pending','ready')),
+                    created_at TEXT NOT NULL DEFAULT (
+                        strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                    ),
+                    completed_at TEXT,
+                    FOREIGN KEY(update_id) REFERENCES telegram_updates(update_id)
+                        ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_telegram_media_status_update
+                    ON telegram_media(status, update_id);
 
                 CREATE INDEX IF NOT EXISTS
                     idx_telegram_delivery_chunks_status
@@ -719,6 +758,7 @@ class TelegramStore:
         raw_update: dict[str, Any],
         message_date: int | None,
         reply_to_message_id: int | None,
+        media: TelegramImageMedia | None,
     ) -> bool:
         raw_json = json.dumps(
             raw_update,
@@ -771,6 +811,16 @@ class TelegramStore:
                         reply_to_message_id,
                     ),
                 )
+                if media is not None:
+                    connection.execute(
+                        """INSERT INTO telegram_media(
+                               update_id,kind,file_id,file_unique_id,mime_type,
+                               filename,width,height,declared_file_size
+                           ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                        (update_id, media.kind, media.file_id, media.file_unique_id,
+                         media.mime_type, media.filename, media.width, media.height,
+                         media.file_size),
+                    )
 
                 connection.execute(
                     "INSERT OR IGNORE INTO telegram_streams(chat_id, user_id) VALUES (?, ?)",
@@ -862,6 +912,61 @@ class TelegramStore:
                 connection.execute("ROLLBACK")
                 raise
 
+    def _get_pending_media_sync(self) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                """SELECT update_id,file_id,file_unique_id,mime_type,
+                          declared_file_size
+                   FROM telegram_media WHERE status='pending'
+                   ORDER BY update_id LIMIT 1"""
+            ).fetchone()
+        return ({key: row[key] for key in row.keys()} if row is not None else None)
+
+    def _complete_media_sync(
+        self, update_id: int, telegram_file_path: str, content: bytes
+    ) -> None:
+        if not isinstance(content, bytes) or not content:
+            raise ValueError("Telegram media content is empty")
+        digest = hashlib.sha256(content).hexdigest()
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT file_unique_id,mime_type,status,local_path,content_sha256 FROM telegram_media WHERE update_id=?",
+                (update_id,),
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"Telegram media update {update_id} does not exist")
+        if row["status"] == "ready":
+            existing = self.media_dir / str(row["local_path"])
+            if row["content_sha256"] != digest or not existing.is_file() or hashlib.sha256(existing.read_bytes()).hexdigest() != digest:
+                raise ValueError("Telegram media retry does not match durable evidence")
+            return
+        suffixes = {
+            "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp",
+            "image/gif": ".gif", "image/bmp": ".bmp", "image/tiff": ".tiff",
+        }
+        suffix = suffixes.get(str(row["mime_type"]).lower(), ".img")
+        identity = hashlib.sha256(str(row["file_unique_id"]).encode("utf-8")).hexdigest()[:16]
+        filename = f"{update_id}-{identity}-{digest}{suffix}"
+        destination = self.media_dir / filename
+        temporary = self.media_dir / f".{filename}.part"
+        temporary.write_bytes(content)
+        temporary.chmod(0o644)
+        temporary.replace(destination)
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute(
+                    """UPDATE telegram_media SET status='ready',telegram_file_path=?,
+                              local_path=?,content_sha256=?,content_size=?,
+                              completed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                       WHERE update_id=? AND status='pending'""",
+                    (telegram_file_path, filename, digest, len(content), update_id),
+                )
+                connection.execute("COMMIT")
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+
     def _claim_next_job_sync(
         self,
     ) -> TelegramJob | None:
@@ -875,6 +980,11 @@ class TelegramStore:
                     FROM telegram_jobs
                     WHERE status = 'queued'
                       AND ready_at <= ?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM telegram_job_messages jm
+                          JOIN telegram_media media ON media.update_id=jm.update_id
+                          WHERE jm.job_id=telegram_jobs.id AND media.status!='ready'
+                      )
                       AND NOT EXISTS (
                           SELECT 1 FROM telegram_jobs active
                           WHERE active.stream_id = telegram_jobs.stream_id
@@ -1514,15 +1624,19 @@ class TelegramStore:
             value = datetime.fromisoformat(stored.replace("Z", "+00:00"))
         return value.astimezone(ZoneInfo("Europe/Kyiv")).isoformat(timespec="seconds")
 
-    def _build_generation_context_sync(self, job: TelegramJob) -> list[dict[str, str]]:
+    def _build_generation_context_sync(self, job: TelegramJob) -> list[dict[str, Any]]:
         batch_ids = job.batch_update_ids or (job.update_id,)
         cutoff = max(batch_ids)
         with self._connection() as connection:
             rows = connection.execute(
                 """SELECT m.id, m.role, m.content, m.source_update_id,
                           m.telegram_message_id, m.created_at, m.telegram_date,
-                          m.reply_to_message_id
+                          m.reply_to_message_id, media.mime_type AS media_mime_type,
+                          media.local_path AS media_local_path,
+                          media.content_sha256 AS media_sha256,
+                          media.file_unique_id AS media_file_unique_id
                    FROM telegram_messages m
+                   LEFT JOIN telegram_media media ON media.update_id=m.source_update_id
                    WHERE m.stream_id = ? AND m.source_update_id <= ?
                    ORDER BY m.id""",
                 (job.stream_id, cutoff),
@@ -1602,7 +1716,26 @@ class TelegramStore:
                     "content": f"Telegram transport metadata for the next user message: {metadata}",
                 }
             )
-            output.append({"role": "user", "content": str(row["content"])})
+            if row["media_local_path"] is None:
+                output.append({"role": "user", "content": str(row["content"])})
+                continue
+            media_path = self.media_dir / str(row["media_local_path"])
+            if media_path.parent != self.media_dir or not media_path.is_file():
+                raise ValueError("Telegram media evidence file is unavailable")
+            media_bytes = media_path.read_bytes()
+            digest = hashlib.sha256(media_bytes).hexdigest()
+            if digest != row["media_sha256"]:
+                raise ValueError("Telegram media evidence checksum mismatch")
+            encoded = base64.b64encode(media_bytes).decode("ascii")
+            output.append({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": str(row["content"])},
+                    {"type": "image_url", "image_url": {
+                        "url": f"data:{row['media_mime_type']};base64,{encoded}"
+                    }},
+                ],
+            })
         return output
 
     def _claim_next_compaction_sync(self) -> TelegramCompaction | None:
