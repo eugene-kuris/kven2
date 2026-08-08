@@ -1,0 +1,71 @@
+#!/bin/bash
+set -euo pipefail
+
+INBOX=/home/qwenii/notify
+STATE=/var/lib/kven-human-notifier
+LOCK=/run/kven-human-notify.lock
+
+exec 9>"$LOCK"
+flock -n 9 || exit 0
+
+shopt -s nullglob
+for req in "$INBOX"/*.req; do
+    [ -f "$req" ] || continue
+
+    owner="$(stat -c %U "$req")"
+    size="$(stat -c %s "$req")"
+    if [ "$owner" != "qwenii" ] || [ "$size" -gt 256 ]; then
+        mv "$req" "$STATE/failed/$(basename "$req").invalid"
+        logger -t kven-human-notifier -- "request_rejected=$(basename "$req") reason=metadata"
+        continue
+    fi
+
+    EVENT=""
+    WORK_ID=""
+    extra=0
+    while IFS='=' read -r key value; do
+        case "$key" in
+            EVENT) EVENT="$value" ;;
+            WORK_ID) WORK_ID="$value" ;;
+            '') ;;
+            *) extra=1 ;;
+        esac
+    done < "$req"
+
+    case "$EVENT" in
+        NEED_USER|WORK_FAILED|WORK_COMPLETE) ;;
+        *)
+            mv "$req" "$STATE/failed/$(basename "$req").event"
+            logger -t kven-human-notifier -- "request_rejected=$(basename "$req") reason=event"
+            continue
+            ;;
+    esac
+
+    if [ "$extra" -ne 0 ] || ! [[ "$WORK_ID" =~ ^[A-Za-z0-9._:-]{1,80}$ ]]; then
+        mv "$req" "$STATE/failed/$(basename "$req").format"
+        logger -t kven-human-notifier -- "request_rejected=$(basename "$req") reason=format"
+        continue
+    fi
+
+    key="$(printf '%s\0%s' "$EVENT" "$WORK_ID" | sha256sum | awk '{print $1}')"
+    marker="$STATE/sent/$key"
+
+    if [ -e "$marker" ]; then
+        rm -f "$req"
+        logger -t kven-human-notifier -- "duplicate_suppressed event=${EVENT} work_id=${WORK_ID}"
+        continue
+    fi
+
+    if /usr/local/sbin/kven-human-notifier "$EVENT" "$WORK_ID"; then
+        {
+            printf 'event=%s\n' "$EVENT"
+            printf 'work_id=%s\n' "$WORK_ID"
+            printf 'sent_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        } > "$marker"
+        chmod 0644 "$marker"
+        rm -f "$req"
+    else
+        mv "$req" "$STATE/failed/$(basename "$req").send"
+        logger -t kven-human-notifier -- "request_failed=$(basename "$req") reason=send"
+    fi
+done

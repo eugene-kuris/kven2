@@ -1,0 +1,22 @@
+[Unit]
+Description=Kven unattended bounded qwenii runner
+Wants=network-online.target
+After=network-online.target kven-mail-courier.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/bin/python3 /opt/kven-qwenii-runner/runner.py
+Restart=always
+RestartSec=5
+KillMode=control-group
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadOnlyPaths=/etc/kven-qwenii-runner.json /etc/kven-mail-courier.json /home/qwenii/inbox /opt/kven-mail-courier /opt/kven2 /agent/data
+ReadWritePaths=/var/lib/kven-qwenii-runner /home/qwenii/work /home/qwenii/results
+UMask=0022
+
+[Install]
+WantedBy=multi-user.target
